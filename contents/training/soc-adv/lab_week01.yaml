@@ -1,0 +1,424 @@
+lab_id: standalone-soc-adv-week01
+title: "SOC 성숙도 평가 — 가시성 공백 점검과 탐지역량 정량화"
+version: standalone-soc-adv
+course: soc-adv
+week: 1
+description: |
+  SOC 고급 W01 — 성숙도(SOC-CMM)는 문서가 아니라 "실제로 무엇을 탐지하는가"로 증명된다. 공격을 흘려
+  웹(ModSec)·네트워크(Suricata)·호스트(osquery)·SIEM(Wazuh) 4계층 가시성을 점검하고, 갭을 정량화한다.
+  공격은 el34-attacker. 인가된 실습만. 명령은 el34 호스트에서. 신규 설치 없음.
+difficulty: hard
+duration_minutes: 170
+prerequisites:
+  - "soc 트랙 W01~W15 통과"
+  - "el34 호스트 SSH + docker exec"
+  - "lecture §2(가시성 4계층) §3(SOC-CMM) §4(갭 분석) 숙지"
+objectives:
+  - "4계층(웹·네트워크·호스트·SIEM) 가시성 점검"
+  - "탐지 공백 식별·정량화"
+  - "SOC-CMM 성숙도 평가·로드맵"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 표적 웹(dvwa)에 실제로 닿는지부터 확인한다
+      > **이 단계에서 할 일:** 공격자 컨테이너에서 dvwa 웹에 요청을 한 번 보내 응답 코드를 본다.
+      > **왜:** 뒤에서 "공격이 안 보인다"가 나왔을 때, 그게 진짜 탐지 공백인지 아니면 그냥 표적에
+      > 못 닿은 건지 구분하려면, 먼저 표적에 닿는지부터 확정해야 한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker`(=att@192.168.0.202) — 웹 핑거프린팅 도구 `whatweb` 로 표적을 찍는다.
+
+      ```bash
+      whatweb -a1 --color=never http://dvwa.el34.lab/
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 코드·버전은 환경마다 다를 수 있음)
+      ```
+      http://dvwa.el34.lab/ [403 Forbidden] Apache[2.4.52], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], IP[192.168.0.161], Title[403 Forbidden]
+      ```
+      `whatweb` 가 응답 줄에 `[403 Forbidden]` 상태 + `Apache[2.4.52]`·`IP[192.168.0.161]` 지문을 찍었다 = 표적에 실제로 닿았다는 뜻(못 닿으면 지문 자체가 안 나온다). dvwa는 차단 모드라 recon 도구의 탐침에도 WAF가 403을 주지만, 서버 배너·IP는 노출된다(juice로 같은 명령을 쏘면 `[200 OK]`).
+
+      ### ▷ 결과 해석
+      지문이 찍혔다 = 공격자→fw→ips→web→dvwa 경로가 살아 있다는 뜻. 이제부터의 4계층 가시성 점검
+      결과를 신뢰할 수 있다. 응답 자체가 안 오면(타임아웃) 표적 미도달(네트워크/컨테이너 상태부터 확인).
+    hint: '도달성'
+    category: survey
+    points: 10
+    answer: |
+      # 1) 웹 표적(dvwa) 핑거프린팅 — whatweb 이 도달성 + 서버/기술 스택 지문을 뽑는다
+      ssh att@192.168.0.202 "whatweb -a1 --color=never http://dvwa.el34.lab/"
+    answer_detail: "SOC 성숙도 평가 대상 = el34 인프라(웹/네트워크/호스트/SIEM 4계층). whatweb 지문(Apache/IP)=도달 확증."
+    verify:
+      type: output_contains
+      expect: 'dvwa'
+      field: stdout
+      semantic:
+        intent: "대상 점검"
+        success_criteria: ["도달"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 웹 공격(SQLi)이 우리 눈에 '보이는가' (① 웹 계층 가시성)
+      > **이 단계에서 할 일:** SQLi를 한 발 보내고, WAF(ModSec) 감사 로그에 그 시도가 탐지로 남는지 본다.
+      > **왜:** 웹은 가장 많이 노출된 표면이다. "막았는가"가 아니라 "기록(탐지)되는가"가 SOC 가시성의 첫 척도.
+
+      ### ▷ 그대로 입력
+      ```bash
+      # ── el34-attacker 에서: sqlmap 이 SQLi 페이로드를 자동 주입(진짜 SQLi 도구) ──
+      sqlmap -u "http://dvwa.el34.lab/?id=1" --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3
+      # ── el34-web 에서: ──
+      sudo tail -400 /var/log/apache2/modsec_audit.log | grep -oE '942[0-9]{3}' | sort | uniq -c | head -3
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 횟수 숫자는 환경마다 다름)
+      ```
+      [*] checking if the target is protected by some kind of WAF/IPS
+      [ERROR] all tested parameters do not appear to be injectable ... maybe you could try to use option '--tamper'
+      403 (Forbidden) - 445 times
+         1214 942100
+          222 942160
+           84 942190
+      ```
+      sqlmap이 SQLi 페이로드를 수백 개 던졌지만 dvwa WAF가 전부 403으로 막았다(`do not appear to be injectable`=못 뚫음, `403 - 445 times`). 그래도 그 시도 하나하나가 ModSec `942xxx`(SQLi) 룰로 audit에 탐지로 기록됐다.
+
+      ### ▷ 결과 해석
+      차단 여부보다 핵심은 **942 룰이 audit에 남았는가**다. 942가 1건이라도 보이면 웹 계층 가시성
+      '있음'. 안 보이면 tail 범위를 늘려(-2000) 다시 보거나 해당 vhost의 ModSec 모드를 확인한다
+      (dvwa=차단 모드라 sqlmap 403 무더기, juice=탐지만이라 sqlmap이 `--dump`로 실제 추출까지 간다).
+    hint: 'ModSec 942'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1) 공격자가 sqlmap 으로 SQLi 자동 주입 (dvwa WAF 가 403 차단 — 진짜 SQLi 도구)
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3"
+      # 2) ModSec audit 로그에서 SQLi 탐지 룰군(942xxx)만 골라 발화 횟수 집계 → 942가 보이면 SQLi 탐지됨
+      ssh ccc@10.20.32.80 "sudo tail -400 /var/log/apache2/modsec_audit.log | grep -oE '942[0-9]{3}' | sort | uniq -c | head -3"
+    answer_detail: "웹 가시성 = sqlmap SQLi 시도가 ModSec 942 audit에 탐지로 남는가. 942 보이면 웹공격 가시성 있음. dvwa=WAF 403 차단이라 미주입, 흔적은 남음."
+    verify:
+      type: output_contains
+      expect: '942'
+      field: stdout
+      semantic:
+        intent: "웹 가시성"
+        success_criteria: ["942 탐지"]
+        acceptable_methods: ["**[OSS] modsec audit (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 네트워크 계층(IPS)이 공격 트래픽을 보는가 (② 네트워크 가시성)
+      > **이 단계에서 할 일:** 포트 스캔을 한 번 흘리고, Suricata eve.json에 공격자 출처 IP 흔적이 쌓이는지 센다.
+      > **왜:** 웹 로그에 안 남는 포트 스캔·비-HTTP 트래픽은 네트워크 계층(IPS)이 본다. el34는 방화벽이
+      > SNAT를 안 해서 출처 IP(192.168.0.202)가 보존된다 → "누가" 스캔했는지 귀속이 된다.
+
+      ### ▷ 그대로 입력
+      ```bash
+      # ── el34-attacker 에서: ──
+      nmap -sS -T4 --top-ports 50 192.168.0.161 2>/dev/null | grep -c open
+      # ── el34-ips 에서: ──
+      tail -2000 /var/log/suricata/eve.json | grep -c '192.168.0.202'
+      echo netvis_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 숫자는 환경마다 다름)
+      ```
+      4
+      1969
+      netvis_done
+      ```
+      첫 줄(4)=열린 포트 수. 둘째 줄(1969)=최근 eve.json에서 공격자 출처 IP가 찍힌 이벤트 수.
+
+      ### ▷ 결과 해석
+      둘째 줄이 0보다 크면 IPS가 그 출처의 트래픽을 '보고 있다'(네트워크 가시성 있음). 출처가 보존되므로
+      이 흔적을 뒤(SIEM)에서 같은 공격자의 다른 단서와 묶을 수 있다. (마지막 `netvis_done`은 단계 완료
+      표시일 뿐 — 진짜 근거는 둘째 줄의 건수다.)
+    hint: 'Suricata eve'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 포트 스캔 수행 (IPS가 트래픽을 보게 만든다)
+      ssh att@192.168.0.202 "nmap -sS -T4 --top-ports 50 192.168.0.161 2>/dev/null | grep open" | jq -s length
+      # 2) eve.json에서 출처 IP(192.168.0.202) 흔적 건수 집계
+      ssh ccc@10.20.31.2 "tail -2000 /var/log/suricata/eve.json | grep '192.168.0.202'" | jq -s length
+      # 3) 네트워크 가시성 점검 완료 마커
+      echo netvis_done
+    answer_detail: "네트워크 가시성 = Suricata eve.json의 출처 IP 흔적. 출처 보존(SNAT 없음)으로 귀속 가능."
+    verify:
+      type: output_contains
+      expect: 'netvis_done'
+      field: stdout
+      semantic:
+        intent: "네트워크 가시성"
+        success_criteria: ["Suricata 흔적"]
+        acceptable_methods: ["**[OSS] Suricata (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — SIEM(Wazuh)이 여러 단서를 모아 '고위험'으로 올리는가 (③ SIEM 가시성)
+      > **이 단계에서 할 일:** Wazuh 경보 파일에서 고위험(level 10 이상) 경보 건수를 센다.
+      > **왜:** 단일 계층의 단서 하나하나는 약하다. SIEM은 ips·web 등 여러 소스를 모아 상관하고, 위험한
+      > 것을 level≥10으로 격상해 분석가의 눈을 모은다. 그 격상이 실제로 일어나는지 본다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      N=$(tail -3000 /var/ossec/logs/alerts/alerts.json | grep -oE '"level":1[0-9]' | wc -l); echo "siem_high=$N"
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      siem_high=44
+      ```
+      `siem_high=` 뒤 숫자가 고위험(level 10~19) 경보 수.
+
+      ### ▷ 결과 해석
+      0보다 크면 Wazuh가 다소스 로그를 모아 위험도를 매기고 고위험으로 격상하고 있다는 뜻(SIEM 가시성
+      있음). 0이면 디코더·룰이 부족해 raw 로그만 쌓이는 상태일 수 있다(고급 트랙 W02~W03에서 보강).
+    hint: 'Wazuh level>=10'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) Wazuh alerts.json의 고위험(level 10~19) 알림 수 집계 → siem_high=N
+      ssh ccc@10.20.32.100 'N=$(tail -3000 /var/ossec/logs/alerts/alerts.json | grep -oE "\"level\":1[0-9]" | wc -l); echo "siem_high=$N"'
+    answer_detail: "SIEM 가시성 = Wazuh alerts.json 고위험 집계. 다소스 상관·격상이 SOC 성숙의 지표."
+    verify:
+      type: output_contains
+      expect: 'siem_high='
+      field: stdout
+      semantic:
+        intent: "SIEM 가시성"
+        success_criteria: ["고위험 집계"]
+        acceptable_methods: ["**[OSS] Wazuh (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 호스트 안(프로세스·포트·계정)을 들여다볼 수 있는가 (④ 호스트 가시성)
+      > **이 단계에서 할 일:** osquery로 호스트의 프로세스 테이블을 한 건 질의해, 호스트를 SQL로
+      > 들여다볼 수 있는지 확인한다.
+      > **왜:** 네트워크 시그니처로 안 잡히는 것 — 백도어 계정, 숨은 리스너, 삭제된 채 도는 프로세스 —
+      > 은 호스트 계층만 본다. osquery가 그 헌팅 도구다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      osqueryi --json 'SELECT pid,name FROM processes LIMIT 1' 2>/dev/null | head -c 40
+      echo; echo hostvis_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 프로세스 이름/pid는 다를 수 있음)
+      ```
+      [
+        {"name":"sshd","pid":"1"}
+      hostvis_done
+      ```
+      JSON 한 건이 나오면 osquery 질의가 동작하는 것(`head -c 40`으로 앞부분만 잘라 보여줌).
+
+      ### ▷ 결과 해석
+      질의가 되면 processes·listening_ports·users 같은 테이블로 백도어/은닉을 헌팅할 수 있다(호스트
+      가시성 있음). osquery는 '지금 이 순간'의 스냅샷이라, 잠깐 생겼다 사라지는 행위는 이벤트 스트림
+      (sysmon, 후속 주차)으로 보완한다. (`hostvis_done`은 완료 표시 — 진짜 근거는 위 JSON 출력.)
+    hint: 'osquery'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) osquery로 프로세스 1건 질의 (호스트를 SQL로 점검 가능한지)
+      ssh ccc@10.20.32.80 "sudo osqueryi --json 'SELECT pid,name FROM processes LIMIT 1' 2>/dev/null | head -c 40"
+      # 2) 줄바꿈 + 호스트 가시성 점검 완료 마커
+      echo; echo hostvis_done
+    answer_detail: "호스트 가시성 = osquery로 프로세스/포트/계정 헌팅 가능. 호스트 계층 탐지의 토대."
+    verify:
+      type: output_contains
+      expect: 'hostvis_done'
+      field: stdout
+      semantic:
+        intent: "호스트 가시성"
+        success_criteria: ["osquery 질의"]
+        acceptable_methods: ["**[OSS] osquery (권장)**"]
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — 가시성을 '숫자'로 정량화한다 (SOC-CMM)
+      > **이 단계에서 할 일:** 인프라 3계층(네트워크/SIEM/호스트)의 점검 소스가 실제로 있는지 프로브해
+      > "몇 계층 확보"를 숫자로 만든다.
+      > **왜:** SOC 성숙도는 "우리는 잘한다"는 말이 아니라 "몇 계층에서 증거가 남는가"라는 측정값이다.
+      > (웹 계층은 STEP 2에서 SQLi로 이미 직접 확인했고, 여기서는 나머지 3계층을 점검 → 합쳐서 4계층.)
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — 변수(N) 집계가 호스트 셸에서 일어나므로, 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 각 컨테이너를 프로브한다.
+
+      ```bash
+      N=0
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && { echo "네트워크(Suricata eve) 가시성 OK"; N=$((N+1)); }
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && { echo "SIEM(Wazuh alerts) 가시성 OK"; N=$((N+1)); }
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' && { echo "호스트(osquery) 가시성 OK"; N=$((N+1)); }
+      echo "가시성 확보 계층: $N/3"; [ "$N" -ge 2 ] && echo soc_cmm_assessed
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      네트워크(Suricata eve) 가시성 OK
+      SIEM(Wazuh alerts) 가시성 OK
+      호스트(osquery) 가시성 OK
+      가시성 확보 계층: 3/3
+      soc_cmm_assessed
+      ```
+
+      ### ▷ 결과 해석
+      이 프로브는 각 계층의 '점검 소스가 살아 있는가'(eve.json / alerts.json / osqueryi)를 확인한다.
+      여기에 STEP 2~5에서 본 '실제 탐지'까지 합쳐야 성숙도의 완전한 그림이다. 2계층 이상(`N≥2`)이면
+      최소 기준 통과로 `soc_cmm_assessed`가 찍힌다. (주의: 소스가 있다 ≠ 탐지 품질이 좋다 — 룰·디코더
+      보강은 별개 과제.)
+    hint: 'SOC-CMM'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) 가시성 확보 계층 수 카운터 초기화
+      N=0
+      # 2) 네트워크: Suricata eve.json 있으면 +1
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && { echo "네트워크(Suricata eve) 가시성 OK"; N=$((N+1)); }
+      # 3) SIEM: Wazuh alerts.json 있으면 +1
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && { echo "SIEM(Wazuh alerts) 가시성 OK"; N=$((N+1)); }
+      # 4) 호스트: osqueryi 있으면 +1
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' && { echo "호스트(osquery) 가시성 OK"; N=$((N+1)); }
+      # 5) 확보 계층 수 + 2계층 이상이면 합격 마커
+      echo "가시성 확보 계층: $N/3"; [ "$N" -ge 2 ] && echo soc_cmm_assessed
+    answer_detail: "SOC-CMM = 4계층 가시성 실프로브로 정량화(N≥2 게이트). 가짜 echo 아닌 실측. 성숙도=탐지 역량."
+    verify:
+      type: output_contains
+      expect: 'soc_cmm_assessed'
+      field: stdout
+      semantic:
+        intent: "성숙도 평가"
+        success_criteria: ["SOC-CMM"]
+        acceptable_methods: ["**[표준] SOC-CMM (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — 안 보이는 계층(갭)을 찾고 개선 순서를 정한다
+      > **이 단계에서 할 일:** STEP 6의 반대 — 각 계층 프로브가 '실패'하는 곳(=미탐 계층=갭)을 모아
+      > 출력하고, 표준 개선 로드맵을 붙인다.
+      > **왜:** 탐지 못 하는 계층이 곧 공격자의 사각지대다. 갭을 알아야 어디부터 투자할지 정한다.
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — 변수(GAP) 집계가 호스트 셸에서 일어나므로, 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 각 컨테이너를 프로브한다.
+
+      ```bash
+      GAP=""
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' || GAP="$GAP 네트워크"
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' || GAP="$GAP SIEM"
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' || GAP="$GAP 호스트"
+      echo "탐지 갭(미탐 계층):${GAP:- 없음}"; echo "로드맵: ①룰 보강(SIGMA/Suricata) ②격상(Wazuh) ③SOAR ④헌팅 정례화"; echo gap_roadmap_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      탐지 갭(미탐 계층): 없음
+      로드맵: ①룰 보강(SIGMA/Suricata) ②격상(Wazuh) ③SOAR ④헌팅 정례화
+      gap_roadmap_done
+      ```
+
+      ### ▷ 결과 해석
+      el34는 3계층 소스가 다 살아 있어 보통 "갭 없음"이 나온다. 실무에선 여기서 빠진 계층이 곧 1순위
+      개선 대상이다. 우선순위는 '가시성 공백이 큰 계층 + 위험이 높은 TTP'부터. (소스가 있어도 룰이
+      약하면 '보이지만 못 잡는' 갭이 따로 있다 — 그건 STEP 2~5의 탐지 품질로 판단.)
+    hint: '갭/로드맵'
+    category: report
+    points: 14
+    answer: |
+      # 1) 갭(미탐 계층) 목록 초기화
+      GAP=""
+      # 2) 각 계층 프로브 실패 시 그 계층명을 갭 목록에 추가
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' || GAP="$GAP 네트워크"
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' || GAP="$GAP SIEM"
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' || GAP="$GAP 호스트"
+      # 3) 갭 목록 + 개선 로드맵 출력 → 완료 마커
+      echo "탐지 갭(미탐 계층):${GAP:- 없음}"; echo "로드맵: ①룰 보강(SIGMA/Suricata) ②격상(Wazuh) ③SOAR ④헌팅 정례화"; echo gap_roadmap_done
+    answer_detail: "갭 분석 = 계층 실프로브로 미탐 갭 식별. 가짜 echo 아닌 실식별. 로드맵=룰보강→격상→SOAR→헌팅."
+    verify:
+      type: output_contains
+      expect: 'gap_roadmap_done'
+      field: stdout
+      semantic:
+        intent: "갭 분석"
+        success_criteria: ["갭/로드맵"]
+        acceptable_methods: ["**[관리적] 로드맵 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — 점검 결과를 '증거 기반' 보고서로 정리한다
+      > **이 단계에서 할 일:** 앞 단계에서 실측한 가시성 계층 수를 다시 집계해, 그 숫자를 인용한
+      > 성숙도 보고서 골격을 출력한다.
+      > **왜:** 의사결정자는 "느낌"이 아니라 "실측 수치"를 보고 움직인다. 앞에서 직접 잰 N계층을
+      > 근거로 인용해야 보고가 신뢰받는다.
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — 변수(N) 집계가 호스트 셸에서 일어나므로, 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 각 컨테이너를 프로브한다.
+
+      ```bash
+      N=0
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && N=$((N+1))
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && N=$((N+1))
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' && N=$((N+1))
+      echo "# SOC고급 W01 성숙도 보고서"
+      echo "## 1. 가시성(실측): 네트워크/SIEM/호스트 ${N}/3계층 탐지 가능"
+      echo "## 2. SOC-CMM 5도메인으로 정량화"
+      echo "## 3. 갭/로드맵: 미탐 계층 → 룰 보강→격상→SOAR→헌팅 정례화"
+      [ "$N" -ge 2 ] && echo soc_maturity_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      # SOC고급 W01 성숙도 보고서
+      ## 1. 가시성(실측): 네트워크/SIEM/호스트 3/3계층 탐지 가능
+      ## 2. SOC-CMM 5도메인으로 정량화
+      ## 3. 갭/로드맵: 미탐 계층 → 룰 보강→격상→SOAR→헌팅 정례화
+      soc_maturity_report_done
+      ```
+
+      ### ▷ 결과 해석
+      이 출력은 보고서의 '골격'이다. 실제 제출용은 여기에 STEP 2~7에서 본 구체 수치(942 탐지 건수,
+      eve.json 흔적 수, 고위험 경보 수)와 갭별 개선안을 본문으로 채워 완성한다. `soc_maturity_report_done`
+      은 실측 N(≥2)이 인용된 보고서가 만들어졌다는 표시.
+    hint: '가시성+성숙도+로드맵'
+    category: report
+    points: 14
+    answer: |
+      # 1) 가시성 계층 수 재집계 (보고서 인용 근거)
+      N=0
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && N=$((N+1))
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && N=$((N+1))
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null 2>&1' && N=$((N+1))
+      # 2) 실측 수치(N) 인용 성숙도 보고서 출력
+      echo "# SOC고급 W01 성숙도 보고서"
+      echo "## 1. 가시성(실측): 네트워크/SIEM/호스트 ${N}/3계층 탐지 가능"
+      echo "## 2. SOC-CMM 5도메인으로 정량화"
+      echo "## 3. 갭/로드맵: 미탐 계층 → 룰 보강→격상→SOAR→헌팅 정례화"
+      # 3) 2계층 이상 실측이 인용된 보고서면 완료 마커
+      [ "$N" -ge 2 ] && echo soc_maturity_report_done
+    answer_detail: "성숙도 보고 = 실측 4계층 가시성 수 인용+SOC-CMM/갭. 증거 기반(N≥2 게이트). 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'soc_maturity_report_done'
+      field: stdout
+      semantic:
+        intent: "성숙도 보고"
+        success_criteria: ["가시성/성숙도/로드맵"]
+        acceptable_methods: ["**[관리적] 보고서 (권장)**"]
+    target_vm: web

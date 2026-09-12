@@ -1,0 +1,474 @@
+lab_id: standalone-attack-week12
+title: "persistence + 안티포렌식 vs 전수 헌팅·로그 무결성"
+version: standalone-attack
+course: attack
+week: 12
+description: |
+  공격기법 W12 — 숨어서 버티기. W08 에서 셸을, W11 에서 root 를 확보한 공격자의 다음 목표는 지속성
+  (persistence) 확보다. 침투 한 번을 "사건"에서 "끊기지 않는 접근 상태"로 바꾸기 위해, 서로 독립적인
+  다중 발판(백도어 계정 T1136 / cron T1053.003 / SSH키 T1098.004)을 심고, 안티포렌식(타임스톰핑
+  T1070.006 / 히스토리 삭제 / 로컬 로그 정리)으로 흔적을 숨긴다. 그다음 방어자 시선으로 돌아서서,
+  osquery 로 모든 벡터를 빠짐없이(전수) 헌팅하고, 로컬 안티포렌식을 무력화하는 로그 무결성(Wazuh
+  중앙 수집 + FIM/syscheck)을 확인한 뒤, 발견한 모든 발판을 전수 제거(self-clean)한다.
+  핵심 대결 구도 — 공격은 "다중·은폐", 방어는 "전수·불변", 양쪽 모두 승부를 가르는 단어는 "빠짐없이".
+  본 lab 의 SSH키·계정은 실제 접속용이 아닌 탐지·헌팅 학습용 가짜 마커(ATKW12FAKE, atkw12bd)다.
+  심은 발판은 모두 self-clean 한다(공유 인프라 보존). 인가된 실습 환경(el34)에서만.
+  침투로 얻은 표적 web 셸 `ssh ccc@10.20.32.80`(비번 1)에서 root 작업은 sudo 로, 방어(SIEM) 확인은
+  `ssh ccc@10.20.32.100`(비번 1)에서 수행한다. 합격 임계값 0.7.
+difficulty: hard
+duration_minutes: 180
+prerequisites:
+  - "W07(osquery)·W11(root 권한 상승) 통과 — root 가 있어야 핵심 경로에 발판을 심을 수 있다"
+  - "표적 web 셸 ssh ccc@10.20.32.80 + SIEM ssh ccc@10.20.32.100 (비번 1)"
+  - "lecture §1(지속성=상태) §2(다섯 persistence 벡터) §3(안티포렌식과 한계) §4(전수 헌팅+로그 무결성) 숙지"
+objectives:
+  - "다중 persistence(계정 T1136 + cron T1053.003 + SSH키 T1098.004)를 독립 발판으로 심기"
+  - "안티포렌식(타임스톰핑/히스토리/로컬 로그) 시도 + 중앙 수집 앞에서의 구조적 한계 이해"
+  - "osquery 로 모든 벡터를 전수 헌팅해 발견 + 전수 제거(self-clean)"
+  - "Wazuh 중앙 수집/FIM 으로 로컬 안티포렌식이 무력화됨을 증거로 확인"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표 — 점검: osquery 가용성
+      본 주차 방어의 핵심 도구인 osquery 가 `el34-web` 에서 동작하는지 먼저 점검한다.
+
+      ## 📖 개념 한 줄
+      전수 헌팅(모든 persistence 벡터를 빠짐없이 점검)을 한 도구로 일괄 수행하게 해 주는 것이
+      **osquery** 다 — OS 상태를 SQL 테이블(users/crontab/authorized_keys/suid_bin)로 추상화한다
+      (lecture §0.5.4, §4.1). 도구가 없으면 헌팅을 시작할 수 없으므로 가용성부터 확인한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **표적 web 셸:** 침투로 얻은 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다(root 작업은 `sudo`).
+
+      ```bash
+      # 1) osquery 버전 확인 — 전수 헌팅 주력 도구(users/crontab/authorized_keys/suid_bin)의 가용성 점검
+      sudo osqueryi --version
+      ```
+      - `osqueryi` — osquery 의 대화형(interactive) 셸. SQL 한 줄로 OS 상태를 질의한다(계정·cron 테이블은 root 권한 필요 → 헌팅은 sudo, 버전 확인도 그 경로로 점검).
+      - `--version` — 설치된 osquery 버전을 출력해 가용성을 확인.
+
+      ## 🧰 처음 나오는 도구
+      - **osquery / osqueryi** — OS(계정·cron·SSH키·SUID·프로세스 등)를 SQL 테이블로 보여주는 호스트
+        가시화 도구(W07). 본 주차 전수 헌팅의 주력 도구다.
+
+      ## ✅ 합격 기준
+      `5.23` 출력 시 통과. **근거:** osqueryi 버전(5.23.x)이 나오면 전수 헌팅 도구 준비 완료 — 모든
+      persistence 벡터(users/crontab/authorized_keys/suid_bin)를 같은 SQL 문법으로 질의할 수 있다.
+    hint: 'osquery'
+    category: survey
+    points: 10
+    answer: |
+      # 1) osquery 버전 확인 — 전수 헌팅 주력 도구(users/crontab/authorized_keys/suid_bin)의 가용성 점검
+      ssh ccc@10.20.32.80 'sudo osqueryi --version'
+    answer_detail: "본 주차 방어의 주력 = osquery. 전수 헌팅 도구로, users(계정)/crontab(cron)/authorized_keys(SSH키)/suid_bin(SUID) 등 모든 persistence 벡터를 같은 SQL 문법으로 질의한다. 버전이 출력되면 가용성 확인 완료 — 다중 발판을 빠짐없이 사냥할 준비가 됐다. 침해 대응 착수 시 first responder 가 헌팅 도구 가용성부터 점검하는 절차에 대응."
+    expected_output: |
+      osqueryi version 5.23.0
+    verify:
+      type: output_contains
+      expect: '5.23'
+      field: stdout
+      semantic:
+        intent: "osquery 점검"
+        success_criteria: ["osquery"]
+        acceptable_methods: ["**[OSS] osqueryi (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표 — 다중 persistence 심기: 계정 + cron + SSH 키
+      W11 에서 확보한 root 권한으로, 서로 독립적인 세 발판을 동시에 심어 "끊기지 않는 접근 상태"를 만든다.
+
+      ## 📖 개념 한 줄
+      단일 발판은 발견 한 번에 끝난다. 공격자는 **서로 다른 메커니즘**(인증·스케줄러·키)에 기댄 발판을
+      중복으로 심어, 하나가 제거돼도 다른 게 재침투를 부르게 한다(lecture §0.5.2, §2). 이 "다중·독립"이
+      방어자가 모두를 빠짐없이 찾아야만 끊을 수 있게 만드는 공격자의 핵심 전략이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **표적 web 셸:** 침투로 얻은 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다(root 작업은 `sudo`).
+
+      ```bash
+      # 1) 백도어 계정(T1136) — 기존 잔재 제거 후 atkw12bd 생성(다른 학생과 안 겹치는 마커)
+      sudo userdel -r atkw12bd >/dev/null 2>&1; sudo useradd -m -s /bin/bash atkw12bd && echo "account ok"
+      # 2) cron 백도어(T1053.003) — 매분(* * * * *) root로 도는 cron 정의 심기
+      echo "* * * * * root /tmp/.atkw12.sh" | sudo tee /etc/cron.d/atkw12_persist >/dev/null && echo "cron ok"
+      # 3) SSH키 백도어(T1098.004) — root authorized_keys에 가짜 키 마커 추가(비번 바뀌어도 키로 재침투)
+      sudo mkdir -p /root/.ssh; echo "ssh-rsa AAAAB3_ATKW12FAKE atk@evil" | sudo tee -a /root/.ssh/authorized_keys >/dev/null && echo "key ok"
+      # 4) 세 독립 발판을 모두 심음
+      echo "planted (계정 + cron + SSH키)"
+      ```
+      세 발판을 한 줄씩 뜯어보면:
+      - `useradd -m -s /bin/bash atkw12bd` — 백도어 계정(T1136). `atkw12bd` 는 다른 학생과 안 겹치는 마커.
+      - `echo "* * * * * root ..." > /etc/cron.d/atkw12_persist` — cron 백도어(T1053.003). `* * * * *`
+        는 "매분 실행"이라는 cron 시간 표기, `root` 는 실행 사용자.
+      - `echo "ssh-rsa AAAAB3_ATKW12FAKE ..." >> /root/.ssh/authorized_keys` — SSH 키 백도어(T1098.004).
+        비밀번호가 바뀌어도 키로 들어오는 발판(여기선 형식만 갖춘 가짜 마커).
+
+      ## 🧰 처음 나오는 개념
+      - **다중 persistence** — 독립 발판을 여러 개 심어 단편적 제거를 무력화하는 전략.
+      - **네임스페이스 마커** — `atkw12bd`/`atkw12_persist`/`ATKW12FAKE`. 다른 학생과 겹치지 않게 고정.
+
+      ## ✅ 합격 기준
+      `planted` 출력 시 통과. **근거:** 계정·cron·SSH키 세 독립 발판을 모두 심으면 planted 가 출력된다 —
+      하나가 제거돼도 나머지가 재침투를 부르는 다중 persistence 완성.
+
+      ## ⚠️ 인가된 실습 + 가짜 마커
+      이 키·계정은 실제 접속용 유효 자격이 아닌 **탐지·헌팅 학습용 가짜 마커**다. el34 내 `el34-web`
+      에서만 심고, lab 6 에서 반드시 전수 제거한다(self-clean, 공유 인프라 보존).
+    hint: 'useradd + cron + authorized_keys'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 백도어 계정(T1136) — 기존 잔재 제거 후 atkw12bd 생성(다른 학생과 안 겹치는 마커). 표적 web 셸에서 sudo
+      ssh ccc@10.20.32.80 'sudo userdel -r atkw12bd >/dev/null 2>&1; sudo useradd -m -s /bin/bash atkw12bd && echo "account ok"'
+      # 2) cron 백도어(T1053.003) — 매분(* * * * *) root로 도는 cron 정의 심기(root 소유 경로라 sudo tee)
+      ssh ccc@10.20.32.80 'echo "* * * * * root /tmp/.atkw12.sh" | sudo tee /etc/cron.d/atkw12_persist >/dev/null && echo "cron ok"'
+      # 3) SSH키 백도어(T1098.004) — root authorized_keys에 가짜 키 마커 추가(비번 바뀌어도 키로 재침투)
+      ssh ccc@10.20.32.80 'sudo mkdir -p /root/.ssh; echo "ssh-rsa AAAAB3_ATKW12FAKE atk@evil" | sudo tee -a /root/.ssh/authorized_keys >/dev/null && echo "key ok"'
+      # 4) 세 독립 발판을 모두 심음
+      echo "planted (계정 + cron + SSH키)"
+    answer_detail: "다중 persistence = 독립 발판 여러 개. 계정(atkw12bd) + cron(atkw12_persist) + SSH키(ATKW12FAKE). 하나 지워도 다른 게 재침투."
+    expected_output: |
+      account ok
+      cron ok
+      key ok
+      planted (계정 + cron + SSH키)
+    verify:
+      type: output_contains
+      expect: 'planted'
+      field: stdout
+      semantic:
+        intent: "다중 persistence 심기"
+        success_criteria: ["계정+cron+키"]
+        acceptable_methods: ["**[OSS] useradd+cron+key (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표 — 안티포렌식 시도: 타임스톰핑
+      심은 발판의 흔적을 숨긴다. 타임스톰핑(T1070.006)으로 cron 발판의 생성시각을 과거로 위조해
+      "오래된 정상 파일"로 위장한다.
+
+      ## 📖 개념 한 줄
+      타임스톰핑 = `touch -t` 로 파일 mtime/atime 을 과거로 위조해 타임라인 분석을 교란하는 기법. 단,
+      변경이 **발생하는 순간** 중앙(Wazuh)으로 이미 ship 된 로그·FIM·외부 백업은 로컬 조작으로 못 지운다
+      — 안티포렌식의 구조적 한계다(미션 5 에서 무력화 확인).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **표적 web 셸:** 침투로 얻은 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다(root 작업은 `sudo`).
+
+      ```bash
+      # 1) 타임스톰핑(T1070.006) — cron 발판의 시각을 2020-01-01로 위조 후 stat로 확인
+      sudo touch -t 202001010000 /etc/cron.d/atkw12_persist; sudo stat -c "%y %n" /etc/cron.d/atkw12_persist
+      ```
+      stat 의 mtime 이 2020-01-01 로 보이면 타임스톰핑 성공 — 생성시각을 과거로 위조해 "오래된 정상 파일"로
+      위장한 것이다. 공격자는 여기에 히스토리 삭제·로컬 로그 정리까지 더한다. 그러나 변경이 발생하는 순간
+      이미 중앙(Wazuh)으로 ship 된 로그·FIM·외부 백업은 로컬 조작으로 못 지운다 — 안티포렌식의 구조적 한계다(미션 5).
+      - `touch -t 202001010000` — mtime/atime 을 2020-01-01 00:00 으로 위조(타임스톰핑).
+      - `stat -c "%y %n"` — 위조된 수정시각(%y)과 파일명(%n)을 출력해 위조 결과를 확인.
+
+      ## ✅ 합격 기준
+      `2020` 출력 시 통과. **근거:** stat 의 mtime 이 2020-01-01 로 위조돼 보이면 타임스톰핑 성공 — 단,
+      이는 로컬 mtime 만 속일 뿐 중앙 수집·FIM 은 못 지운다(미션 5 에서 무력화 확인).
+    hint: 'touch -t 타임스톰프'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 타임스톰핑(T1070.006) — cron 발판의 시각을 2020-01-01로 위조 후 stat로 확인
+      ssh ccc@10.20.32.80 'sudo touch -t 202001010000 /etc/cron.d/atkw12_persist; sudo stat -c "%y %n" /etc/cron.d/atkw12_persist'
+    answer_detail: "안티포렌식 = 흔적 은폐. 타임스톰프(touch -t로 시각 위조)/히스토리 삭제/로컬 로그 정리. 한계: 중앙 수집 로그·FIM·백업은 로컬 조작으로 못 지운다."
+    expected_output: |
+      2020-01-01 00:00:00.000000000 +0000 /etc/cron.d/atkw12_persist
+    verify:
+      type: output_contains
+      expect: '2020'
+      field: stdout
+      semantic:
+        intent: "안티포렌식 시도 + 한계"
+        success_criteria: ["타임스톰프", "중앙수집 한계"]
+        acceptable_methods: ["**[OSS] touch -t (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표 — 전수 헌팅 (osquery)
+      방어자 시선으로 전환한다. osquery 로 모든 persistence 벡터(계정·cron·키)를 빠짐없이(전수) 헌팅한다.
+
+      ## 📖 개념 한 줄
+      전수 헌팅 = 한 벡터만 보면 다른 발판을 놓치므로 users·crontab·authorized_keys 를 **모두** 같은
+      도구로 점검하는 것. 타임스톰핑은 mtime 만 속일 뿐 계정·키의 **존재 자체**는 못 숨긴다 — 그래서
+      osquery 전수 조회가 안티포렌식을 우회한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **표적 web 셸:** 침투로 얻은 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다(root 작업은 `sudo`).
+
+      ```bash
+      # 1) 계정 벡터 — osquery users 테이블에서 백도어 계정 조회
+      echo "[계정]"; osqueryi --json 'SELECT username,uid FROM users WHERE username="atkw12bd";'
+      # 2) cron 벡터 — osquery crontab 테이블에서 atkw12 경로 조회
+      echo "[cron]"; osqueryi --json 'SELECT command,path FROM crontab WHERE path LIKE "%atkw12%";'
+      # 3) SSH키 벡터 — authorized_keys에서 가짜 키 마커 줄을 직접 확인(있으면 그 줄, 없으면 안내)
+      echo "[SSH키]"; sudo grep ATKW12FAKE /root/.ssh/authorized_keys || echo "(키 없음)"
+      ```
+      계정·cron·키 세 벡터가 모두 발견되면 전수 헌팅 성공이다 — 타임스톰프는 mtime 만 속일 뿐 계정·키의 **존재
+      자체**는 못 숨긴다. 한 벡터만 보면 다른 발판을 놓치므로 users·crontab·authorized_keys 를 모두 같은 도구로 점검한다.
+      - osquery `users`/`crontab` 테이블은 /etc/passwd·/etc/cron.d 를 SQL 로 질의 — 타임스톰핑으로도 못 지우는 "존재"를 본다.
+      - `grep ATKW12FAKE`(개수 아닌 실제 마커 줄을 표시 — 있으면 키 발판 존재, 없으면 "(키 없음)").
+
+      ## ✅ 합격 기준
+      `atkw12bd` 출력 시 통과. **근거:** osquery users 조회에 백도어 계정 atkw12bd 가 잡히면 전수 헌팅
+      성공 — cron·키까지 세 벡터를 모두 발견해야 다중 발판을 빠짐없이 끊을 수 있다.
+    hint: 'osquery users/crontab + key'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) 계정 벡터 — osquery users 테이블에서 백도어 계정 조회
+      echo "[계정]"; ssh ccc@10.20.32.80 'sudo osqueryi --json "SELECT username,uid FROM users WHERE username=\"atkw12bd\";"'
+      # 2) cron 벡터 — osquery crontab 테이블에서 atkw12 경로 조회
+      echo "[cron]"; ssh ccc@10.20.32.80 'sudo osqueryi --json "SELECT command,path FROM crontab WHERE path LIKE \"%atkw12%\";"'
+      # 3) SSH키 벡터 — authorized_keys에서 가짜 키 마커 줄을 직접 확인(있으면 그 줄, 없으면 안내)
+      echo "[SSH키]"; ssh ccc@10.20.32.80 'sudo grep ATKW12FAKE /root/.ssh/authorized_keys || echo "(키 없음)"'
+    answer_detail: "전수 헌팅 = 모든 persistence 벡터를 빠짐없이. osquery users(계정)+crontab(cron)+authorized_keys(키). 타임스톰프는 mtime만 속이지 존재 자체는 못 숨김."
+    expected_output: |
+      [계정]
+      [
+        {"uid":"1001","username":"atkw12bd"}
+      ]
+      [cron]
+      [
+        {"command":"root /tmp/.atkw12.sh","path":"/etc/cron.d/atkw12_persist"}
+      ]
+      [SSH키]
+      ssh-rsa AAAAB3_ATKW12FAKE atk@evil
+    verify:
+      type: output_contains
+      expect: 'atkw12bd'
+      field: stdout
+      semantic:
+        intent: "전수 persistence 헌팅"
+        success_criteria: ["계정/cron/키 전부 발견"]
+        acceptable_methods: ["**[OSS] osquery 다벡터 (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표 — 로그 무결성: 안티포렌식 무력화
+      로컬 안티포렌식을 무력화하는 방어를 확인한다. web agent 가 중앙(el34-siem)으로 ship 한 로그와
+      FIM 은 로컬에서 못 지운다.
+
+      ## 📖 개념 한 줄
+      로그 무결성 = 안티포렌식의 천적. 변경이 발생하는 순간 Wazuh agent 가 중앙으로 ship 하고
+      FIM(syscheck)이 기록 → 불변(append-only) 중앙 로그가 로컬 삭제·타임스톰프를 무력화한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **방어자 시선(SIEM):** Wazuh 매니저에 직접 접속한다 — `ssh ccc@10.20.32.100`(비번 `1`, /var/ossec 은 sudo).
+
+      ```bash
+      # 1) web agent가 중앙(el34-siem)에 등록·연결됐는지 확인(로컬 변경을 이미 ship)
+      sudo /var/ossec/bin/agent_control -l | grep -E "web," || echo "(web agent)"
+      # 2) 최근 FIM/syscheck 경보 건수 — 발판 경로 변경이 중앙에 기록됐는지
+      echo "최근 FIM/syscheck 경보:"; sudo tail -400 /var/ossec/logs/alerts/alerts.json | grep -ciE "syscheck|integrity"
+      ```
+      agent_control 목록에 web agent 가 보이면 web 의 변경 로그가 이미 중앙(el34-siem)으로 ship 된 상태다 —
+      로컬 타임스톰프·로그 삭제로는 못 지우는 불변(append-only) 증거다. 변경이 발생하는 순간 Wazuh agent 가
+      중앙으로 ship 하고 FIM(syscheck)이 기록하므로, 로컬 안티포렌식이 구조적으로 무력화된다.
+      - `agent_control -l` — Wazuh manager 에 등록된 agent 목록. `web,` 가 보이면 web 이 중앙 수집 대상.
+      - `grep -ciE "syscheck|integrity"` — 최근 경보 중 FIM(파일 무결성) 관련 건수(대소문자 무시).
+
+      ## ✅ 합격 기준
+      `web` 출력 시 통과. **근거:** agent_control 목록에 web agent 가 보이면 변경 로그가 이미 중앙
+      (el34-siem)으로 ship 된 상태 — 로컬 타임스톰프·로그 삭제로는 못 지우는 불변 증거다.
+    hint: 'Wazuh agent + FIM(중앙 로그)'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) web agent가 중앙(el34-siem)에 등록·연결됐는지 확인(로컬 변경을 이미 ship)
+      ssh ccc@10.20.32.100 'sudo /var/ossec/bin/agent_control -l' | grep -E "web," || echo "(web agent)"
+      # 2) 최근 FIM/syscheck 경보 건수 — 발판 경로 변경이 중앙에 기록됐는지
+      echo "최근 FIM/syscheck 경보:"; ssh ccc@10.20.32.100 'sudo tail -400 /var/ossec/logs/alerts/alerts.json | grep -ciE "syscheck|integrity"'
+    answer_detail: "로그 무결성 = 안티포렌식의 천적. 변경이 발생하는 순간 Wazuh agent가 중앙으로 ship + FIM이 기록 → 로컬 삭제/타임스톰프로 못 지운다. 불변(append-only) 중앙 로그가 방어."
+    expected_output: |
+      ID: 004, Name: web, IP: any, Active
+      최근 FIM/syscheck 경보:
+      4
+    verify:
+      type: output_contains
+      expect: 'web'
+      field: stdout
+      semantic:
+        intent: "로그 무결성으로 안티포렌식 무력화"
+        success_criteria: ["중앙 수집/FIM 확인"]
+        acceptable_methods: ["**[OSS] agent + FIM (권장)**"]
+    target_vm: siem
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표 — 전수 제거 (self-clean)
+      헌팅에서 찾은 모든 발판을 빠짐없이 제거한다(공유 인프라 보존).
+
+      ## 📖 개념 한 줄
+      전수 제거 = 발견한 모든 벡터를 빠짐없이 끊는 것(계정 userdel + cron rm + 키 sed). 하나라도 남으면
+      그게 곧 재침투 경로가 된다 — 헌팅도 제거도 "전수"가 원칙이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **표적 web 셸:** 침투로 얻은 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다(root 작업은 `sudo`).
+
+      ```bash
+      # 1) 전수 제거 — 계정(userdel)·cron(rm)·SSH키(sed) 세 벡터를 한 번에 제거
+      sudo userdel -r atkw12bd >/dev/null 2>&1; sudo rm -f /etc/cron.d/atkw12_persist; sudo sed -i "/ATKW12FAKE/d" /root/.ssh/authorized_keys; echo cleaned
+      # 2) 제거 확인 — 계정·cron 잔재가 없는지 재점검(하나라도 남으면 재침투)
+      id atkw12bd >/dev/null 2>&1 && echo "계정 잔재!" || echo "user ok"; sudo ls /etc/cron.d/atkw12_persist >/dev/null 2>&1 && echo "cron 잔재!" || echo "cron ok"
+      ```
+      - `userdel -r`(계정+홈 제거) · `rm -f`(cron 정의 제거) · `sed -i "/ATKW12FAKE/d"`(키 라인 삭제).
+      - 2) 의 `id ... || echo "user ok"` 는 계정이 없을 때만 ok — 잔재가 남으면 "계정 잔재!"로 경고.
+
+      ## ✅ 합격 기준
+      `cleaned` 출력 시 통과. **근거:** 계정·cron·키 세 벡터를 모두 제거하면 cleaned 가 출력되고, 이어진
+      재점검에서 잔재 없음(user ok/cron ok)이 확인된다 — 하나라도 남으면 재침투.
+    hint: 'userdel + rm cron + sed 키'
+    category: response
+    points: 12
+    answer: |
+      # 1) 전수 제거 — 계정(userdel)·cron(rm)·SSH키(sed) 세 벡터를 한 번에 제거
+      ssh ccc@10.20.32.80 'sudo userdel -r atkw12bd >/dev/null 2>&1; sudo rm -f /etc/cron.d/atkw12_persist; sudo sed -i "/ATKW12FAKE/d" /root/.ssh/authorized_keys; echo cleaned'
+      # 2) 제거 확인 — 계정·cron 잔재가 없는지 재점검(하나라도 남으면 재침투)
+      ssh ccc@10.20.32.80 'id atkw12bd >/dev/null 2>&1 && echo "계정 잔재!" || echo "user ok"; sudo ls /etc/cron.d/atkw12_persist >/dev/null 2>&1 && echo "cron 잔재!" || echo "cron ok"'
+    answer_detail: "전수 제거 = 발견한 모든 벡터를 빠짐없이(계정 userdel + cron rm + 키 sed). 하나라도 남으면 재침투. 헌팅과 제거 모두 전수가 원칙."
+    expected_output: |
+      cleaned
+      user ok
+      cron ok
+    verify:
+      type: output_contains
+      expect: 'cleaned'
+      field: stdout
+      semantic:
+        intent: "전수 persistence 제거"
+        success_criteria: ["계정/cron/키 전부 제거"]
+        acceptable_methods: ["**[OSS] userdel+rm+sed (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표 — 방어: 전수 헌팅 + 불변 로그
+      persistence·안티포렌식에 맞서는 방어의 네 축(전수 헌팅·불변 로그·FIM·최소권한)을 정리한다.
+
+      ## 📖 개념 한 줄
+      공격의 "다중·은폐"는 방어의 "전수·불변"으로 깨진다 — 모든 벡터를 빠짐없이(전수) 헌팅하고, 중앙
+      불변 로그로 안티포렌식을 무력화하며, FIM 으로 persistence 경로를 실시간 감시한다.
+
+      ## 💻 실행 방법 — 편집기로 방어 4축 정리
+
+      **표적 web 셸:** `ssh ccc@10.20.32.80`(비번 1) 로 접속해 `nano ~/w12_defense.md` 를 열고, persistence·
+      안티포렌식에 맞서는 방어 4축을 아래처럼 정리·저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # W12 방어 — 공격의 다중·은폐를 전수·불변으로
+      ## ① 전수 헌팅 : 계정/cron/키/SUID/서비스 모든 벡터를 baseline 대비 정기 점검(osquery)
+      ## ② 불변 로그 : 중앙 수집(Wazuh) + append-only → 로컬 안티포렌식 무력화
+      ## ③ FIM      : persistence 경로(/etc/cron.d, /root/.ssh, /etc/passwd) 실시간 감시
+      ## ④ 최소권한 + 정기 무결성 검증
+      ## 결론 : 공격자는 다중·은폐, 방어자는 전수·불변 — 하나라도 놓치면 재침투
+      ```
+      작성 후 `cat ~/w12_defense.md` 로 확인한다 — 정리는 echo 로 찍는 게 아니라 스스로 판단해 쓰는 문서다.
+
+      ## ✅ 합격 기준
+      `전수` 출력 시 통과. **근거:** 전수 헌팅·불변 로그·FIM·최소권한 네 축이 정리되면 통과 — 공격의
+      다중·은폐에 방어는 전수·불변으로 맞선다.
+    hint: '전수 헌팅 + 불변 로그'
+    category: report
+    points: 12
+    answer: |
+      # (편집기로 작성한 방어 4축 정리 — 채점용)
+      ssh ccc@10.20.32.80 'cat > ~/w12_defense.md <<'"'"'EOF'"'"'
+      # W12 방어 — 공격의 다중·은폐를 전수·불변으로
+      ## ① 전수 헌팅 : 계정/cron/키/SUID/서비스 모든 벡터를 baseline 대비 정기 점검(osquery)
+      ## ② 불변 로그 : 중앙 수집(Wazuh) + append-only → 로컬 안티포렌식 무력화
+      ## ③ FIM      : persistence 경로(/etc/cron.d, /root/.ssh, /etc/passwd) 실시간 감시
+      ## ④ 최소권한 + 정기 무결성 검증
+      ## 결론 : 공격자는 다중·은폐, 방어자는 전수·불변 — 하나라도 놓치면 재침투
+      EOF
+      cat ~/w12_defense.md'
+    answer_detail: "편집기로 ~/w12_defense.md 를 작성해 방어 4축을 정리한다 = 전수 헌팅(모든 벡터 baseline 점검) + 불변 중앙 로그(안티포렌식 무력) + FIM(persistence 경로 실시간 감시) + 최소권한. 공격의 '다중·은폐'에 방어는 '전수·불변'으로 맞선다 — 하나라도 놓치면 재침투. 정리는 echo 로 찍는 게 아니라 스스로 판단해 쓰는 문서다. 출력에 '전수'가 보이면 통과."
+    expected_output: |
+      # W12 방어 — 공격의 다중·은폐를 전수·불변으로
+      ## ① 전수 헌팅 : 계정/cron/키/SUID/서비스 모든 벡터를 baseline 대비 정기 점검(osquery)
+      ## ② 불변 로그 : 중앙 수집(Wazuh) + append-only → 로컬 안티포렌식 무력화
+      ## ③ FIM      : persistence 경로(/etc/cron.d, /root/.ssh, /etc/passwd) 실시간 감시
+      ## ④ 최소권한 + 정기 무결성 검증
+      ## 결론 : 공격자는 다중·은폐, 방어자는 전수·불변 — 하나라도 놓치면 재침투
+    verify:
+      type: output_contains
+      expect: '전수'
+      field: stdout
+      semantic:
+        intent: "persistence/안티포렌식 방어"
+        success_criteria: ["전수 헌팅", "불변 로그"]
+        acceptable_methods: ["**[설명] 전수+불변 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표 — persistence 보고서
+      미션 1~7(다중 발판·안티포렌식·전수 헌팅·로그 무결성·방어)을 한 보고서로 종합한다.
+
+      ## 📖 개념 한 줄
+      persistence 는 다중 발판 + 안티포렌식, 방어는 전수 헌팅 + 불변 로그 — 양쪽 모두 승부를 가르는
+      단어는 "빠짐없이". 이 공방을 한 문서로 정리한다.
+
+      ## 💻 실행 방법 — 편집기로 persistence 보고서 작성
+
+      **표적 web 셸:** `ssh ccc@10.20.32.80`(비번 1) 로 접속해 `nano ~/w12_report.md` 를 열고, 미션 1~7 을
+      아래 골격에 채워 저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # 공격 W12 — persistence + 안티포렌식 보고서
+      ## 1. 다중 persistence : 계정(atkw12bd) + cron(atkw12_persist) + SSH키(ATKW12FAKE)
+      ## 2. 안티포렌식 : 타임스톰프(touch -t)/히스토리/로컬로그 → 한계(중앙수집 못 지움)
+      ## 3. 전수 헌팅 : osquery users/crontab/keys 전부 발견. 로그 무결성(Wazuh FIM)이 안티포렌식 무력화
+      ## 4. 방어 : 전수 헌팅 + 불변 중앙 로그 + FIM + 최소권한
+      ## 결론 : 공격은 다중·은폐, 방어는 전수·불변. 하나라도 놓치면 재침투
+      ```
+      작성 후 `cat ~/w12_report.md` 로 확인한다 — 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이다.
+
+      ## ✅ 합격 기준
+      `persistence` 출력 시 통과. **근거:** 보고서에 다중 persistence(계정/cron/키) + 안티포렌식 한계 +
+      전수 헌팅/로그 무결성 + 방어가 모두 포함되면 통과.
+    hint: '다중+안티포렌식+전수방어'
+    category: report
+    points: 10
+    answer: |
+      # (편집기로 작성한 persistence 보고서 — 채점용)
+      ssh ccc@10.20.32.80 'cat > ~/w12_report.md <<'"'"'EOF'"'"'
+      # 공격 W12 — persistence + 안티포렌식 보고서
+      ## 1. 다중 persistence : 계정(atkw12bd) + cron(atkw12_persist) + SSH키(ATKW12FAKE)
+      ## 2. 안티포렌식 : 타임스톰프(touch -t)/히스토리/로컬로그 → 한계(중앙수집 못 지움)
+      ## 3. 전수 헌팅 : osquery users/crontab/keys 전부 발견. 로그 무결성(Wazuh FIM)이 안티포렌식 무력화
+      ## 4. 방어 : 전수 헌팅 + 불변 중앙 로그 + FIM + 최소권한
+      ## 결론 : 공격은 다중·은폐, 방어는 전수·불변. 하나라도 놓치면 재침투
+      EOF
+      cat ~/w12_report.md'
+    answer_detail: "편집기로 ~/w12_report.md 를 작성해 종합한다. persistence = 다중 발판(계정+cron+SSH키) + 안티포렌식(타임스톰프/히스토리/로컬로그). 방어 = 전수 헌팅(osquery) + 불변 중앙 로그(Wazuh FIM). 양쪽 모두 '빠짐없이'가 핵심 — 하나라도 놓치면 재침투. 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이라야 하며, 출력에 'persistence'가 보이면 통과."
+    expected_output: |
+      # 공격 W12 — persistence + 안티포렌식 보고서
+      ## 1. 다중 persistence : 계정(atkw12bd) + cron(atkw12_persist) + SSH키(ATKW12FAKE)
+      ## 2. 안티포렌식 : 타임스톰프(touch -t)/히스토리/로컬로그 → 한계(중앙수집 못 지움)
+      ## 3. 전수 헌팅 : osquery users/crontab/keys 전부 발견. 로그 무결성(Wazuh FIM)이 안티포렌식 무력화
+      ## 4. 방어 : 전수 헌팅 + 불변 중앙 로그 + FIM + 최소권한
+      ## 결론 : 공격은 다중·은폐, 방어는 전수·불변. 하나라도 놓치면 재침투
+    verify:
+      type: output_contains
+      expect: 'persistence'
+      field: stdout
+      semantic:
+        intent: "persistence 종합 보고"
+        success_criteria: ["다중/안티포렌식/전수방어"]
+        acceptable_methods: ["**[관리적] persistence 보고서 (권장)**"]
+    target_vm: web

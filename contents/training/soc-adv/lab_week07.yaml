@@ -1,0 +1,380 @@
+lab_id: standalone-soc-adv-week07
+title: "네트워크 포렌식 — 흐름·패킷에서 공격 흔적 복원"
+version: standalone-soc-adv
+course: soc-adv
+week: 7
+description: |
+  SOC 고급 W07 — 네트워크 포렌식. Suricata eve.json(alert/http/flow/dns 이벤트)에서 공격의 흐름을 복원한다.
+  공격을 흘려 eve.json에 흔적을 만들고, event_type별 분석·출처 상관·타임라인을 구성한다. el34-ips Suricata
+  eve.json·jq 사용. 공격은 el34-attacker. 인가된 실습만. 명령은 el34 호스트에서. 신규 설치 없음.
+difficulty: hard
+duration_minutes: 170
+prerequisites:
+  - "soc W02(스캔)·secuops W03~W04(Suricata) + soc-adv W01~W06 통과"
+  - "el34 호스트 SSH + docker exec"
+  - "lecture §2(eve.json event_type) §3(흐름 분석) §4(타임라인) 숙지"
+objectives:
+  - "Suricata eve.json event_type별 분석"
+  - "출처 상관·흐름(flow) 분석"
+  - "공격 타임라인 복원"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 포렌식 원천 로그(Suricata eve.json)에 접근되는지 확인
+      > **이 단계에서 할 일:** IPS의 eve.json 파일 크기를 조회해 포렌식 원천 로그가 있고 읽히는지 본다.
+      > **왜:** 네트워크 포렌식의 모든 분석은 Suricata eve.json에서 출발한다. 소스가 없으면 시작 불가.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      ls -la /var/log/suricata/eve.json | awk '{print $5}'
+      echo eve_ready
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 크기는 환경마다 다름)
+      ```
+      76481108
+      eve_ready
+      ```
+
+      ### ▷ 결과 해석
+      바이트 단위 파일 크기가 찍히면 eve.json이 살아서 계속 쌓이고 있다는 뜻(여기선 약 76MB). 이 JSON
+      라인 로그의 event_type별 이벤트가 앞으로의 포렌식 단서다.
+    hint: 'eve.json'
+    category: survey
+    points: 10
+    answer: |
+      # 1) IPS 컨테이너의 Suricata eve.json 파일 크기를 조회 (포렌식 원천 로그 접근 확인)
+      ssh ccc@10.20.31.2 "ls -la /var/log/suricata/eve.json | awk '{print \$5}'"
+      # 2) 단계 완료 마커
+      echo eve_ready
+    answer_detail: "네트워크 포렌식 소스 = el34-ips Suricata eve.json(JSON 라인 이벤트 로그)."
+    verify:
+      type: output_contains
+      expect: 'eve_ready'
+      field: stdout
+      semantic: {intent: "eve 접근", success_criteria: ["eve.json"], acceptable_methods: ["**[OSS] eve.json (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 분석할 '공격 흐름'을 직접 만든다
+      > **이 단계에서 할 일:** 포트 스캔(flow/alert)과 SQLi 웹공격(http/alert)을 흘려 eve.json에 여러
+      > 종류의 흔적을 남긴다.
+      > **왜:** 포렌식 연습엔 분석 대상이 필요하다. 스캔+웹공격을 흘리면 한 출처가 여러 event_type
+      > 흔적을 만든다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      nmap -sS -T4 --top-ports 30 192.168.0.161 2>/dev/null | grep -c open
+      sqlmap -u "http://dvwa.el34.lab/?id=1" --batch --level=2 --risk=2 --flush-session --disable-coloring >/dev/null 2>&1
+      echo traffic_generated
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      4
+      traffic_generated
+      ```
+
+      ### ▷ 결과 해석
+      `4`는 스캔에서 열린 포트 수. sqlmap의 SQLi 요청 다발은 출력 없이 흘려보냈다(dvwa WAF가 403 차단). 이제
+      eve.json에 이 출처의 flow/alert(nmap 스캔)·http/alert(sqlmap SQLi) 이벤트가 갓 쌓였다 — STEP 3~6에서 그걸
+      복원한다.
+    hint: '흐름 생성'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 포트 스캔 → IPS에 flow/alert 이벤트 생성
+      ssh att@192.168.0.202 "nmap -sS -T4 --top-ports 30 192.168.0.161 2>/dev/null | grep open" | jq -s length
+      # 2) sqlmap SQLi 자동 주입 → http/alert 이벤트 생성 (dvwa WAF 403)
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=2 --risk=2 --flush-session --disable-coloring >/dev/null 2>&1"
+      # 3) 단계 완료 마커
+      echo traffic_generated
+    answer_detail: "흐름 생성 = 스캔(nmap)+웹공격(sqlmap)으로 eve.json에 flow/alert/http 이벤트 남김. 포렌식 분석 대상."
+    verify:
+      type: output_contains
+      expect: 'traffic_generated'
+      field: stdout
+      semantic: {intent: "흐름 생성", success_criteria: ["트래픽"], acceptable_methods: ["**[OSS] nmap/sqlmap (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — event_type별로 단서를 분류한다
+      > **이 단계에서 할 일:** 최근 eve.json에서 event_type 값만 뽑아 종류별 건수를 센다.
+      > **왜:** eve.json은 event_type(alert/http/flow/tls/dns/fileinfo)으로 나뉘고, 각 타입이 다른
+      > 포렌식 단서를 준다 — 무엇이 얼마나 쌓였는지부터 본다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      tail -n 3000 /var/log/suricata/eve.json | grep -oE '"event_type":"[a-z]+"' | sort | uniq -c | head
+      echo types_analyzed
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+           39 "event_type":"alert"
+         1039 "event_type":"fileinfo"
+          754 "event_type":"flow"
+         1054 "event_type":"http"
+          114 "event_type":"tls"
+      types_analyzed
+      ```
+
+      ### ▷ 결과 해석
+      각 타입의 의미: alert=탐지(룰 매치), http=요청 상세(URL/UA), flow=연결 요약(바이트/패킷),
+      tls=암호화 핸드셰이크(SNI/JA3), fileinfo=전송 파일. 포렌식은 이 타입들을 한 사건으로 엮는 작업이다.
+    hint: 'event_type'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1~2) eve.json에서 event_type 값을 뽑아 종류별 건수 집계
+      ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep -oE '\"event_type\":\"[a-z]+\"' | sort | uniq -c | head"
+      # 3) 단계 완료 마커
+      echo types_analyzed
+    answer_detail: "event_type 분석 = eve.json의 alert/flow/http/dns/tls 분포. 각 타입이 다른 포렌식 단서."
+    verify:
+      type: output_contains
+      expect: 'types_analyzed'
+      field: stdout
+      semantic: {intent: "event_type", success_criteria: ["타입 분포"], acceptable_methods: ["**[OSS] grep (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — "누가"를 묶는다 (출처 IP 상관)
+      > **이 단계에서 할 일:** 최근 eve.json에서 공격자 출처 IP(192.168.0.202)가 든 이벤트 건수를 센다.
+      > **왜:** 포렌식의 핵심 질문은 "누가"다. el34는 SNAT가 없어 출처 IP가 보존되므로, 이 IP로 모든
+      > 이벤트를 한 공격자 활동으로 묶을 수 있다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      tail -n 3000 /var/log/suricata/eve.json | grep -c '192.168.0.202'
+      echo src_correlated
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      2955
+      src_correlated
+      ```
+
+      ### ▷ 결과 해석
+      이 출처가 든 이벤트가 다수면(여기선 2955건) 그만큼 활동이 활발했다는 뜻. 출처가 보존되니, 이
+      한 IP를 축으로 STEP 3의 여러 event_type을 묶어 '한 공격자가 무엇을 했나'를 복원한다.
+    hint: '출처 상관'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1) 공격자 출처 IP(192.168.0.202) 이벤트 건수 집계 (출처 기반 활동 묶기)
+      ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep '192.168.0.202'" | jq -s length
+      # 2) 단계 완료 마커
+      echo src_correlated
+    answer_detail: "출처 상관 = 출처 IP로 eve.json 이벤트 묶기. SNAT 없는 출처 보존이 포렌식 귀속의 기반."
+    verify:
+      type: output_contains
+      expect: 'src_correlated'
+      field: stdout
+      semantic: {intent: "출처 상관", success_criteria: ["IP 묶기"], acceptable_methods: ["**[OSS] grep (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 흐름(flow)으로 연결의 '모양'을 본다
+      > **이 단계에서 할 일:** flow 이벤트 한 건을 뽑아 그 필드 형태(앞부분)를 본다.
+      > **왜:** flow 이벤트는 연결 단위 요약(바이트·패킷·기간)을 준다 — 대량 전송(데이터 유출)이나
+      > 주기적 소량(C2 비콘)을 모양으로 식별하는 단서다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      tail -n 3000 /var/log/suricata/eve.json | grep '"event_type":"flow"' | head -1 | head -c 80
+      echo; echo flow_analyzed
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 값은 환경마다 다름)
+      ```
+      {"timestamp":"2026-06-24T14:04:44.381772+0000","flow_id":1659888405818962,"in_if
+      flow_analyzed
+      ```
+
+      ### ▷ 결과 해석
+      flow 이벤트엔 timestamp·flow_id와 함께 bytes_toserver/toclient·pkts·duration 필드가 있다(앞 80자만
+      잘라 봄). 운영에선 jq로 bytes_toserver가 큰 flow(유출 의심)나, 같은 목적지로 일정 간격 소량 flow가
+      반복되는 것(비콘)을 골라낸다.
+    hint: 'flow 분석'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) flow 이벤트 한 건의 앞부분(연결 요약 필드) 확인
+      ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep '\"event_type\":\"flow\"' | head -1 | head -c 80"
+      # 2) 줄바꿈 + 단계 완료 마커
+      echo; echo flow_analyzed
+    answer_detail: "flow 분석 = 연결 단위 요약(bytes/pkts/duration). 대량=유출, 주기적 소량=비콘 식별."
+    verify:
+      type: output_contains
+      expect: 'flow_analyzed'
+      field: stdout
+      semantic: {intent: "flow 분석", success_criteria: ["연결 요약"], acceptable_methods: ["**[OSS] eve flow (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — "언제"를 세운다 (타임라인 복원)
+      > **이 단계에서 할 일:** 출처 이벤트의 timestamp를 시간순으로 뽑고, 타임라인에 들어갈 총 이벤트
+      > 수를 센다.
+      > **왜:** 포렌식의 산출물은 "언제 무엇이 일어났나"의 타임라인이다 — 정찰→침투→유출 순서를 시각으로
+      > 재구성한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      tail -n 3000 /var/log/suricata/eve.json | grep 192.168.0.202 | grep -oE '"timestamp":"[0-9T:.-]+' | head -5
+      N=$(tail -n 3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+      echo "타임라인 이벤트 ${N}건"
+      echo timeline_built
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 시각/건수는 환경마다 다름)
+      ```
+      "timestamp":"2026-06-24T14:04:06.073615
+      "timestamp":"2026-06-24T14:04:06.074732
+      "timestamp":"2026-06-24T14:04:06.075935
+      타임라인 이벤트 2955건
+      timeline_built
+      ```
+
+      ### ▷ 결과 해석
+      timestamp들이 시간순으로 나오면 이 순서가 곧 공격 타임라인의 뼈대다. 운영에선 이 시각에 event_type을
+      붙여 "14:04:06 스캔 → 14:04:44 SQLi → ..."처럼 킬체인을 재구성한다(사건 재구성·법적 증거).
+    hint: '타임라인'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) 출처 이벤트의 timestamp 시간순 추출
+      ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep 192.168.0.202 | grep -oE '\"timestamp\":\"[0-9T:.-]+' | head -5"
+      # 2) 타임라인 총 이벤트 수
+      N=$(ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep -c 192.168.0.202")
+      echo "타임라인 이벤트 ${N}건"
+      # 3) 단계 완료 마커
+      echo timeline_built
+    answer_detail: "타임라인 = eve.json timestamp 추출로 시간순 재구성. 포렌식 핵심 산출물."
+    verify:
+      type: output_contains
+      expect: 'timeline_built'
+      field: stdout
+      semantic: {intent: "타임라인", success_criteria: ["시간순 재구성"], acceptable_methods: ["**[관리적] 타임라인 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — 증거를 보전한다 (무결성 해시)
+      > **이 단계에서 할 일:** 증거 로그(eve.json)의 SHA-256 해시를 계산해 무결성 지문을 남긴다.
+      > **왜:** 포렌식 증거가 법적 효력을 가지려면 '변조되지 않았음'을 증명해야 한다. 그 증명이 해시
+      > 기반 chain of custody다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      H=$(sha256sum /var/log/suricata/eve.json | cut -c1-32)
+      echo "eve.json 증거 무결성 해시(SHA-256): ${H}"
+      echo "chain of custody: 해시+수집시각으로 변조 방지 (원본 패킷은 pcap)"
+      echo "$H" | grep -qE "^[a-f0-9]{16}" && echo evidence_preserved
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 해시값은 매번 다름)
+      ```
+      eve.json 증거 무결성 해시(SHA-256): 75b4492fd401a1693a5c2aa82d941c17
+      chain of custody: 해시+수집시각으로 변조 방지 (원본 패킷은 pcap)
+      evidence_preserved
+      ```
+
+      ### ▷ 결과 해석
+      16진수 해시가 산출되면 그 시점 파일의 '지문'이 확보된 것. 주의: eve.json은 계속 append돼서 해시는
+      실행할 때마다 달라진다 — 실제 증거 보전은 수집 순간 파일을 복사·동결한 뒤 그 사본의 해시를 기록한다.
+      원본 패킷은 pcap으로 별도 보전한다.
+    hint: 'PCAP/증거'
+    category: report
+    points: 12
+    answer: |
+      # 1) 증거 로그 SHA-256 해시 계산 (무결성 지문)
+      H=$(ssh ccc@10.20.31.2 "sha256sum /var/log/suricata/eve.json | cut -c1-32")
+      echo "eve.json 증거 무결성 해시(SHA-256): ${H}"
+      # 2) chain of custody 메모
+      echo "chain of custody: 해시+수집시각으로 변조 방지 (원본 패킷은 pcap)"
+      # 3) 해시 산출 확인 → 단계 완료 마커
+      echo "$H" | grep -qE "^[a-f0-9]{16}" && echo evidence_preserved
+    answer_detail: "증거 보전 = eve.json SHA-256 해시로 무결성(chain of custody). 원본은 pcap."
+    verify:
+      type: output_contains
+      expect: 'evidence_preserved'
+      field: stdout
+      semantic: {intent: "PCAP/증거", success_criteria: ["보전"], acceptable_methods: ["**[설명] 증거 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — 포렌식 결과를 보고서로 남긴다
+      > **이 단계에서 할 일:** 출처 이벤트 수와 증거 해시를 다시 집계해, 그 실측을 인용한 보고서 골격을
+      > 출력한다.
+      > **왜:** 사건 보고는 추측이 아니라 집계 수치와 증거 해시를 근거로 해야 신뢰받고 법적으로도 선다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      N=$(tail -n 3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+      H=$(sha256sum /var/log/suricata/eve.json | cut -c1-16)
+      echo "# W07 네트워크 포렌식 보고서 — event_type/출처상관(${N}건)·flow/타임라인·증거(해시 ${H})"
+      echo netforensics_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수·해시는 환경마다 다름)
+      ```
+      # W07 네트워크 포렌식 보고서 — event_type/출처상관(2955건)·flow/타임라인·증거(해시 75b4492fd401a169)
+      netforensics_report_done
+      ```
+
+      ### ▷ 결과 해석
+      보고서 한 줄 골격이다. 제출용은 STEP 3~7의 구체값(event_type 분포, 출처 상관 건수, flow 모양,
+      타임라인, 증거 해시)과 사건 서사(정찰→침투→…)를 본문으로 채운다.
+    hint: '분석+타임라인+증거'
+    category: report
+    points: 14
+    answer: |
+      # 1) 출처 이벤트 수 집계 (인용 근거 ①)
+      N=$(ssh ccc@10.20.31.2 "tail -n 3000 /var/log/suricata/eve.json | grep -c 192.168.0.202")
+      # 2) 증거 해시 계산 (인용 근거 ②)
+      H=$(ssh ccc@10.20.31.2 "sha256sum /var/log/suricata/eve.json | cut -c1-16")
+      # 3) 실측 수치 인용 보고서 출력
+      echo "# W07 네트워크 포렌식 보고서 — event_type/출처상관(${N}건)·flow/타임라인·증거(해시 ${H})"
+      # 4) 보고서 생성 완료 마커
+      echo netforensics_report_done
+    answer_detail: "네트워크 포렌식 보고 = 실측 출처 건수/증거 해시 인용. 증거 기반."
+    verify:
+      type: output_contains
+      expect: 'netforensics_report_done'
+      field: stdout
+      semantic: {intent: "포렌식 보고", success_criteria: ["분석/타임라인/증거"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

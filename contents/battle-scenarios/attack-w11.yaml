@@ -1,0 +1,214 @@
+id: "attack-w11"
+category: "attack"
+title: "[공격기법 W11] user에서 root로 — SUID·sudo 오설정·cron으로 권한 상승 vs 탐지·하드닝"
+difficulty: "hard"
+time_limit: 3000
+battle_type: "1v1"
+description: |
+  발판(일반 사용자 셸)을 잡았다고 끝이 아니다. **권한 상승(Privilege Escalation)**으로 root가 돼야
+  진짜 장악이다. SUID 바이너리, sudo 설정 오류, world-writable, cron, capabilities, 커널 취약점 —
+  잠긴 문 옆의 **열린 창문**을 찾는다. 방어자는 권한 상승 흔적(새 권한 계정·SUID 변경·비정상 sudo)을
+  탐지하고 하드닝한다.
+
+  ▸ 모드: solo(공격자 권한상승 시뮬→탐지 1인) / duel(상대 호스트 권한상승→본인 탐지). 대상=solo 본인 / duel 상대.
+
+  ▸ 알아둘 점 — Red는 발판 이후 **호스트 내부** 권한 상승 — 명령 로그 신뢰 제한 → 대상 호스트 아티팩트로
+    채점. privesc 결과 마커: root 권한 백도어 계정 **`at11root`**, root 셸 리스너 **포트 41141**. 탐지룰
+    Wazuh **id 101411**.
+
+red_missions:
+  - order: 1
+    assess_target: opponent
+    target_vm: web
+    points: 22
+    instruction: |
+      ## 🎯 RED-1 — 권한 상승 → root 백도어 계정
+
+      ### 상황
+      SUID/sudo 오설정/cron 등으로 root 권한을 획득하고, 지속성을 위해 백도어 계정(**at11root**)을
+      만든다(root 권한으로 useradd). privesc 성공의 증거다.
+
+      ### 할 일
+      권한 상승 후 root로 백도어 계정을 만든다.
+      ```bash
+      find / -perm -4000 2>/dev/null        # SUID 헌팅
+      sudo -l                                # sudo 오설정 확인
+      # root 획득 후:
+      useradd -m -s /bin/bash at11root
+      ```
+
+      ### 채점 방법
+      대상 호스트 `/etc/passwd`에 권한 상승 산물(at11root)이 추가됐는지로 채점.
+
+      ### 합격 기준
+      `/etc/passwd`에 `at11root`가 있다(privesc 성공).
+    hint: "SUID/sudo로 root → useradd at11root. 채점: file_contains passwd at11root."
+    verify:
+      type: "file_contains"
+      expect: "at11root"
+      checks:
+        - { id: "red-1-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "at11root" } }
+      semantic:
+        intent: "MITRE T1548/T1068 — 권한 상승(SUID/sudo/cron/kernel). root 획득 후 백도어 계정 = privesc 성공 증거."
+        success_criteria:
+          - "/etc/passwd에 at11root"
+          - "어떤 privesc 벡터(SUID/sudo/cron)를 썼는지 서술"
+        acceptable_methods:
+          - "SUID/sudo/cron/capabilities/kernel → root → useradd"
+        negative_signs:
+          - "권한 상승 미성공"
+
+  - order: 2
+    assess_target: opponent
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🎯 RED-2 — root persistence (셸 리스너)
+
+      ### 상황
+      root 권한으로 지속 접근 채널을 연다(root 셸 리스너 **포트 41141**, 또는 root cron/SUID 백도어).
+
+      ### 할 일
+      ```bash
+      nohup ncat -lk 41141 >/dev/null 2>&1 &    # root 셸 리스너
+      ```
+
+      ### 채점 방법
+      대상 호스트에 root persistence(포트 41141)가 생겼는지로 채점.
+
+      ### 합격 기준
+      대상 호스트에서 포트 41141이 listening이다.
+    hint: "root 셸 리스너 ncat 41141. 채점: port_listening 41141."
+    verify:
+      type: "port_listening"
+      expect: "41141"
+      checks:
+        - { id: "red-2-1", type: "port_listening", target: "web", params: { port: 41141 } }
+      semantic:
+        intent: "T1543/T1053 — root persistence(셸 리스너/cron/SUID 백도어). 권한 상승의 지속화."
+        success_criteria:
+          - "포트 41141 listening"
+          - "root persistence 기법 서술"
+        acceptable_methods:
+          - "root 셸 리스너 / cron / SUID 백도어"
+        negative_signs:
+          - "persistence 미생성"
+
+blue_missions:
+  - order: 1
+    assess_target: self
+    target_vm: web
+    points: 20
+    instruction: |
+      ## 🛡️ BLUE-1 — 권한 상승 흔적 탐지
+
+      ### 상황
+      권한 상승 흔적을 탐지한다: 새 권한 계정(at11root), 비정상 SUID 바이너리, world-writable, 비정상
+      sudo 사용, root 프로세스.
+
+      ### 할 일
+      호스트를 점검해 권한 상승 산물(at11root)을 찾는다.
+
+      ### 채점 방법
+      대상 호스트에 권한 상승 산물(at11root)이 탐지되는지로 채점.
+
+      ### 합격 기준
+      `/etc/passwd`에 `at11root`가 있고 탐지했다.
+    hint: "suid_bin/users 점검으로 privesc 흔적. 채점: file_contains passwd at11root."
+    verify:
+      type: "file_contains"
+      expect: "at11root"
+      checks:
+        - { id: "blue-1-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "at11root" } }
+      semantic:
+        intent: "privesc 탐지 — 새 권한 계정/비정상 SUID/world-writable/sudo 남용. 채점 핵심은 발견+점검(도구 실행 증거 비요구)."
+        success_criteria:
+          - "권한 상승 산물 확인"
+          - "suid_bin/users/sudo 점검"
+          - "baseline 대비 새 SUID/계정 식별"
+        acceptable_methods:
+          - "osquery suid_bin/users + sudo 로그 등(도구보다 발견 핵심)"
+        negative_signs:
+          - "탐지 누락"
+
+  - order: 2
+    assess_target: self
+    target_vm: siem
+    points: 22
+    instruction: |
+      ## 🛡️ BLUE-2 — privesc 탐지룰 (id 101411)
+
+      ### 상황
+      권한 상승을 탐지하는 Wazuh 룰(**id 101411**)을 `local_rules.xml`에 작성한다(새 계정 추가, 비정상
+      sudo). 즉시 경보로 잡는다.
+
+      ### 할 일
+      `local_rules.xml`에 privesc 탐지룰을 추가하고 `wazuh-control restart`한다.
+      ```xml
+      <group name="edu,syscheck,">
+        <rule id="101411" level="12">
+          <if_group>syscheck</if_group>
+          <field name="file">/etc/passwd</field>
+          <description>EDU W11 - privesc account added to /etc/passwd</description>
+        </rule>
+      </group>
+      ```
+
+      ### 채점 방법
+      `local_rules.xml`에 id 101411 룰이 있는지로 확인.
+
+      ### 합격 기준
+      local_rules.xml에 101411 룰이 있다.
+    hint: "local_rules.xml에 privesc(계정/sudo) 탐지룰(id 101411) → restart."
+    verify:
+      type: "file_contains"
+      expect: "101411"
+      checks:
+        - { id: "blue-2-1", type: "file_contains", target: "siem",
+            params: { path: "/var/ossec/etc/rules/local_rules.xml", pattern: "101411" } }
+      semantic:
+        intent: "privesc 탐지룰 — 새 계정/passwd 변경/비정상 sudo를 Wazuh 룰로. 권한 변화 즉시 경보."
+        success_criteria:
+          - "local_rules.xml에 rule id 101411"
+          - "privesc 신호(계정/passwd/sudo) 탐지"
+          - "어떤 이벤트에 매칭"
+        acceptable_methods:
+          - "local_rules.xml 101411 + restart"
+        negative_signs:
+          - "XML 문법 오류 / 정상 변경 과탐"
+
+  - order: 3
+    assess_target: self
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-3 — 하드닝 권고 (SUID 최소화·sudo 정책·커널)
+
+      ### 상황
+      권한 상승 표면을 줄이는 하드닝을 권고한다: 불필요 SUID 제거, sudo 최소권한/NOPASSWD 제거,
+      world-writable 정리, 커널/패키지 패치, capabilities 검토.
+
+      ### 할 일
+      SUID 최소화/sudo 정책/패치/capabilities를 권고한다.
+
+      ### 채점 방법
+      web 서버(Apache)가 정상 가동 중인지로 채점(하드닝 후 보존).
+
+      ### 합격 기준
+      web의 apache2가 running이다.
+    hint: "SUID 최소화/sudo 정책/패치/capabilities 권고. 채점: process_running web apache2."
+    verify:
+      type: "process_running"
+      expect: "apache"
+      checks:
+        - { id: "blue-3-1", type: "process_running", target: "web", params: { name: "apache2" } }
+      semantic:
+        intent: "하드닝 — SUID 최소화, sudo 최소권한, world-writable 정리, 패치, capabilities 검토. privesc 표면 축소."
+        success_criteria:
+          - "apache2 가동(보존) 확인"
+          - "SUID/sudo/패치/capabilities 권고"
+          - "위험 큰 벡터부터 우선순위"
+        acceptable_methods:
+          - "하드닝 권고 + 서비스 보존"
+        negative_signs:
+          - "과도한 제거로 서비스 손상 / 우선순위 없음"

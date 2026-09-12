@@ -1,0 +1,1128 @@
+lab_id: standalone-secuops-week04
+title: Suricata 룰 심화 — pcre / fast_pattern / flowbits / threshold / suppression + R/B/P
+version: standalone-non-ai
+course: secuops
+week: 4
+description: |
+  W03 의 단순 content 매칭에서 한 단계 위 — content modifier 5종 (nocase / depth /
+  offset / distance / within), HTTP sticky buffer 9종, pcre 정규식 + content prefilter
+  결합, fast_pattern 명시, flowbits 다단계 추적, threshold rate-limit (룰 modifier),
+  threshold.config 의 suppress + event_filter (운영 통제), 그리고 5 기술 결합 1개 룰
+  (sid 9005099) + R/B/P (다단계 공격 추적 + suppression 권장) + 종합 보고서. 한 cycle.
+difficulty: medium
+duration_minutes: 200
+prerequisites:
+  - "W03 통과 — Suricata 데몬 + eve.json + 새 alert 룰 작성 익숙"
+  - "장비 직접 SSH: ips ssh ccc@10.20.31.2 (root 명령은 sudo) + 공격 ssh att@192.168.0.202 (비번 1)"
+  - "lecture §1-§9 (5 기술 + 트러블슈팅) 숙지"
+objectives:
+  - "content modifier 5종 + HTTP sticky buffer 9종 사용"
+  - "pcre + content prefilter — 한국 주민번호 / SQL UNION"
+  - "fast_pattern 명시 + multi-pattern matcher 효과 이해"
+  - "flowbits 다단계 추적 (401 → /admin)"
+  - "threshold rate-limit (룰 modifier) + 3 mode + 3 track"
+  - "threshold.config 의 suppress + event_filter (운영 통제)"
+  - "5 기술 결합 production-grade 룰 (sid 9005099)"
+  - "R/B/P — 다단계 공격 + suppression 권장"
+  - "트러블슈팅 + 종합 보고서"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 MISSION — content modifier 5종 + http.uri 결합 룰 (sid 9005041 /admin)
+
+      `/etc/suricata/rules/local.rules` 에 **http.uri + depth + nocase + fast_pattern**
+      4 modifier 결합 룰 작성 → syntax 검증 → reload → 트리거 → eve.json 검증 → cleanup.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰 작성·검증은 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 룰 작성 + 검증 + reload ──
+      # 1. 룰 작성 (heredoc 사용 — escape 단순화)
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 admin path access\"; http.uri; content:\"/admin\"; depth:6; nocase; fast_pattern; classtype:attempted-recon; priority:2; sid:9005041; rev:1;)
+      EOF"
+      # 2. syntax 검증
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3
+      # 3. rule-files 등록 확인 (suricata.yaml 이미 local.rules 포함)
+      sudo grep "local.rules" /etc/suricata/suricata.yaml
+      # 4. reload
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 5. 트리거 — /admin + /ADMIN (nocase 검증) — 진짜 디렉터리 열거 도구 ffuf ──
+      # 💡 ffuf 가 2-워드 목록(admin, ADMIN)을 FUZZ 에 대입해 실제 GET /admin·/ADMIN 요청을 발사한다(브라우저/Burp 로도 가능). 탐지(eve.json)가 목적이라 -s 로 조용히.
+      ffuf -u 'http://juice.el34.lab/FUZZ' -w <(printf 'admin\nADMIN\n') -mc all -s
+
+      # ── el34-ips 에서: 6. alert 검증 (트리거 4초 후) ──
+      sudo grep "9005041" /var/log/suricata/eve.json | jq -s length
+      sudo grep "9005041" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature, severity:.alert.severity, url:.http.url}'
+      ```
+
+      ## 📋 확인 사항
+
+      - syntax 검증: `Notice: ...successfully loaded. Exiting.`
+      - reload: `{"message":"done","return":"OK"}`
+      - 명령 6 카운트: **2–4** (ffuf 가 admin·ADMIN 2 요청 → NIC 미러링에 따라 2~4 alert)
+      - alert 출력: `{sig:"el34 admin path access", severity:2, url:"/admin" 또는 "/ADMIN"}`
+
+      ## 💡 왜 이걸 하는가?
+
+      4 modifier 결합 — `http.uri` (영역) + `content` (패턴) + `depth:6` (URI 첫 6 byte) +
+      `nocase` (대소문자) + `fast_pattern` (성능). production 룰의 표준 형식.
+
+      ## 🔍 결과 해석 + 트러블슈팅
+
+      - **정상**: 4 alert (2 요청 × 2 NIC) + sig 일치 + severity 2 (priority 2 매핑)
+      - **비정상 1**: alert 1-2 (양 NIC 중 하나만 capture) → af-packet 점검
+      - **비정상 2**: alert 0 → http.uri sticky buffer 5.x 후위 문법 사용했는지 점검 (6v6
+        은 6.0.4 → 전위 문법)
+      - **비정상 3**: ADMIN 만 매치 안 됨 → nocase 누락
+    hint: 'el34-ips 접속 후 — local.rules 에 http.uri + content:"/admin" + depth:6 + nocase + fast_pattern 룰(sid 9005041) append → suricatasc -c reload-rules'
+    category: manipulation
+    points: 15
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 admin path access\"; http.uri; content:\"/admin\"; depth:6; nocase; fast_pattern; classtype:attempted-recon; priority:2; sid:9005041; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/FUZZ' -w <(printf 'admin\nADMIN\n') -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005041 /var/log/suricata/eve.json; do :; done"' || true
+      ssh ccc@10.20.31.2 'sudo grep "9005041" /var/log/suricata/eve.json | jq -s length'
+      ssh ccc@10.20.31.2 'sudo grep "9005041" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature, severity:.alert.severity, url:.http.url}"'
+    answer_detail: |
+      4 modifier 결합 — http.uri (영역) + content (/admin) + depth (URI 첫 6) + nocase +
+      fast_pattern. priority:2 → severity 2. 2 요청 × 2 NIC = 4 alert.
+    verify:
+      type: output_contains
+      expect: 'admin path'
+      field: stdout
+      semantic:
+        intent: "content modifier 5종 + sticky buffer 결합"
+        success_criteria:
+          - "9005041 alert"
+          - "/admin URL"
+          - "severity 2"
+          - "nocase 효과 (ADMIN 매치)"
+        acceptable_methods:
+          - "**[OSS] http.uri sticky + content** — 표준"
+          - "**[OSS] depth:N** — URI 첫 N byte"
+          - "**[OSS] nocase** — 대소문자 무관"
+          - "**[OSS] fast_pattern** — multi-pattern matcher prefilter"
+          - "**[OSS] suricata -T -S** — 사전 syntax 검증"
+          - "**[OSS] classtype + priority** — alert 분류"
+          - "**[OSS] http.uri vs http.uri.raw** — normalized vs raw URI"
+          - "**[OSS] within/distance** — chained content (W04 §1.2)"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 2
+    instruction: |
+      ## 🎯 MISSION — pcre + content prefilter (한국 주민번호 패턴)
+
+      lecture §2.4 의 pattern — `content:"|2d|"` (= '-' byte) prefilter + `pcre:"/\d{6}-[1-4]\d{6}/"`
+      정밀 매칭. POST body 의 RRN 패턴 탐지.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰 작성·검증은 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 룰 작성 + reload ──
+      # 1. 룰 작성 — content prefilter + pcre
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 RRN in POST body\"; flow:to_server,established; http.request_body; content:\"|2d|\"; nocase; pcre:\"/\\\\d{6}-[1-4]\\\\d{6}/\"; classtype:policy-violation; priority:2; sid:9005002; rev:1;)
+      EOF"
+      # 2. 검증 + reload
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 3. 트리거 (ffuf 로 POST body 에 가짜 RRN 전송) ──
+      # 💡 ffuf 로 POST body 를 실제 전송한다(-d 로 body 고정, ?z=FUZZ 는 ffuf 필수 키워드용 더미). 탐지(eve.json)가 목적이라 -s.
+      ffuf -u 'http://juice.el34.lab/?z=FUZZ' -X POST -H 'Content-Type: application/x-www-form-urlencoded' -d 'name=hong&rrn=901231-1234567&email=h@a.com' -w <(echo x) -mc all -s
+
+      # ── el34-ips 에서: 4. alert 검증 (트리거 4초 후) ──
+      sudo grep "9005002" /var/log/suricata/eve.json | jq -s length
+      sudo grep "9005002" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature, classtype:.alert.category, method:.http.http_method, url:.http.url}'
+      ```
+
+      ## 📋 확인 사항
+
+      - syntax pass
+      - reload OK
+      - alert 1+ (POST body 의 RRN 매치)
+      - alert.category: "Potential Corporate Privacy Violation"
+
+      ## 💡 왜 이걸 하는가?
+
+      개인정보 (RRN / 신용카드 / 이메일) 의 평문 전송 검출. ISMS-P 의 PII 관리 + GDPR
+      / 개인정보보호법 의 표준 통제.
+
+      ## 🔍 결과 해석
+
+      - **정상**: alert 1+ + classtype "policy-violation"
+      - **비정상 1**: alert 없음 → http.request_body 디코더 비활성 또는 `SecRequestBodyAccess`
+        문제 → W05 의 ModSec 과 별도 (Suricata 는 자체적으로 body access)
+      - **비정상 2**: pcre escape 오류 (`\d` 가 `d` 로 해석) → suricata.log 의 syntax error
+
+      ## 운영 응용
+
+      - `http.response_body` 로 변경하면 응답 본문 (예: 누출 데이터 모니터)
+      - `http.cookie` 로 변경하면 cookie 안의 PII
+      - 신용카드 → `pcre:"/\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}/"`
+      - 이메일 → `pcre:"/[\w._%+-]+@[\w.-]+\.[A-Za-z]{2,}/"`
+    hint: 'pcre /\d{6}-[1-4]\d{6}/ + content "-" prefilter'
+    category: manipulation
+    points: 18
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 RRN in POST body\"; flow:to_server,established; http.request_body; content:\"|2d|\"; nocase; pcre:\"/\\\\d{6}-[1-4]\\\\d{6}/\"; classtype:policy-violation; priority:2; sid:9005002; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/?z=FUZZ' -X POST -H 'Content-Type: application/x-www-form-urlencoded' -d 'name=hong&rrn=901231-1234567&email=h@a.com' -w <(echo x) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005002 /var/log/suricata/eve.json; do :; done"' || true
+      ssh ccc@10.20.31.2 'sudo grep "9005002" /var/log/suricata/eve.json | jq -s length'
+      ssh ccc@10.20.31.2 'sudo grep "9005002" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature, classtype:.alert.category}"'
+    answer_detail: |
+      content "|2d|" (= '-' byte) prefilter + pcre 정밀 매치. flow:to_server,established
+      로 request 방향만. policy-violation classtype.
+    verify:
+      type: output_contains
+      expect: 'RRN'
+      field: stdout
+      semantic:
+        intent: "pcre + content prefilter — PII 탐지"
+        success_criteria:
+          - "9005002 alert"
+          - "RRN 매치"
+          - "policy-violation"
+        acceptable_methods:
+          - "**[OSS] pcre + content prefilter** — 성능 + 정확도"
+          - "**[OSS] http.request_body** — POST body"
+          - "**[OSS] content:|2d|** — hex byte (= '-')"
+          - "**[OSS] flow:to_server,established** — request only"
+          - "**[OSS] classtype:policy-violation** — 표준 카테고리"
+          - "**[OSS] pcre modifier i / s / R / U / H / M**"
+          - "**[OSS] /\\d{6}-[1-4]\\d{6}/** — 정밀 RRN"
+          - "**[OSS] 신용카드 / 이메일 변형**"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 3
+    instruction: |
+      ## 🎯 MISSION — flowbits 다단계 추적 (UA test → /admin 접근)
+
+      lecture §4 의 다단계 패턴. 같은 conn 에서 step1 (특정 UA) → step2 (/admin) 흐름을
+      flowbits 로 추적. step1 은 `flowbits:noalert` (state 만), step2 는 isset 으로 alert.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰 작성·검증은 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 2 룰 작성 + reload ──
+      # 1. 2 룰 작성
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      EOF"
+      # 2. 검증 + reload
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: step1(UA FlowbitTest → state set, alert 없음) → step2(/admin + UA → alert 발생) ──
+      # 💡 step1 = ffuf 가 UA 헤더에 FlowbitTest 마커를 실어 GET / 발사(flowbit set, noalert). step2 = ffuf 가 GET /admin 을 같은 마커 UA 로 발사(step1 set → isset 매치 → alert). 탐지(eve.json)가 목적이라 -s.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(echo 1) -mc all -s
+      ffuf -u 'http://juice.el34.lab/FUZZ' -H 'User-Agent: FlowbitTest/s2' -w <(echo admin) -mc all -s
+
+      # ── el34-ips 에서: alert 검증 (트리거 4초 후) ──
+      echo "step1 alert (noalert 이므로 0):"
+      sudo grep "9005010" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      echo "step2 alert (양 NIC sniff 라 2):"
+      sudo grep "9005011" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      sudo grep "9005011" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature, sev:.alert.severity, url:.http.url}'
+      ```
+
+      ## 📋 확인 사항 (실측 2026-05-12)
+
+      - syntax pass + reload OK
+      - step1 alert event 0 (noalert 효과)
+      - step2 alert event 2 (양 NIC sniff)
+      - step2 alert 의 sig "step2 admin after step1" + severity 1 (priority 1 매핑)
+
+      ## 💡 왜 이걸 하는가?
+
+      단순 content 매칭은 1 packet 의 패턴만 검사. 다단계 침해 (정찰 → 인증 시도 → 권한
+      상승 → 데이터 유출) 는 한 conn 의 흐름 분석 필요. flowbits 가 in-line 상태 추적의
+      표준 도구.
+
+      ## 🔍 결과 해석 + 운영 제약
+
+      - **정상**: step1 alert 0 + step2 alert 2 (양 NIC)
+      - **위험 1 (flow 경계)**: client 가 step1 후 새 TCP conn 으로 step2 → flow_id 다름
+        → flowbits 매치 실패. 단일 TCP 연결(keep-alive) 유지 확인.
+      - **위험 2 (flow timeout)**: step1 과 step2 사이 60초+ 경과 시 flow context 만료
+      - **위험 3 (flow memcap)**: 대규모 traffic 환경에서 일부 flow context drop → SIEM 통합 권장
+
+      ## 운영 응용
+
+      - 401 → /admin 의 인증 우회 (KISA 사고 패턴)
+      - SQL injection probing → 성공 패턴 → DB dump
+      - APT — recon → execution → lateral movement
+    hint: 'flowbits set + isset + noalert — 다단계 추적'
+    category: manipulation
+    points: 22
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(echo 1) -mc all -s"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/FUZZ' -H 'User-Agent: FlowbitTest/s2' -w <(echo admin) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005011 /var/log/suricata/eve.json; do :; done"' || true
+      echo "step1 alert event count (noalert ~ 0):"
+      ssh ccc@10.20.31.2 'sudo grep "9005010" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"'
+      echo "step2 alert event count (양 NIC = 2):"
+      ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"'
+      ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature, sev:.alert.severity}"'
+    answer_detail: |
+      step1 (sid 9005010): UA "FlowbitTest" → flowbits:set,fb_test_step1 + noalert (alert
+      event 없음, state 만). step2 (sid 9005011): /admin + isset,fb_test_step1 → alert
+      발생. priority 1 → severity 1. 양 NIC sniff 라 2 alert.
+    verify:
+      type: output_contains
+      expect: 'step2'
+      field: stdout
+      semantic:
+        intent: "flowbits 다단계 추적"
+        success_criteria:
+          - "step1 noalert (alert 0)"
+          - "step2 alert 2 (양 NIC)"
+          - "severity 1"
+        acceptable_methods:
+          - "**[OSS] flowbits:set,name + flowbits:noalert** — state 만"
+          - "**[OSS] flowbits:isset,name** — 매치 조건"
+          - "**[OSS] flowbits:unset / toggle** — state 변경"
+          - "**[OSS] flow.memcap 모니터링** — context 부족"
+          - "**[OSS] same flow_id 추적** — eve.json 매칭"
+          - "**[OSS] SIEM 통합 — IP 기반 (flow 경계 무시)**"
+          - "**[OSS] KISA 사고 패턴 매핑**"
+          - "**[OSS] src_ip 기반 다단계 추적 — el34 출처 보존**"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 4
+    instruction: |
+      ## 🎯 MISSION — threshold rate-limit (룰 modifier 3 mode 비교)
+
+      lecture §5 의 3 mode (limit / threshold / both) 효과 비교. 같은 룰 3 sid 로 작성 +
+      30초에 10 burst → alert count 차이 관찰.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰 작성·카운트는 `el34-ips`, burst 는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 3 sid (limit / threshold / both) 작성 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"thr_limit 10s 5\"; http.user_agent; content:\"ThreshLimit\"; nocase; threshold:type limit, track by_src, count 5, seconds 10; sid:9005020; rev:1;)
+      alert http any any -> any any (msg:\"thr_thresh 10s 5\"; http.user_agent; content:\"ThreshThr\"; nocase; threshold:type threshold, track by_src, count 5, seconds 10; sid:9005021; rev:1;)
+      alert http any any -> any any (msg:\"thr_both 10s 5\"; http.user_agent; content:\"ThreshBoth\"; nocase; threshold:type both, track by_src, count 5, seconds 10; sid:9005022; rev:1;)
+      EOF"
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 각 mode 별 10 burst (한 src) — 진짜 퍼저 ffuf 가 UA 마커를 실어 발사 ──
+      # 💡 ffuf 가 UA 헤더에 ThreshXxx/FUZZ 마커를 실어 seq 1..10 을 대입해 10 요청을 한 src 에서 burst 로 발사한다
+      #    (Burp Intruder Sniper 의 CLI 등가물 — threshold/rate 테스트의 표준). 탐지(eve.json)만 볼 거라 -s.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshLimit/FUZZ' -w <(seq 1 10) -mc all -s
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshThr/FUZZ' -w <(seq 1 10) -mc all -s
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshBoth/FUZZ' -w <(seq 1 10) -mc all -s
+
+      # ── el34-ips 에서: 각 sid 의 alert count ──
+      echo "sid 9005020 (limit) alert count:"; sudo grep 9005020 /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      echo "sid 9005021 (threshold) alert count:"; sudo grep 9005021 /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      echo "sid 9005022 (both) alert count:"; sudo grep 9005022 /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      ```
+
+      ## 📋 확인 사항 (이론값 — 한 NIC 기준, 실측은 × 2)
+
+      - **9005020 limit count 5**: 10 burst → first 5 alert, 6~10 무시 → **5 alert × 2 NIC = 10**
+      - **9005021 threshold count 5**: 10 burst → 5 마다 1 alert → **2 alert × 2 NIC = 4**
+      - **9005022 both count 5**: 10 burst → 5 채워야 첫 alert + 후속 5마다 → **2 alert × 2 NIC = 4**
+
+      (실측은 시간에 따라 약간 변동 — 10초 안에 다 들어왔는지)
+
+      ## 💡 왜 이걸 하는가?
+
+      threshold 의 3 mode 의 운영 효과를 숫자로 비교. limit 은 burst 의 첫 N만, threshold
+      는 sparse, both 는 limit + threshold 결합. production 권장은 보통 **both** —
+      짧은 burst 무시 + 지속 공격 sparse alert.
+
+      ## 🔍 결과 해석
+
+      - **9005020 (limit)**: 첫 5 발생 → 그 후 무시 → sparse 공격 미탐지 가능
+      - **9005021 (threshold)**: 매 5 마다 alert → 짧은 burst (count 4) 알 수 없음
+      - **9005022 (both)**: 짧은 burst 무시 + 지속 공격 sparse → 운영 권장
+
+      ## 운영 응용
+
+      - **SSH brute force**: both (5/60s) — 첫 5 시도 ignore, 후속 sparse
+      - **DDoS**: threshold (100/10s, track by_dst) — sparse alert
+      - **Port scan**: limit (10/60s) — 첫 10 alert 후 무시 + suppression 보조
+    hint: 'threshold type limit/threshold/both 3 sid 비교'
+    category: manipulation
+    points: 20
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"thr_limit 10s 5\"; http.user_agent; content:\"ThreshLimit\"; nocase; threshold:type limit, track by_src, count 5, seconds 10; sid:9005020; rev:1;)
+      alert http any any -> any any (msg:\"thr_thresh 10s 5\"; http.user_agent; content:\"ThreshThr\"; nocase; threshold:type threshold, track by_src, count 5, seconds 10; sid:9005021; rev:1;)
+      alert http any any -> any any (msg:\"thr_both 10s 5\"; http.user_agent; content:\"ThreshBoth\"; nocase; threshold:type both, track by_src, count 5, seconds 10; sid:9005022; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      # 반복 요청은 진짜 퍼저 ffuf 로 발사(Burp Intruder Sniper 의 CLI 등가물) — UA 마커에 seq 1..10 대입, 탐지만 관찰(-s).
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshLimit/FUZZ' -w <(seq 1 10) -mc all -s"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshThr/FUZZ' -w <(seq 1 10) -mc all -s"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: ThreshBoth/FUZZ' -w <(seq 1 10) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005020 /var/log/suricata/eve.json; do :; done"' || true
+      echo "sid 9005020 alert count: $(ssh ccc@10.20.31.2 'sudo grep 9005020 /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')"
+      echo "sid 9005021 alert count: $(ssh ccc@10.20.31.2 'sudo grep 9005021 /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')"
+      echo "sid 9005022 alert count: $(ssh ccc@10.20.31.2 'sudo grep 9005022 /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')"
+    answer_detail: |
+      3 mode 비교 — limit (첫 N만) / threshold (N 마다 1) / both (limit + threshold).
+      production 권장 both (짧은 burst 무시 + 지속 공격 sparse).
+    verify:
+      type: output_contains
+      expect: alert count
+      field: stdout
+      semantic:
+        intent: "threshold 3 mode 비교"
+        success_criteria:
+          - "3 sid alert count"
+          - "limit / threshold / both 차이"
+        acceptable_methods:
+          - "**[OSS] threshold:type limit, track by_src** — burst 의 첫 N"
+          - "**[OSS] threshold:type threshold** — sparse"
+          - "**[OSS] threshold:type both** — limit + threshold"
+          - "**[OSS] track by_dst** — DDoS 적합"
+          - "**[OSS] track by_rule** — global"
+          - "**[OSS] threshold.config event_filter** — 외부 통제"
+          - "**[OSS] rate_filter type new_action drop** — IPS 액션 (5분 차단)"
+          - "**[OSS] count / seconds 의 운영 의미**"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 5
+    instruction: |
+      ## 🎯 MISSION — threshold.config 의 suppress + event_filter (운영 통제)
+
+      룰 modifier 와 별개로 **외부 통제**. 룰 수정 없이 운영자가 false-positive 차단 +
+      rate-limit 변경 가능. suppress (alert 차단) + event_filter (rate-limit) 2 directive.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰·suppress·검증은 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+      (baseline → 적용 후 카운트는 눈으로 비교한다.)
+
+      ```bash
+      # ── el34-ips 에서: 1-2. 활성 룰(9005030) 작성 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 suppress test UA\"; http.user_agent; content:\"SuppTest\"; nocase; sid:9005030; rev:1;)
+      EOF"
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: baseline 트리거 (ffuf 가 UA 마커 SuppTest 로 GET / 발사) ──
+      # 💡 ffuf 가 UA 헤더에 SuppTest 마커를 실어 요청한다(브라우저/Burp 로도 가능). 탐지(eve.json)가 목적이라 -s.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: SuppTest/FUZZ' -w <(echo 1) -mc all -s
+
+      # ── el34-ips 에서: baseline alert 카운트 (suppress 없음) ──
+      sudo grep "9005030" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+
+      # ── el34-ips 에서: 3-4. threshold.config 에 suppress 추가 (attacker IP 만) + 활성화 ──
+      sudo bash -c "cat > /etc/suricata/threshold.config <<EOF
+      suppress gen_id 1, sig_id 9005030, track by_src, ip 192.168.0.202
+      EOF"
+      sudo grep "threshold-file" /etc/suricata/suricata.yaml | head -2
+      # 주석 처리되어 있다면 활성화:
+      sudo sed -i "s|^# threshold-file:|threshold-file:|" /etc/suricata/suricata.yaml
+
+      # ── el34-ips 에서: 5. reload ──
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 재트리거 (suppress 적용 후 같은 SuppTest 요청) ──
+      # 💡 ffuf 가 같은 SuppTest 마커 UA 로 다시 발사 — suppress 가 이 src 의 alert 를 막는지 확인. -s.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: SuppTest/FUZZ' -w <(echo 1) -mc all -s
+
+      # ── el34-ips 에서: suppress 적용 후 alert (attacker IP 라 추가 0 예상) + cleanup ──
+      sudo grep "9005030" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      sudo rm -f /etc/suricata/threshold.config; sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules
+      sudo suricatasc -c reload-rules
+      ```
+
+      ## 📋 확인 사항
+
+      - baseline: alert 1+ (양 NIC = 2)
+      - suppress 적용 후: alert 카운트가 **변하지 않음** (이미 적재된 baseline alert + 새 alert
+        들어오지 않음 — suppress 효과)
+
+      > **주의**: `grep -c` 는 누적 카운트라 baseline 후 추가된 alert 가 0 이어야 정상.
+      > 정확한 측정은 baseline / after delta.
+
+      ## 💡 왜 이걸 하는가?
+
+      lecture §7 — production 운영의 false-positive 튜닝. 모니터링 서버 / 정상 사용자 IP /
+      알려진 health check 가 매번 alert 매치 → 운영자가 source-specific suppress 로 차단.
+      룰 수정 없이 외부 통제 → git audit + 분기 검토 가능.
+
+      ## 🔍 결과 해석
+
+      - **정상**: baseline alert 있음 + suppress 후 추가 alert 없음
+      - **비정상 1**: threshold-file 미활성 → suricata.yaml 의 `# threshold-file:` 주석 제거
+      - **비정상 2**: suppress 후에도 alert → IP range 매칭 오류 (track by_src 확인)
+    hint: 'threshold.config 의 suppress gen_id 1, sig_id 9005030, track by_src, ip 192.168.0.202'
+    category: operations
+    points: 17
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 suppress test UA\"; http.user_agent; content:\"SuppTest\"; nocase; sid:9005030; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: SuppTest/FUZZ' -w <(echo 1) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005030 /var/log/suricata/eve.json; do :; done"' || true
+      BEFORE=$(ssh ccc@10.20.31.2 'sudo grep "9005030" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      echo "baseline alert: $BEFORE"
+      # suppress 추가
+      ssh ccc@10.20.31.2 'sudo bash -c "cat > /etc/suricata/threshold.config <<EOF
+      suppress gen_id 1, sig_id 9005030, track by_src, ip 192.168.0.202
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo sed -i "s|^# threshold-file:|threshold-file:|" /etc/suricata/suricata.yaml'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: SuppTest/FUZZ' -w <(echo 1) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005030 /var/log/suricata/eve.json; do :; done"' || true
+      AFTER=$(ssh ccc@10.20.31.2 'sudo grep "9005030" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      echo "suppress 적용 후 alert: $AFTER  delta: $((AFTER - BEFORE))"
+      echo "(delta = 0 이면 suppress 동작)"
+      ssh ccc@10.20.31.2 'sudo rm -f /etc/suricata/threshold.config; sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+    answer_detail: |
+      baseline 측정 → threshold.config 에 suppress 추가 (attacker IP) → reload → 재트리거 →
+      delta 0 검증. 외부 통제 — 룰 수정 없이 false-positive 차단.
+    verify:
+      type: output_contains
+      expect: 'suppress'
+      field: stdout
+      semantic:
+        intent: "threshold.config 의 suppress (외부 통제)"
+        success_criteria:
+          - "baseline alert 1+"
+          - "suppress 추가"
+          - "delta 0 (suppress 동작)"
+        acceptable_methods:
+          - "**[OSS] threshold.config suppress** — 표준"
+          - "**[OSS] suppress + track by_src + ip <X>** — 특정 src"
+          - "**[OSS] suppress + ip [range]** — 다중 IP"
+          - "**[OSS] event_filter rate_filter** — 동적 rate-limit"
+          - "**[OSS] threshold-file: suricata.yaml** — 활성화"
+          - "**[OSS] git audit 의 threshold.config**"
+          - "**[OSS] suricatasc -c reload-rules** — downtime 0"
+          - "**[OSS] 분기 검토 — false-positive 정당화 재평가**"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo rm -f /etc/suricata/threshold.config; sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 6
+    instruction: |
+      ## 🎯 MISSION — 5 기술 결합 production-grade 룰 (sid 9005099)
+
+      lecture §8 의 종합 — **fast_pattern + content prefilter + pcre + threshold +
+      classtype + metadata + reference**. sqlmap UA + UNION SELECT 결합 + rate-limited.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰 작성·검증은 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 종합 룰(5 기술 결합) 작성 + 검증 + reload ──
+      # 1. 종합 룰 작성
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 sqlmap UNION SELECT (rate-limited)\"; flow:to_server,established; http.user_agent; content:\"sqlmap\"; fast_pattern; nocase; http.request_body; content:\"union\"; nocase; pcre:\"/\\\\bunion\\\\b\\\\s+\\\\bselect\\\\b/i\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:web-application-attack; priority:1; sid:9005099; rev:1; metadata:created_at 2026_05_11, mitre_tactic_id TA0001;)
+      EOF"
+      # 2. syntax 검증
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3
+      # 3. reload
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 4. 트리거 — 진짜 SQLi 도구 sqlmap 이 UA=sqlmap + UNION SELECT body 를 POST ──
+      # 💡 sqlmap 은 자체 UA(sqlmap/x.y)로 요청하고, POST 파라미터 union 주입 시 body 에 UNION SELECT 를 실어 보낸다
+      #    → 이 룰(UA sqlmap + body union select)이 자연히 매치. 탐지(eve.json)가 목적.
+      sqlmap -u 'http://juice.el34.lab/' --data='q=1' --batch --level=2 --risk=2 --technique=U --disable-coloring 2>&1 | grep -iE 'sqlmap|union|WAF/IPS' | head -3
+
+      # ── el34-ips 에서: 5. alert 검증 (트리거 4초 후) ──
+      echo "9005099 alert count:"
+      sudo grep "9005099" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      sudo grep "9005099" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature, sev:.alert.severity, ua:.http.http_user_agent, body:.http.request_body[:80], meta:.alert.metadata}'
+      ```
+
+      ## 📋 확인 사항
+
+      - syntax pass
+      - alert 1+ 발생 (실제 sqlmap 은 union POST 를 여러 발 보냄 → threshold limit 1/60s 는 창별로 캡하지만 스캔이 여러 창에 걸치면 다수 alert; **룰이 매치하는지**가 핵심)
+      - alert 의 sig, severity 1, ua=sqlmap/1.x (실제 sqlmap UA), body 에 UNION SELECT, metadata 의 mitre_tactic_id
+
+      ## 💡 왜 이걸 하는가?
+
+      production 룰의 표준 형식. 5 기술 결합으로:
+      - **fast_pattern**: hyperscan SIMD prefilter
+      - **content prefilter + pcre**: 정확 + 성능
+      - **flow:to_server,established**: request 방향만
+      - **threshold limit**: alert flood 차단
+      - **classtype + priority + metadata + reference**: audit + IR
+
+      ## 🔍 결과 해석 + 운영 권장
+
+      - **정상**: alert 1+ + 모든 필드 채워짐
+      - **운영 권장 5**:
+        1. 룰 작성 후 `suricata -T -S` 검증 (syntax)
+        2. `suricatasc -c reload-rules` (downtime 0)
+        3. 트리거 + alert 검증 (eve.json 의 모든 필드)
+        4. fast_pattern 명시 (autoselect 의도 불일치 방지)
+        5. metadata + reference (운영 audit + IR)
+    hint: 'fast_pattern + pcre + threshold + classtype + metadata + reference 결합'
+    category: synthesis
+    points: 25
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 sqlmap UNION SELECT (rate-limited)\"; flow:to_server,established; http.user_agent; content:\"sqlmap\"; fast_pattern; nocase; http.request_body; content:\"union\"; nocase; pcre:\"/\\\\bunion\\\\b\\\\s+\\\\bselect\\\\b/i\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:web-application-attack; priority:1; sid:9005099; rev:1; metadata:created_at 2026_05_11, mitre_tactic_id TA0001;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "sqlmap -u 'http://juice.el34.lab/' --data='q=1' --batch --level=2 --risk=2 --technique=U --disable-coloring 2>&1 | grep -iE 'sqlmap|union|WAF/IPS' | head -3"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005099 /var/log/suricata/eve.json; do :; done"' || true
+      echo "9005099 alert count:"
+      ssh ccc@10.20.31.2 'sudo grep "9005099" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"'
+      ssh ccc@10.20.31.2 'sudo grep "9005099" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature, sev:.alert.severity, ua:.http.http_user_agent}"'
+    answer_detail: |
+      5 기술 결합 production 룰. fast_pattern + content prefilter + pcre + threshold +
+      classtype + metadata. 운영 audit + IR 의 표준 형식.
+    verify:
+      type: output_contains
+      expect: '9005099'
+      field: stdout
+      semantic:
+        intent: "5 기술 결합 production 룰"
+        success_criteria:
+          - "9005099 alert"
+          - "sig 일치"
+          - "severity 1"
+          - "metadata"
+        acceptable_methods:
+          - "**[OSS] fast_pattern 명시** — hyperscan prefilter"
+          - "**[OSS] content + pcre 결합** — 정확 + 성능"
+          - "**[OSS] flow:to_server,established** — 방향 + state"
+          - "**[OSS] threshold limit** — alert flood 차단"
+          - "**[OSS] classtype + priority** — alert sort"
+          - "**[OSS] metadata created_at + mitre_tactic_id** — audit"
+          - "**[OSS] reference url/cve** — IR 컨텍스트"
+          - "**[OSS] sid 9000000+** — custom 범위"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 7
+    instruction: |
+      ## 🎯 MISSION — **R/B/P** 다단계 공격 + suppression 권장
+
+      **Red** 가 다단계 공격 (401 실패 → /admin 접근, FlowbitTest UA 로 시뮬) → **Blue**
+      가 flowbits 룰 매칭 → **Purple** 이 alert flood 분석 + suppression 권장.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰·카운트·정리는 `el34-ips`, 다단계 공격은 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+      (baseline → after 카운트는 눈으로 비교해 delta 를 구한다.)
+
+      ```bash
+      # ── el34-ips 에서: 0. STEP 3 의 flowbits 룰(9005010/9005011) 재활성 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      EOF"
+      sudo suricatasc -c reload-rules
+
+      # ── el34-ips 에서: 1. baseline (이 숫자를 적어둔다) ──
+      sudo grep "9005011" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+
+      # ── el34-attacker 에서: 2. Red — 다단계 공격 5 cycle (step1 UA → step2 /admin) — 진짜 퍼저 ffuf ──
+      # 💡 ffuf 가 step1(GET / + UA FlowbitTest/1..5)로 flowbit 5개 set → step2(GET /admin + 같은 UA)로 5회 isset 매치.
+      #    Burp Intruder Sniper 의 CLI 등가물. 탐지(eve.json)가 목적이라 -s.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s
+      ffuf -u 'http://juice.el34.lab/admin?c=FUZZ' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s
+
+      # ── el34-ips 에서: 3-4. after 카운트(delta = after - baseline, 5~10) + severity 분포 ──
+      sudo grep "9005011" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      sudo grep "9005011" /var/log/suricata/eve.json | tail -10 | jq -r .alert.severity | sort | uniq -c
+
+      # 5. Purple — suppression 권장 (시뮬, 본 공격이 known false-positive 였을 때)
+      # 권장 config 를 파일로 남겨 리뷰/적용한다 (threshold.config 에 병합할 초안).
+      cat > ~/w04_suppress_recommend.config <<'EOF'
+      # /etc/suricata/threshold.config
+      suppress gen_id 1, sig_id 9005011, track by_src, ip 192.168.0.202
+      event_filter gen_id 1, sig_id 9005011, type limit, track by_src, count 1, seconds 60
+      EOF
+      cat ~/w04_suppress_recommend.config
+
+      # ── el34-ips 에서: Cleanup ──
+      sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules
+      sudo suricatasc -c reload-rules
+      ```
+
+      ## 📋 확인 사항
+
+      - delta: **5 ~ 10** (5 cycle × 1~2 NIC alert)
+      - severity 분포: 1 (priority 1)
+      - suppression 권장 출력
+
+      ## 💡 왜 이걸 하는가?
+
+      Purple Team standard — Red 의 다단계 공격 → Blue 의 flowbits 매칭 → Purple 의
+      운영 효과 분석 + 권장. flowbits 의 강점 (다단계 추적) + 한계 (flow 경계, memcap)
+      모두 가시화.
+
+      ## 🔍 결과 해석 + 운영 권장
+
+      - **정상**: delta 5~10 + severity 1 + flow_id 분포
+      - **위험 — alert flood**: production 환경에서 5 cycle 가 50 cycle 이 되면 alert 50건
+        → SOC fatigue → suppression 또는 event_filter
+      - **운영 권장 5**:
+        1. flowbits 룰은 항상 `priority` 명시 (severity sort)
+        2. 다단계 룰의 metadata 에 mitre_tactic_id (IR 시 추적)
+        3. flow.memcap 모니터링 (W04 §4.4 참조)
+        4. 분산 환경은 IP 기반 SIEM 통합 (W09)
+        5. 분기 검토 — flowbits 룰의 false-positive 율
+    hint: 'flowbits 다단계 5 cycle + Purple suppression 권장'
+    category: redblue
+    points: 25
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      BEFORE=$(ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      echo "baseline: $BEFORE"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/admin?c=FUZZ' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005011 /var/log/suricata/eve.json; do :; done"' || true
+      AFTER=$(ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      echo "after: $AFTER  delta: $((AFTER - BEFORE))"
+      ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | tail -10 | jq -r .alert.severity | sort | uniq -c'
+      echo
+      echo "권장 suppression (시뮬):"
+      echo "  suppress gen_id 1, sig_id 9005011, track by_src, ip 192.168.0.202"
+      echo "  event_filter gen_id 1, sig_id 9005011, type limit, track by_src, count 1, seconds 60"
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+    answer_detail: |
+      Red 5 cycle × 1~2 NIC alert = delta 5~10. severity 1. Purple 권장 — suppression
+      또는 event_filter rate_filter.
+    verify:
+      type: output_contains
+      expect: delta
+      field: stdout
+      semantic:
+        intent: "R/B/P — flowbits 다단계 + suppression 권장"
+        success_criteria:
+          - "delta 5~10"
+          - "severity 1"
+          - "suppression 권장"
+        acceptable_methods:
+          - "**[OSS] flowbits 다단계 5 cycle**"
+          - "**[OSS] delta 계산** — baseline / after"
+          - "**[OSS] severity 분포 분석**"
+          - "**[OSS] suppress + track by_src + ip**"
+          - "**[OSS] event_filter rate_filter** — alert flood"
+          - "**[OSS] SIEM 통합 (W09)** — alert correlation"
+          - "**[OSS] mitre_tactic_id 매핑**"
+          - "**[OSS] 분기 검토 — false-positive 율**"
+    cleanup: |
+      ssh ccc@10.20.31.2 "sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules /etc/suricata/threshold.config"
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: bastion
+
+  - order: 8
+    instruction: |
+      ## 🎯 MISSION — 트러블슈팅 (lecture §9 의 4 실수 시뮬)
+
+      lecture §9.1 (sticky buffer 5.x → 6.x) + §9.2 (pcre 단독 성능) 두 흔한 실수 시뮬 +
+      복구.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰·진단·정리는 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 실수 1 — 5.x 후위 문법 (Suricata 6 에서 silent fail) 작성 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 5x 후위 문법 silent fail\"; content:\"sqlmap\"; http_user_agent; nocase; sid:9005091; rev:1;)
+      EOF"
+      # syntax 검증 (silent OK — Suricata 가 무시 가능)
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -3
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 트리거 ──
+      # 💡 이 트리거 트래픽은 브라우저(자연 URL)나 Burp Repeater 로도 발생시킬 수 있다 — 탐지(eve.json)가 목적이라 응답은 -o /dev/null 로 버린다.
+      sqlmap -u 'http://juice.el34.lab/rest/products/search?q=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|checking if the target|WAF/IPS' | head -2
+
+      # ── el34-ips 에서: 5.x 후위 문법 alert (0 또는 매우 적음 예상) ──
+      echo "5.x 후위 문법 alert:"
+      sudo grep "9005091" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+
+      # ── el34-ips 에서: 복구 — 6.x 전위 문법 작성 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 6x 전위 문법 correct\"; http.user_agent; content:\"sqlmap\"; nocase; sid:9005091; rev:2;)
+      EOF"
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 재트리거 ──
+      # 💡 이 트리거 트래픽은 브라우저(자연 URL)나 Burp Repeater 로도 발생시킬 수 있다 — 탐지(eve.json)가 목적이라 응답은 -o /dev/null 로 버린다.
+      sqlmap -u 'http://juice.el34.lab/rest/products/search?q=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|checking if the target|WAF/IPS' | head -2
+
+      # ── el34-ips 에서: 6.x 전위 문법 alert (1+ 정상) ──
+      echo "6.x 전위 문법 alert:"
+      sudo grep "9005091" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+
+      # 실수 2: pcre 단독 (성능 부담) — 시뮬만 (실제 적용하면 drop_rate 증가 위험)
+      echo "권장 (성능):"
+      echo "  부적합: pcre:\"/\\\\bunion\\\\b/i\""
+      echo "  적합:  content:\"union\"; nocase; pcre:\"/\\\\bunion\\\\b/i\";"
+
+      # ── el34-ips 에서: dump-counters 의 drop rate 확인 + cleanup ──
+      sudo suricatasc -c dump-counters 2>&1 | jq -c '{drops: .message."capture.kernel_drops", pkts: .message."decoder.pkts"}'
+      sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules
+      sudo suricatasc -c reload-rules
+      ```
+
+      ## 📋 확인 사항
+
+      - 5.x 후위 문법: alert 0 또는 매우 적음 (Suricata 6 의 silent fail)
+      - 6.x 전위 문법 (복구): alert 1+ (정상 매치)
+      - drops < 0.01% × decoder.pkts
+
+      ## 💡 왜 이걸 하는가?
+
+      운영 중 가장 흔한 실수 2 가지 — sticky buffer 문법 변경 + pcre 단독 성능. Suricata
+      5 에서 6 마이그레이션 시 룰셋의 80% 가 silent fail 경험 → 즉시 alert gap.
+
+      ## 🔍 결과 해석 + 운영 권장
+
+      - **정상**: 복구 후 alert 1+ + drops 0%
+      - **권장 1**: 룰 마이그레이션 시 자동 변환 도구 (`suricata-update`의 free-form-converter)
+        검토
+      - **권장 2**: pcre 사용 시 content prefilter 동반 강제 (코드 리뷰 체크리스트)
+      - **권장 3**: 정기적 drop_rate 측정 + Wazuh alert (임계 0.01%)
+      - **권장 4**: `suricata -T -S file` 사전 syntax 검증 (단, sticky buffer mismatch 는
+        syntax 가 아니라 semantic — 결과 검증 필수)
+    hint: '5.x 후위 (content + http_user_agent) → 6.x 전위 (http.user_agent + content)'
+    category: troubleshooting
+    points: 15
+    answer: |
+      echo "=== 실수 1: 5.x 후위 silent fail ==="
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"5x 후위\"; content:\"sqlmap\"; http_user_agent; nocase; sid:9005091; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "sqlmap -u 'http://juice.el34.lab/rest/products/search?q=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS' | head -2"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005091 /var/log/suricata/eve.json; do :; done"' || true
+      echo "5.x alert (silent fail 가능):"
+      ssh ccc@10.20.31.2 'sudo grep "9005091" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"'
+      echo
+      echo "=== 복구: 6.x 전위 ==="
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"6x 전위\"; http.user_agent; content:\"sqlmap\"; nocase; sid:9005091; rev:2;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 "sqlmap -u 'http://juice.el34.lab/rest/products/search?q=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS' | head -2"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005091 /var/log/suricata/eve.json; do :; done"' || true
+      echo "6.x alert (1+ 정상):"
+      ssh ccc@10.20.31.2 'sudo grep "9005091" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"'
+      echo
+      echo "drop_rate:"
+      ssh ccc@10.20.31.2 'sudo suricatasc -c dump-counters 2>&1 | jq -c "{drops: .message.\"capture.kernel_drops\", pkts: .message.\"decoder.pkts\"}"'
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+    answer_detail: |
+      5.x 후위 silent fail → 6.x 전위 복구 → alert 정상화. drop_rate 0%. production 5 → 6
+      마이그레이션 시 80% 룰이 silent fail 경험.
+    verify:
+      type: output_contains
+      expect: 'drops'
+      field: stdout
+      semantic:
+        intent: "트러블슈팅 — 5.x 후위 silent fail → 6.x 전위 복구"
+        success_criteria:
+          - "5.x 후위 silent fail"
+          - "6.x 전위 복구"
+          - "alert 정상화"
+        acceptable_methods:
+          - "**[OSS] sticky buffer 6.x 전위 (http.user_agent + content)**"
+          - "**[OSS] suricata-update --free-form-converter** — 자동 변환"
+          - "**[OSS] suricata.log 의 syntax error 점검**"
+          - "**[OSS] dump-counters 의 drop_rate**"
+          - "**[OSS] reload 후 결과 검증** — semantic vs syntax"
+          - "**[OSS] git audit + 변경 PR 의 sticky buffer 검토**"
+          - "**[OSS] -T 사전 검증** — semantic mismatch 는 검출 못 함"
+          - "**[OSS] Wazuh alert 임계 (drop_rate 0.01%)** — 자동 모니터"
+    cleanup: |
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: ips
+
+  - order: 9
+    instruction: |
+      ## 🎯 MISSION — 종합: 5 기술 결합 + R/B/P 통합 cycle
+
+      9005099 (5 기술 결합) + 9005010/9005011 (flowbits) + threshold.config 의 suppress
+      를 동시 운영 + 5 burst 다단계 트리거 + 운영 효과 측정.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 룰·config·카운트는 `el34-ips`, 다단계 공격은 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+      (baseline → after 카운트는 눈으로 비교해 delta 를 구한다.)
+
+      ```bash
+      # ── el34-ips 에서: 1-3. 3 룰 + event_filter 작성 + 활성화 + reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      alert http any any -> any any (msg:\"el34 sqlmap UNION (rate-limited)\"; flow:to_server,established; http.user_agent; content:\"sqlmap\"; fast_pattern; nocase; http.request_body; content:\"union\"; nocase; pcre:\"/\\\\bunion\\\\b\\\\s+\\\\bselect\\\\b/i\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:web-application-attack; priority:1; sid:9005099; rev:1;)
+      EOF"
+      sudo bash -c "cat > /etc/suricata/threshold.config <<EOF
+      event_filter gen_id 1, sig_id 9005011, type limit, track by_src, count 1, seconds 30
+      EOF"
+      sudo sed -i "s|^# threshold-file:|threshold-file:|" /etc/suricata/suricata.yaml
+      sudo suricatasc -c reload-rules
+
+      # ── el34-ips 에서: 4. baseline (9005011 / 9005099 카운트를 적어둔다) ──
+      sudo grep "9005011" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+      sudo grep "9005099" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'
+
+      # ── el34-attacker 에서: 5. Red — 5 burst 다단계(step1 → step2 → sqlmap) ──
+      # 💡 ffuf 가 flowbit 다단계(step1 GET / + UA FlowbitTest/1..5 → step2 GET /admin) + 진짜 SQLi 도구 sqlmap 이 UA=sqlmap+UNION body POST.
+      #    threshold/event_filter 가 alert flood 를 억제하는지 관찰(-s). Burp Intruder 의 CLI 등가물.
+      ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s
+      ffuf -u 'http://juice.el34.lab/admin?c=FUZZ' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s
+      sqlmap -u 'http://juice.el34.lab/' --data='q=1' --batch --level=2 --risk=2 --technique=U --disable-coloring 2>&1 | grep -iE 'sqlmap|union|WAF/IPS' | head -3
+
+      # ── el34-ips 에서: 6-7. after 카운트 + flood 차단 판정 ──
+      sudo grep "9005011" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'    # delta 작음 (event_filter limit 1/30s 가 ffuf 5-burst flood 를 억제)
+      sudo grep "9005099" /var/log/suricata/eve.json | grep -c '"event_type":"alert"'    # 실 sqlmap union 다발 → 룰이 매치(다수), threshold 는 창별 캡
+      # 9005011 delta 가 5-cycle 보다 작으면(event_filter 억제) flowbit flood 차단 성공
+
+      # ── el34-ips 에서: Cleanup ──
+      sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules /etc/suricata/threshold.config
+      sudo suricatasc -c reload-rules
+      ```
+
+      ## 📋 확인 사항
+
+      - 9005011 delta: 작음 (ffuf 5 cycle 이지만 event_filter limit 1/30s 가 flood 를 억제)
+      - 9005099 delta: 1+ (실제 sqlmap 이 union POST 를 다발로 → 룰이 매치; threshold 는 창별 캡)
+      - flowbit flood(9005011) 가 event_filter 로 억제됨을 확인
+
+      ## 💡 왜 이걸 하는가?
+
+      production 의 통합 운영. 5 기술 결합 + 외부 통제 (threshold.config) + 다단계 룰 +
+      alert flood 차단 = 운영 표준. 본 step 이 W04 의 cap stone.
+
+      ## 🔍 결과 해석
+
+      - **정상**: 두 delta 모두 작음 + flood 차단 성공
+      - **위험**: delta 큼 → threshold 비활성 또는 event_filter 미적용
+      - **운영 권장**: alert flood 차단 + production 환경의 SIEM 통합 (W09) → 통합 dashboard
+    hint: '5 기술 + flowbits + threshold.config 통합 + 5 cycle 다단계 → flood 차단 검증'
+    category: synthesis
+    points: 23
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"step1 FlowbitTest UA\"; http.user_agent; content:\"FlowbitTest\"; flowbits:set,fb_test_step1; flowbits:noalert; sid:9005010; rev:1;)
+      alert http any any -> any any (msg:\"step2 admin after step1\"; http.uri; content:\"/admin\"; flowbits:isset,fb_test_step1; classtype:successful-recon; priority:1; sid:9005011; rev:1;)
+      alert http any any -> any any (msg:\"el34 sqlmap UNION (rate-limited)\"; flow:to_server,established; http.user_agent; content:\"sqlmap\"; fast_pattern; nocase; http.request_body; content:\"union\"; nocase; pcre:\"/\\\\bunion\\\\b\\\\s+\\\\bselect\\\\b/i\"; threshold:type limit, track by_src, count 1, seconds 60; classtype:web-application-attack; priority:1; sid:9005099; rev:1;)
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo bash -c "cat > /etc/suricata/threshold.config <<EOF
+      event_filter gen_id 1, sig_id 9005011, type limit, track by_src, count 1, seconds 30
+      EOF"'
+      ssh ccc@10.20.31.2 'sudo sed -i "s|^# threshold-file:|threshold-file:|" /etc/suricata/suricata.yaml'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      BEFORE_11=$(ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      BEFORE_99=$(ssh ccc@10.20.31.2 'sudo grep "9005099" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      echo "baseline 11: $BEFORE_11 / 99: $BEFORE_99"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s"
+      ssh att@192.168.0.202 "ffuf -u 'http://juice.el34.lab/admin?c=FUZZ' -H 'User-Agent: FlowbitTest/FUZZ' -w <(seq 1 5) -mc all -s"
+      ssh att@192.168.0.202 "sqlmap -u 'http://juice.el34.lab/' --data='q=1' --batch --level=2 --risk=2 --technique=U --disable-coloring 2>&1 | grep -iE 'sqlmap|union|WAF/IPS' | head -3"
+      ssh ccc@10.20.31.2 'timeout 10 bash -c "until sudo grep -q 9005011 /var/log/suricata/eve.json; do :; done"' || true
+      AFTER_11=$(ssh ccc@10.20.31.2 'sudo grep "9005011" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      AFTER_99=$(ssh ccc@10.20.31.2 'sudo grep "9005099" /var/log/suricata/eve.json | jq -s "map(select(.event_type==\"alert\"))|length"')
+      D11=$((AFTER_11 - BEFORE_11))
+      D99=$((AFTER_99 - BEFORE_99))
+      echo "9005011 delta: $D11 / 9005099 delta: $D99"
+      ssh ccc@10.20.31.2 'sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules /etc/suricata/threshold.config'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+    answer_detail: |
+      5 기술 결합 + flowbits + threshold.config 통합 + 5 burst 다단계. 9005011 delta
+      1~4, 9005099 delta 1~2. alert flood 차단 성공. production 통합 운영 cap stone.
+    verify:
+      type: output_contains
+      expect: delta
+      field: stdout
+      semantic:
+        intent: "통합 cycle — 5 기술 + flowbits + threshold.config"
+        success_criteria:
+          - "3 룰 동시 로드"
+          - "event_filter limit"
+          - "delta 작음 (flood 차단)"
+        acceptable_methods:
+          - "**[OSS] 다중 룰 + threshold.config 동시 운영**"
+          - "**[OSS] event_filter type limit/threshold/both**"
+          - "**[OSS] suppression 추가** — 정상 사용자 IP 차단"
+          - "**[OSS] alert flood 차단 검증** — delta 분석"
+          - "**[OSS] SIEM 통합 (W09)** — alert correlation"
+          - "**[OSS] git audit** — 모든 룰 + config 변경"
+          - "**[OSS] 분기 검토 — false-positive 율 재평가**"
+          - "**[OSS] MITRE ATT&CK 매핑 — TA0001 (recon)**"
+    cleanup: |
+      ssh ccc@10.20.31.2 "sudo sed -i '/sid:9005/d' /etc/suricata/rules/local.rules /etc/suricata/threshold.config"
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      true
+    target_vm: bastion
+
+  - order: 10
+    instruction: |
+      ## 🎯 MISSION — W04 종합 보고서
+
+      STEP 1-9 결과 + R/B/P + 트러블슈팅 + 운영 권장 + W05 준비도.
+
+      ## 💻 산출물 형식
+
+      ```markdown
+      # el34 W04 Suricata 룰 심화 보고서 (학번, 이름)
+
+      ## 1. STEP 1-9 결과 표
+      | Step | 영역 | 결과 |
+      |------|------|------|
+      | 1 | content modifier 5 (http.uri + depth + nocase + fast_pattern) | pass |
+      | 2 | pcre + content prefilter (RRN) | pass |
+      | 3 | flowbits 다단계 (401 → /admin) | pass (step1=0, step2=2) |
+      | 4 | threshold 3 mode 비교 | pass (limit/threshold/both 차이) |
+      | 5 | threshold.config suppress | pass (delta 0) |
+      | 6 | 5 기술 결합 9005099 | pass |
+      | 7 | R/B/P 다단계 5 burst | pass (delta 5-10) |
+      | 8 | 트러블슈팅 5x→6x | pass |
+      | 9 | 통합 cycle | pass (flood 차단) |
+
+      ## 2. R/B/P 측정 (STEP 7+9)
+      flowbits 다단계 + sqlmap UNION + threshold flood 차단 모두 검증
+
+      ## 3. 5 기술 운영 권장
+      1. content modifier — sticky buffer 6.x 전위 강제
+      2. pcre 단독 금지, content prefilter 강제
+      3. fast_pattern 명시 — 자동 선택의도 불일치 방지
+      4. flowbits — flow 경계 + memcap 인지
+      5. threshold modifier (룰 본질) vs threshold.config (운영 통제) 분리
+
+      ## 4. 트러블슈팅 (STEP 8)
+      sticky buffer 5x → 6x 변환 + content prefilter 추가
+
+      ## 5. W05 (ModSecurity WAF) 준비도
+      - Suricata 의 HTTP event 와 ModSec audit log 의 차이 (sniff vs inline)
+      - OWASP CRS 의 paranoia level + Suricata 의 threshold modifier 비교
+      - 본인 gap: SecAuditLogFormat JSON 분석
+
+      ## 6. 본인 학습 gap
+      ...
+      ```
+
+      ## 📋 확인 사항
+
+      - 6 섹션
+      - 9 step 표
+      - R/B/P 측정값
+      - 운영 권장 5
+      - W05 준비도
+
+      ## 💡 왜 이걸 하는가?
+
+      Suricata 룰 심화 운영 audit 표준.
+
+      ## 🔍 결과 해석
+
+      - **A**: 6 섹션 + 9 step + 5 권장 + gap
+      - **C**: 일부 누락 → 재제출
+    hint: 마크다운 1페이지
+    category: synthesis
+    points: 10
+    answer: |
+      # 보고서는 편집기로 작성해 파일로 남긴다 (nano ~/w04_report.md 로 열어 아래 골격을 채운다).
+      cat > ~/w04_report.md <<'EOF'
+      # el34 W04 Suricata 룰 심화 보고서
+
+      ## 1. STEP 1-9 결과
+      (표 9 row)
+
+      ## 2. R/B/P (STEP 7+9)
+      flowbits + sqlmap UNION + threshold flood 차단
+
+      ## 3. 운영 권장 5
+
+      ## 4. 트러블슈팅 (STEP 8) sticky buffer
+
+      ## 5. W05 준비도
+      EOF
+      cat ~/w04_report.md
+    answer_detail: 종합 보고서
+    verify:
+      type: output_contains
+      expect: Suricata
+      field: stdout
+      semantic:
+        intent: "W04 종합"
+        success_criteria: ["9 step 표", "R/B/P", "운영 권장 5", "W05 준비도"]
+        acceptable_methods:
+          - "**[관리적] 마크다운 6 섹션**"
+          - "**[관리적] ISMS-P 2.6.4 매핑**"
+          - "**[관리적] NIST DE.AE-1 (Event Analysis)**"
+          - "**[관리적] MITRE ATT&CK 매핑 (TA0001)**"
+          - "**[관리적] alert fatigue + SOC tier 분석**"
+          - "**[관리적] 운영 권장 5 (5 기술 사용 원칙)**"
+          - "**[관리적] W06 (ModSecurity) logical flow**"
+          - "**[관리적] 본인 학습 gap**"
+    target_vm: ips

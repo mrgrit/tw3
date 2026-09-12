@@ -1,0 +1,167 @@
+lab_id: autonomous-security-week03
+title: "W03 — Bastion 프로젝트 생명주기: 접수·계획(하니스+KG·Experience)·실행·평가·학습"
+version: ai
+course: autonomous-security
+week: 3
+description: |
+  bastion 임무 생명주기. 접수→계획→실행→평가→학습 매핑(LIFECYCLE_MAPPED), Manager 하니스 엔지니어링
+  +KG/Experience 로드(HARNESS_BUILT), 평가·경험 DB 축적(LEARNING_CAPTURED), 종합(Assessment).
+  지식·경험이 계획·학습을 강화 — 자율 프로젝트 운영.
+difficulty: medium
+duration_minutes: 120
+audience: 자율 보안 (3주차)
+prerequisites:
+  - el34 호스트 접속 (`ssh ccc@{{TARGET_IP}}`, 비밀번호 `1`)
+  - GPU Ollama 도달 — gemma3:4b
+  - W03 강의안 정독 — §0.5(생명주기·하니스·KG·Experience·학습)
+objectives:
+  - "GPU 헬스체크(GEN_OK)"
+  - "생명주기 5단계 매핑(LIFECYCLE_MAPPED)"
+  - "하니스 엔지니어링+KG/Experience(HARNESS_BUILT)"
+  - "평가·학습 축적(LEARNING_CAPTURED)"
+  - "종합(Assessment)"
+pass_threshold: 0.6
+
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — GPU 헬스체크 → GEN_OK
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+      ```
+      ✅ 마지막 줄 `GEN_OK`.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+    answer_detail: "GPU 응답 확인."
+    verify:
+      type: output_contains
+      expect: GEN_OK
+      field: stdout
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 생명주기 매핑 → LIFECYCLE_MAPPED
+      > **🎯 목표:** 임무를 접수→계획→실행→평가→학습 5단계로 매핑.
+      > **개념:** 학습이 다음 계획을 강화하는 되먹임.
+      ```bash
+      cat > /tmp/lifecycle_mapped_STU42.txt <<'EOF'
+      intake goal/scope/constraints defined
+      planning harness + KG/Experience-informed plan
+      execution SubAgent performs (A2A)
+      evaluation success/failure judged
+      learning lessons stored in Experience DB
+      EOF
+      awk '{printf "  [%-10s] ",$1;$1="";print}' /tmp/lifecycle_mapped_STU42.txt
+      [ "$(cut -d' ' -f1 /tmp/lifecycle_mapped_STU42.txt | tr '\n' ',')" = "intake,planning,execution,evaluation,learning," ] && echo LIFECYCLE_MAPPED || echo INCOMPLETE
+      ```
+      ✅ 마지막 줄 `LIFECYCLE_MAPPED` (접수·계획·실행·평가·학습 5단계).
+      🔎 접수(목표)→계획(하니스+KG·Experience)→실행(SubAgent)→평가(달성?)→학습(경험 DB). 학습이 다음 계획을 강화.
+    answer: |
+      cat > /tmp/lifecycle_mapped_STU42.txt <<'EOF'
+      intake goal/scope/constraints defined
+      planning harness + KG/Experience-informed plan
+      execution SubAgent performs (A2A)
+      evaluation success/failure judged
+      learning lessons stored in Experience DB
+      EOF
+      awk '{printf "  [%-10s] ",$1;$1="";print}' /tmp/lifecycle_mapped_STU42.txt
+      [ "$(cut -d' ' -f1 /tmp/lifecycle_mapped_STU42.txt | tr '\n' ',')" = "intake,planning,execution,evaluation,learning," ] && echo LIFECYCLE_MAPPED || echo INCOMPLETE
+    answer_detail: "임무 생명주기 5단계 매핑 → LIFECYCLE_MAPPED."
+    verify:
+      type: output_contains
+      expect: LIFECYCLE_MAPPED
+      field: stdout
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 하니스 엔지니어링 → HARNESS_BUILT
+      > **🎯 목표:** 임무에 맞는 도구·컨텍스트를 구성하고 KG/Experience를 로드.
+      > **개념:** 아는 것(지식)+해본 것(경험)으로 강화된 계획.
+      ```bash
+      cat > /tmp/harness_built_STU42.txt <<'EOF'
+      tools: query_wazuh, check_ip, nmap_scan
+      context: el34 internal recon
+      KG/Experience: loaded (past lessons)
+      constraints: scope + rate-limit
+      EOF
+      cat /tmp/harness_built_STU42.txt
+      [ "$(grep -cE "true|:" /tmp/harness_built_STU42.txt)" -ge 3 ] && echo HARNESS_BUILT || echo INCOMPLETE
+      ```
+      ✅ 마지막 줄 `HARNESS_BUILT` (도구+컨텍스트+지식 그래프+경험 DB 로드).
+      🔎 임무에 맞는 도구·컨텍스트에 더해 지식 그래프(자산·공격 패턴)·경험 DB(과거 성공 플레이북)를 로드해 강화된 계획.
+    answer: |
+      cat > /tmp/harness_built_STU42.txt <<'EOF'
+      tools: query_wazuh, check_ip, nmap_scan
+      context: el34 internal recon
+      KG/Experience: loaded (past lessons)
+      constraints: scope + rate-limit
+      EOF
+      cat /tmp/harness_built_STU42.txt
+      [ "$(grep -cE "true|:" /tmp/harness_built_STU42.txt)" -ge 3 ] && echo HARNESS_BUILT || echo INCOMPLETE
+    answer_detail: "하니스(도구·컨텍스트)+KG/Experience(지식·경험) 구성 → HARNESS_BUILT."
+    verify:
+      type: output_contains
+      expect: HARNESS_BUILT
+      field: stdout
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 평가·학습 축적 → LEARNING_CAPTURED
+      > **🎯 목표:** 실행 결과를 평가하고 교훈을 경험 DB에 축적.
+      > **개념:** 학습이 다음 임무를 강화.
+      ```bash
+      # 임무 결과에서 얻은 교훈을 Experience 형식으로 기록한다.
+      cat > /tmp/learning_STU42.txt <<'EOF'
+      situation: bruteforce from 203.0.113.5
+      action: block + notify
+      result: contained
+      lesson: known-scanner enrichment cuts false triage
+      tags: bruteforce, ssh
+      EOF
+      cat /tmp/learning_STU42.txt
+      grep -q "^lesson:" /tmp/learning_STU42.txt && grep -q "^result:" /tmp/learning_STU42.txt && echo LEARNING_CAPTURED || echo INCOMPLETE
+      ```
+      ✅ 마지막 줄 `LEARNING_CAPTURED` (평가 후 재사용 교훈을 경험 DB에 축적).
+      🔎 목표 달성 평가+성공 패턴(로그·IP 상관)·실패 교훈(API 타임아웃)을 경험 DB에 축적. 다음 유사 임무에서 재사용.
+    answer: |
+      # 임무 결과에서 얻은 교훈을 Experience 형식으로 기록한다.
+      cat > /tmp/learning_STU42.txt <<'EOF'
+      situation: bruteforce from 203.0.113.5
+      action: block + notify
+      result: contained
+      lesson: known-scanner enrichment cuts false triage
+      tags: bruteforce, ssh
+      EOF
+      cat /tmp/learning_STU42.txt
+      grep -q "^lesson:" /tmp/learning_STU42.txt && grep -q "^result:" /tmp/learning_STU42.txt && echo LEARNING_CAPTURED || echo INCOMPLETE
+    answer_detail: "평가 후 재사용 교훈을 경험 DB에 축적 → LEARNING_CAPTURED."
+    verify:
+      type: output_contains
+      expect: LEARNING_CAPTURED
+      field: stdout
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 종합 → Assessment
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W03 on the bastion project lifecycle. Findings: a mission was mapped through intake, planning, execution, evaluation, and learning (LIFECYCLE_MAPPED), the Manager built a harness with tools, context, a knowledge graph, and an experience DB (HARNESS_BUILT), and evaluation captured reusable lessons into the experience DB (LEARNING_CAPTURED). Explain that the Manager runs this lifecycle, that planning is strengthened by knowledge and experience (KG/Experience), and that learning improves future missions. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+      ```
+      ✅ 출력에 `Assessment`.
+      🔎 정리: bastion 임무=접수·계획(하니스+KG·Experience)·실행·평가·학습 생명주기. 지식·경험이 계획·학습을 강화. Manager가 관장.
+      다음 주(W04)는 **SubAgent와 원격 실행(A2A)**.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W03 on the bastion project lifecycle. Findings: a mission was mapped through intake, planning, execution, evaluation, and learning (LIFECYCLE_MAPPED), the Manager built a harness with tools, context, a knowledge graph, and an experience DB (HARNESS_BUILT), and evaluation captured reusable lessons into the experience DB (LEARNING_CAPTURED). Explain that the Manager runs this lifecycle, that planning is strengthened by knowledge and experience (KG/Experience), and that learning improves future missions. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+    answer_detail: "W03 생명주기 종합(Assessment). 접수·계획·실행·평가·학습·KG/Experience."
+    verify:
+      type: output_contains
+      expect: Assessment
+      field: stdout

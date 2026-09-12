@@ -1,0 +1,421 @@
+lab_id: standalone-web-vuln-week12
+title: "API 보안 — BOLA/과다 데이터 노출/mass assignment vs API 인가"
+version: standalone-web-vuln
+course: web-vuln
+week: 12
+description: |
+  OWASP API Security Top 10 점검 — API 는 화면(UI) 없는 또 다른 공격 표면이다. 화면에서 막은 통제도
+  서버가 API 요청에 대해 다시 검사하지 않으면 도구 한 줄로 우회된다. 본 실습은 JuiceShop REST API 를
+  대상으로 ① 공개 자원(/api/Products 200)과 보호 자원(/api/Users 401)의 경계를 매핑하고, ② 무인증
+  엔드포인트(/api/Feedbacks)가 이메일 등 불필요 필드(PII)를 흘리는 과다 데이터 노출(API3)을 입증하며,
+  ③ 순차 객체 id(/api/Users/{id})로 BOLA(API1, 객체 수준 인가)를 점검(el34 JuiceShop 은 401 보호=양호)
+  하고, ④ 요청 본문에 미허용 필드를 끼워 넣는 mass assignment(API6)의 원리·영향·방어를 정리한다.
+  근본 방어는 "모든 통제는 서버에서, 객체마다, 입력·출력 양쪽에" — 객체 수준 인가 + 응답/입력 allowlist
+  + 토큰 검증이다. 공격은 외부 공격자 VM 192.168.0.202(att/1, 출처 IP 192.168.0.202)에서 공인 진입
+  192.168.0.161로 — `ssh att@192.168.0.202`(비번 1)로 접속해 수행한다. 인가된 표적(juice.el34.lab) vhost 만
+  점검한다. 도구는 whatweb(경계·노출 핑거프린팅)·ffuf(객체 id 퍼징) — att 192.168.0.202 에 탑재.
+difficulty: hard
+duration_minutes: 160
+prerequisites:
+  - "W01–W11 통과"
+  - "외부 공격자 VM 접속(ssh att@192.168.0.202, 비밀번호 1) — whatweb/ffuf 탑재"
+  - "lecture §3(BOLA) §4(과다노출) §5(mass assignment) 숙지"
+objectives:
+  - "whatweb 으로 JuiceShop REST API 를 핑거프린팅해 공개(/api/Products 200)·보호(/api/Users 401) 경계를 상태코드로 매핑한다"
+  - "무인증 /api/Feedbacks 응답에서 whatweb 이 이메일(PII)을 추출하는 것으로 과다 데이터 노출(API3)을 입증한다"
+  - "ffuf 로 순차 객체 id(/api/Users/{id})를 퍼징해 BOLA(API1)를 점검하고 401 보호(양호)·200 노출(치명)을 구분한다"
+  - "mass assignment(API6)의 원리와 권한상승 영향을 설명한다"
+  - "객체 수준 인가 + 응답/입력 allowlist + 토큰 검증으로 이어지는 서버측 API 인가 방어를 보고서로 정리한다"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 점검 — REST API 도달성 확인
+      점검의 전제는 표적 API 에 요청이 닿는다는 것이다. 연결이 안 되면 이후의 모든 음성 결과("취약점
+      없음")가 무의미하므로, 본격 점검 전 항상 도달성부터 확인한다. 본 주차의 표적은 화면(UI)이 아니라
+      JuiceShop 의 REST API(`/api/...`)이며, `nc` 로 직접 두드린다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) whatweb으로 JuiceShop REST API(/api/Products) 도달 확인 + 상태코드([200 OK])·서버 핑거프린팅
+      whatweb -a1 --color=never http://juice.el34.lab/api/Products
+      ```
+      - `whatweb` 는 요청을 보내 상태코드(`[200 OK]`)·웹서버·헤더를 한 줄로 요약하는 웹 핑거프린팅
+        도구다(raw 소켓 nc 와 달리 곧바로 노출을 읽어준다). att 의 `/etc/hosts` 가 `juice.el34.lab →
+        192.168.0.161` 로 매핑돼 fw 게이트웨이로 나가고, REST API(`/api/...`)는 화면(UI) 없이 도구로 직접 두드린다.
+
+      ## ✅ 합격 기준
+      `api=` 출력 시 통과. **근거:** `api=<코드>`(예: `api=200`)가 나오면 REST API 에 도달한 것이다.
+      요청은 외부 공격자 VM 192.168.0.202(192.168.0.202) → fw → ips → web → JuiceShop 경로를 거친다.
+    hint: 'api 도달'
+    category: survey
+    points: 10
+    answer: |
+      # 1) whatweb으로 JuiceShop REST API(/api/Products) 도달 확인 + 상태코드([200 OK])·서버 핑거프린팅
+      ssh att@192.168.0.202 "whatweb -a1 --color=never http://juice.el34.lab/api/Products"
+    answer_detail: "API 보안 점검 대상 = JuiceShop REST API. whatweb 출력에 /api/Products 와 [200 OK] 가 보이면 표적에 도달해 점검 가능한 상태임을 확인한 것 — 점검 착수의 첫 단계다."
+    expected_output: |
+      http://juice.el34.lab/api/Products [200 OK] Apache[2.4.52], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], UncommonHeaders[access-control-allow-origin,x-content-type-options,feature-policy,x-recruiting], IP[192.168.0.161]
+    verify:
+      type: output_contains
+      expect: 'juice.el34.lab'
+      field: stdout
+      semantic:
+        intent: "API 점검"
+        success_criteria: ["도달"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 공개 자원 매핑 — /api/Products (200)
+      API 점검의 첫 단계는 **공개/보호 경계 매핑** 이다. 어디가 인증 없이 열려 있고 어디가 보호되는지를
+      알아야 점검 방향이 선다. `/api/Products` 는 상품 카탈로그라 인증 없이 열려 있는 것이 **정상 설계일
+      수 있는** 공개 자원이며, 경계 매핑의 기준선(공개 쪽)이 된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 공개 자원 경계 매핑 — whatweb으로 /api/Products의 상태코드만 추림(200이면 인증 없이 열린 공개 자원)
+      whatweb -a1 --color=never http://juice.el34.lab/api/Products | grep -oE '[0-9]{3} (OK|Unauthorized|Forbidden)'
+      # 2) 해석 — 200=공개 자원(카탈로그 등 정상 설계일 수 있음), 보호 자원(401)과 대비가 핵심
+      # → 200 = 인증 없이 접근 가능한 공개 자원(정상 설계일 수 있음)
+      ```
+
+      ## ✅ 합격 기준
+      `prod=200` 출력 시 통과. **근거:** prod=200 이면 인증 없이 접근 가능한 공개 자원으로 식별된다 —
+      단, 200 이라고 무조건 취약은 아니며(카탈로그 공개는 정상일 수 있음) 보호 자원(401)과의 대비가 핵심이다.
+    hint: 'Products 200'
+    category: recon
+    points: 12
+    answer: |
+      # 1) 공개 자원 경계 매핑 — whatweb으로 /api/Products의 상태코드만 추림(200이면 인증 없이 열린 공개 자원)
+      ssh att@192.168.0.202 "whatweb -a1 --color=never http://juice.el34.lab/api/Products | grep -oE '[0-9]{3} (OK|Unauthorized|Forbidden)'"
+      # 2) 해석 — 200=공개 자원(카탈로그 등 정상 설계일 수 있음), 보호 자원(401)과 대비가 핵심
+      # → 200 = 인증 없이 접근 가능한 공개 자원(정상 설계일 수 있음)
+    answer_detail: "공개 자원 = 인증 불필요(200). whatweb 이 [200 OK]로 확인해준다. 카탈로그 등 의도된 공개일 수 있어 200 자체가 취약은 아니다. 보호 자원(401)과 대비해 경계를 긋는 매핑의 출발점이다."
+    expected_output: |
+      200 OK
+      → 200 = 인증 없이 접근 가능한 공개 자원(정상 설계일 수 있음)
+    verify:
+      type: output_contains
+      expect: '200 OK'
+      field: stdout
+      semantic:
+        intent: "공개 자원 식별"
+        success_criteria: ["200 공개"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 보호 자원 매핑 — /api/Users (401)
+      공개 쪽 기준선(미션 2)을 그렸으면, 이번엔 **보호되어야 할 자원이 실제로 보호되는가** 를 확인한다.
+      사용자 목록은 인증 없이 열려선 안 되는 대표적 자원이다. `401 Unauthorized`(인증 필요)는 인증 경계가
+      제대로 그어졌다는 1차 증거이고, BOLA(미션 5)의 1차 방어가 양호하다는 신호이기도 하다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 보호 자원 경계 매핑 — whatweb으로 /api/Users의 상태코드만 추림(401이면 인증으로 보호=양호)
+      whatweb -a1 --color=never http://juice.el34.lab/api/Users | grep -oE '[0-9]{3} (OK|Unauthorized|Forbidden)'
+      # 2) 해석 — 401=인증 필요(양호), 200이면 사용자 목록 무인증 노출(심각)
+      # → 401 = 인증 필요(양호). 사용자 목록은 보호되어야 정상
+      ```
+
+      ## ✅ 합격 기준
+      `users=401` 출력 시 통과. **근거:** users=401 이면 인증으로 보호되는 자원으로 식별(양호) — 만약
+      200 이면 사용자 목록 무인증 노출이라는 심각한 결함이다. 공개(200)와 보호(401)의 대비로 인가 경계 지도가 완성된다.
+    hint: 'Users 401'
+    category: recon
+    points: 12
+    answer: |
+      # 1) 보호 자원 경계 매핑 — whatweb으로 /api/Users의 상태코드만 추림(401이면 인증으로 보호=양호)
+      ssh att@192.168.0.202 "whatweb -a1 --color=never http://juice.el34.lab/api/Users | grep -oE '[0-9]{3} (OK|Unauthorized|Forbidden)'"
+      # 2) 해석 — 401=인증 필요(양호), 200이면 사용자 목록 무인증 노출(심각)
+      # → 401 = 인증 필요(양호). 사용자 목록은 보호되어야 정상
+    answer_detail: "보호 자원 = 인증 필요(401). whatweb 이 [401 Unauthorized] + Title[UnauthorizedError: No Authorization header was found]로 잡아준다 = 인증 경계가 그어져 있고 BOLA 1차 방어 양호. 여기서 200 이 나오면 사용자 목록 무인증 노출이라는 발견이 된다."
+    expected_output: |
+      401 Unauthorized
+      → 401 = 인증 필요(양호). 사용자 목록은 보호되어야 정상
+    verify:
+      type: output_contains
+      expect: '401 Unauthorized'
+      field: stdout
+      semantic:
+        intent: "보호 자원 식별"
+        success_criteria: ["401 보호"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 과다 데이터 노출 (OWASP API3)
+      과다 데이터 노출(API3)은 응답이 **클라이언트가 실제로 쓰지 않는 필드까지** 내려주는 결함이다.
+      개발자가 DB 객체를 통째로 직렬화해 보내고 "어차피 화면이 거른다"고 가정하면 생긴다. 그러나 거르는
+      것은 화면일 뿐 응답 자체는 모든 필드를 담으므로, 응답 **본문을 직접 받아 보면** 화면에 안 보이던
+      필드가 드러난다. 이번 미션은 그래서 응답 코드가 아니라 **응답 본문** 을 검사한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) whatweb으로 무인증 /api/Feedbacks 응답을 분석 → Email 플러그인이 응답 본문에서 이메일을 추출(PII 노출 확인)
+      whatweb -a1 --color=never http://juice.el34.lab/api/Feedbacks | grep -oE 'Email\[[^]]*\]'
+      # 2) 해석 — 무인증 200 응답에 작성자 이메일(PII)까지 실림(응답이 필요 이상 = API3 과다 노출)
+      # → /api/Feedbacks 무인증 200 + 이메일(PII) 노출. 응답이 필요 이상(API3)
+      ```
+      - whatweb 은 응답 본문을 파싱하다 이메일 형태를 발견하면 `Email[...]` 로 뽑아낸다. 피드백 내용만
+        보여주면 될 응답에 작성 사용자의 이메일이 함께 실려 있다 — 화면엔 안 보이지만 응답엔 있다.
+        `/api/Feedbacks` 는 고객 피드백 엔드포인트로 **무인증 200** 을 준다.
+
+      ## ✅ 합격 기준
+      `Email[...]`(이메일) 출력 시 통과. **근거:** 출력에 작성자 이메일이 보이면 과다 데이터 노출(API3) 입증 — 피드백
+      내용만 보이면 될 응답에 작성 사용자의 이메일(PII)이 함께 실려 있다(화면엔 안 보이지만 응답엔 있음).
+    hint: 'Feedbacks 이메일'
+    category: manipulation
+    points: 16
+    answer: |
+      # 1) whatweb으로 무인증 /api/Feedbacks 응답을 분석 → Email 플러그인이 응답 본문에서 이메일을 추출(PII 노출 확인)
+      ssh att@192.168.0.202 "whatweb -a1 --color=never http://juice.el34.lab/api/Feedbacks | grep -oE 'Email\[[^]]*\]'"
+      # 2) 해석 — 무인증 200 응답에 작성자 이메일(PII)까지 실림(응답이 필요 이상 = API3 과다 노출)
+      # → /api/Feedbacks 무인증 200 + 이메일(PII) 노출. 응답이 필요 이상(API3)
+    answer_detail: "과다 노출(API3) = 응답에 클라이언트가 안 쓰는 불필요·민감 필드(이메일/내부 id)까지 포함. /api/Feedbacks 가 무인증 200 으로 작성자 이메일을 흘리는 것을 whatweb 의 Email 플러그인이 추출하는 것이 증거 — 화면이 아니라 응답 본문을 봐야 잡힌다. 방어는 직렬화 allowlist(필요한 필드만)."
+    expected_output: |
+      Email[der@juice-sh.op,ereum@juice-sh.op,in@juice-sh.op]
+      → /api/Feedbacks 무인증 200 + 이메일(PII) 노출. 응답이 필요 이상(API3)
+    verify:
+      type: output_contains
+      expect: 'juice-sh.op'
+      field: stdout
+      semantic:
+        intent: "과다 데이터 노출"
+        success_criteria: ["불필요 필드 노출"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 BOLA (OWASP API1) — 객체 수준 인가 점검
+      BOLA(Broken Object Level Authorization)는 OWASP API Top 10 의 **1위** 이자 가장 흔한 API 침해
+      원인이다. API 가 객체를 `/api/Users/1` 처럼 **순차 숫자 id** 로 가리킬 때, 서버가 인증(로그인)만
+      확인하고 **"이 객체가 요청자의 것이냐"(객체 소유권 = 인가)** 를 검사하지 않으면, id 를 `1→2→3` 으로
+      바꿔가며 남의 객체를 줄줄이 읽을 수 있다. 화면에서 내 데이터만 보이게 가려도 막을 수 없는, 순수한
+      서버측 인가 문제다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) ffuf로 객체 id(1~6)를 /api/Users/FUZZ 에 순차 퍼징 → 각 응답 상태코드 출력(객체 수준 인가 점검)
+      seq 1 6 > /tmp/ids.txt
+      ffuf -u http://juice.el34.lab/api/Users/FUZZ -w /tmp/ids.txt -mc all 2>/dev/null | grep -oE 'Status: [0-9]+'
+      # 2) 해석 — 전부 401=객체수준 인가 양호(막혀 있음 확인도 결과), 200 섞이면 치명적 BOLA
+      # → 순차 객체 id로 남의 자원 접근 시도. 401 = 객체수준 인가 양호. 200이면 BOLA 치명
+      ```
+      - `ffuf` 는 URL 의 `FUZZ` 자리를 워드리스트로 치환하며 반복 요청하는 실전 퍼징 도구다. 여기선 객체
+        id(1~6)를 넣어 `/api/Users/{id}` 를 열거하고, `-mc all` 로 모든 상태를 매칭해 `grep` 으로 각
+        응답의 `Status:` 코드만 추린다. 전부 401 이면 무인증 접근이 객체마다 차단된 것.
+
+      ## ✅ 합격 기준
+      `Status: 401` 출력 시 통과. **근거:** ffuf가 열거한 id 가 전부 `Status: 401`(보호)이면 객체 수준 인가가 작동
+      (el34 JuiceShop 양호) — 막혀 있음을 확인하는 것도 점검 결과다. 200 이 섞이면 그 id 객체의 치명적 BOLA 증거다.
+    hint: 'Users/{id} 순차'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1) ffuf로 객체 id(1~6)를 /api/Users/FUZZ 에 순차 퍼징 → 각 응답 상태코드 출력(객체 수준 인가 점검)
+      ssh att@192.168.0.202 "seq 1 6 > /tmp/ids.txt; ffuf -u http://juice.el34.lab/api/Users/FUZZ -w /tmp/ids.txt -mc all 2>/dev/null | grep -oE 'Status: [0-9]+'"
+      # 2) 해석 — 전부 401=객체수준 인가 양호(막혀 있음 확인도 결과), 200 섞이면 치명적 BOLA
+      # → 순차 객체 id로 남의 자원 접근 시도. 401 = 객체수준 인가 양호. 200이면 BOLA 치명
+    answer_detail: "BOLA(API1) = 순차 객체 id로 타인 자원 접근 시도. ffuf 로 /api/Users/{id} 를 퍼징하면 el34 JuiceShop 은 전부 401(보호)=객체 수준 인가 양호이며, 막혀 있음을 확인하는 것도 점검 결과다. 200 이면 치명적 노출. 근본 방어는 접근마다 객체 소유권을 검사하는 객체 수준 인가."
+    expected_output: |
+      Status: 401
+      Status: 401
+      Status: 401
+      Status: 401
+      Status: 401
+      Status: 401
+      → 순차 객체 id로 남의 자원 접근 시도. 401 = 객체수준 인가 양호. 200이면 BOLA 치명
+    verify:
+      type: output_contains
+      expect: 'Status: 401'
+      field: stdout
+      semantic:
+        intent: "BOLA 시도"
+        success_criteria: ["객체수준 인가 점검"]
+        acceptable_methods: ["**[OSS] ffuf (권장)**"]
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 영향 — API 취약점이 현실에 미치는 결과
+      발견을 나열만 하면 "그래서 무엇이 위험한가"가 보이지 않는다. 본 미션은 앞서 점검한 세 API
+      취약점이 실제로 어떤 피해로 이어지는지를 한 줄씩 자리매김한다. mass assignment(API6)는 직접
+      점검하지 않았지만 원리상 영향이 명확하므로 함께 정리한다(요청 본문에 미허용 필드를 끼워 넣어
+      서버가 무비판 바인딩하면 권한이 상승한다).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) BOLA(API1)의 영향 — 객체 id 교체로 타인 데이터 대량 수집
+      echo "BOLA(API1): 객체 id 교체로 타인 데이터 대량 수집"
+      # 2) 과다 노출(API3)의 영향 — 불필요 필드로 PII 유출
+      echo "과다 노출(API3): 응답의 불필요 필드(이메일/내부ID) → PII 유출"
+      # 3) mass assignment(API6)의 영향 — 미허용 필드(isAdmin) 주입으로 권한 상승
+      echo "Mass assignment(API6): 미허용 필드(isAdmin) 주입 → 권한 상승"
+      # 4) 결론 — API는 UI 통제 우회, 서버측 인가/직렬화 통제 없으면 치명
+      # → API는 UI 통제 우회. 서버측 인가/직렬화 통제 없으면 치명
+      ```
+      - PII(Personally Identifiable Information) = 개인을 식별할 수 있는 정보(이메일·이름·전화번호 등).
+
+      ## ✅ 합격 기준
+      `PII` 출력 시 통과. **근거:** 세 영향(BOLA→타인 데이터, 과다 노출→PII 유출, mass assignment→권한
+      상승)이 정리되면 셋의 공통점(모두 UI 통제를 우회)이 드러난다.
+    hint: 'PII유출/권한상승'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) BOLA(API1)의 영향 — 객체 id 교체로 타인 데이터 대량 수집
+      echo "BOLA(API1): 객체 id 교체로 타인 데이터 대량 수집"
+      # 2) 과다 노출(API3)의 영향 — 불필요 필드로 PII 유출
+      echo "과다 노출(API3): 응답의 불필요 필드(이메일/내부ID) → PII 유출"
+      # 3) mass assignment(API6)의 영향 — 미허용 필드(isAdmin) 주입으로 권한 상승
+      echo "Mass assignment(API6): 미허용 필드(isAdmin) 주입 → 권한 상승"
+      # 4) 결론 — API는 UI 통제 우회, 서버측 인가/직렬화 통제 없으면 치명
+      # → API는 UI 통제 우회. 서버측 인가/직렬화 통제 없으면 치명
+    answer_detail: "영향 = 타인 데이터 대량 수집(BOLA/API1) / PII 유출(과다노출/API3) / 권한상승(mass assignment/API6). 세 취약점 모두 화면(UI) 통제를 우회한다는 것이 공통 핵심이며, 그래서 통제는 서버측에서 강제해야 한다."
+    expected_output: |
+      BOLA(API1): 객체 id 교체로 타인 데이터 대량 수집
+      과다 노출(API3): 응답의 불필요 필드(이메일/내부ID) → PII 유출
+      Mass assignment(API6): 미허용 필드(isAdmin) 주입 → 권한 상승
+      → API는 UI 통제 우회. 서버측 인가/직렬화 통제 없으면 치명
+    verify:
+      type: output_contains
+      expect: 'PII'
+      field: stdout
+      semantic:
+        intent: "API 영향"
+        success_criteria: ["데이터유출/권한상승"]
+        acceptable_methods: ["**[관리적] 영향 (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 방어 — 서버측 API 인가
+      점검의 가치는 "고치는 길"을 제시하는 데 있다. 본 주차 세 취약점은 뿌리가 같으므로(통제를 화면에
+      맡기고 서버에서 빠뜨림), 방어도 하나의 원칙으로 모인다 — **모든 통제는 서버에서, 객체마다,
+      입력·출력 양쪽에 강제한다.** 이를 네 가지 구체 통제로 정리한다. WAF(ModSecurity)는 SQLi/XSS 같은
+      알려진 패턴은 잡지만 BOLA·mass assignment 같은 인가·로직 결함은 시그니처로 잡기 어려우므로,
+      근본 방어는 WAF 가 아니라 **애플리케이션 서버측 인가·검증** 임에 유의한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) 객체수준 인가(BOLA) — 모든 객체 접근에 소유권/역할 검사
+      echo "1) 객체수준 인가(BOLA): 모든 객체 접근에 소유권/역할 검사"
+      # 2) 응답 최소화(과다 노출) — 직렬화 allowlist로 필요한 필드만
+      echo "2) 응답 최소화(과다 노출): 직렬화 allowlist, 필요한 필드만"
+      # 3) 입력 바인딩 allowlist/DTO(mass assignment) — 민감 필드 바인딩 차단
+      echo "3) 입력 바인딩 allowlist/DTO(mass assignment): 민감 필드 바인딩 차단"
+      # 4) 토큰 검증 강화 + 속도 제한 + API 게이트웨이 로깅
+      echo "4) 토큰 검증 강화 + 속도 제한 + API 게이트웨이 로깅"
+      # 5) 핵심 — 서버측 객체수준 인가 + 입출력 allowlist
+      # → 핵심: 서버측 객체수준 인가 + 입출력 allowlist
+      ```
+      - DTO(Data Transfer Object) = 입력으로 받을 필드만 정의해 둔 전용 객체(허용 필드 틀).
+
+      ## ✅ 합격 기준
+      `allowlist` 출력 시 통과. **근거:** 네 통제(① 객체 수준 인가 ② 응답 직렬화 allowlist ③ 입력 바인딩
+      allowlist/DTO ④ 토큰 검증·속도제한·로깅)가 각 취약점(API1/3/6/2)에 1:1 로 대응되게 정리되면 서버측 인가 방어가 선다.
+    hint: '객체인가/응답최소화/allowlist'
+    category: report
+    points: 12
+    answer: |
+      # 1) 객체수준 인가(BOLA) — 모든 객체 접근에 소유권/역할 검사
+      echo "1) 객체수준 인가(BOLA): 모든 객체 접근에 소유권/역할 검사"
+      # 2) 응답 최소화(과다 노출) — 직렬화 allowlist로 필요한 필드만
+      echo "2) 응답 최소화(과다 노출): 직렬화 allowlist, 필요한 필드만"
+      # 3) 입력 바인딩 allowlist/DTO(mass assignment) — 민감 필드 바인딩 차단
+      echo "3) 입력 바인딩 allowlist/DTO(mass assignment): 민감 필드 바인딩 차단"
+      # 4) 토큰 검증 강화 + 속도 제한 + API 게이트웨이 로깅
+      echo "4) 토큰 검증 강화 + 속도 제한 + API 게이트웨이 로깅"
+      # 5) 핵심 — 서버측 객체수준 인가 + 입출력 allowlist
+      # → 핵심: 서버측 객체수준 인가 + 입출력 allowlist
+    answer_detail: "방어 = 객체 수준 인가(BOLA) + 응답 필드 최소화/직렬화 allowlist(과다노출) + 입력 바인딩 allowlist·DTO(mass assignment) + 토큰 검증·속도제한·로깅(인증). 공통 원칙은 '모든 통제는 서버에서, 객체마다, 입출력 양쪽'. WAF 가 아니라 서버측 인가가 근본이다."
+    expected_output: |
+      1) 객체수준 인가(BOLA): 모든 객체 접근에 소유권/역할 검사
+      2) 응답 최소화(과다 노출): 직렬화 allowlist, 필요한 필드만
+      3) 입력 바인딩 allowlist/DTO(mass assignment): 민감 필드 바인딩 차단
+      4) 토큰 검증 강화 + 속도 제한 + API 게이트웨이 로깅
+      → 핵심: 서버측 객체수준 인가 + 입출력 allowlist
+    verify:
+      type: output_contains
+      expect: 'allowlist'
+      field: stdout
+      semantic:
+        intent: "API 인가 방어"
+        success_criteria: ["객체인가/allowlist"]
+        acceptable_methods: ["**[설명] 방어 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 API 보안 점검 종합 보고서
+      점검의 산출물은 보고서다. 미션 1–7 의 발견(과다 노출)과 양호 사항(BOLA 401 보호)을 한 문서로
+      종합해야 점검이 완성된다. 보고서의 신뢰는 주장이 아니라 **재현 절차 + 증거(응답 코드·노출 필드)**
+      에서 나온다. "취약점을 찾았다"고 과장하지 말고, **무엇이 보호되고 무엇이 새는지를 사실대로** 적는다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) heredoc(<<'EOF' ... EOF)으로 API 보안 점검 보고서를 출력 — 경계/발견(증거)→영향→인가 방어
+      cat > ~/web-vuln_w12_note1.md <<'EOF'
+      # 웹취약점 W12 API 보안 보고서
+      ## 1. 발견: 공개(/api/Products 200)/보호(/api/Users 401) 경계, 과다 노출(/api/Feedbacks → UserId/이메일), BOLA 시도(Users/{id} 401 보호)
+      ## 2. 영향: PII 유출(과다 노출), 타인 데이터(BOLA), 권한상승(mass assignment)
+      ## 3. 방어: 객체수준 인가 + 응답/입력 allowlist + 토큰검증
+      ## 결론: API는 UI 없는 공격 표면. 서버측 객체수준 인가와 입출력 allowlist가 근본 방어
+      EOF
+      cat ~/web-vuln_w12_note1.md
+      ```
+
+      ## ✅ 합격 기준
+      `allowlist` 출력 시 통과. **근거:** 보고서에 경계 매핑(공개 200/보호 401) + 발견(과다 노출 API3)과
+      양호(BOLA API1 401) + 영향(PII/권한상승) + 방어(객체 수준 인가 + 입출력 allowlist + 토큰 검증)가
+      증거와 함께 담기면 OWASP API Top 10 자리매김의 종합 보고서로 인정된다.
+    hint: 'API3/API1+allowlist'
+    category: report
+    points: 14
+    answer: |
+      cat > ~/web-vuln_w12_note2.md <<'EOF'
+      # 웹취약점 W12 API 보안 보고서
+      ## 1. 발견: 공개(/api/Products 200)/보호(/api/Users 401) 경계, 과다 노출(/api/Feedbacks → UserId/이메일), BOLA 시도(Users/{id} 401 보호)
+      ## 2. 영향: PII 유출(과다 노출), 타인 데이터(BOLA), 권한상승(mass assignment)
+      ## 3. 방어: 객체수준 인가 + 응답/입력 allowlist + 토큰검증
+      ## 결론: API는 UI 없는 공격 표면. 서버측 객체수준 인가와 입출력 allowlist가 근본 방어
+      EOF
+      cat ~/web-vuln_w12_note2.md
+    answer_detail: "API 보안 종합 = OWASP API Top10 자리매김. 경계 매핑(공개 200/보호 401) + 발견(과다노출 API3) + 양호(BOLA API1 401 보호) + 영향(PII/권한상승) + 방어(객체 수준 인가 + 응답/입력 allowlist + 토큰검증). 발견·양호를 증거(응답 코드/노출 필드)로 사실대로 구분해 기록하는 것이 핵심."
+    expected_output: |
+      # 웹취약점 W12 API 보안 보고서
+      ## 1. 발견: 공개(/api/Products 200)/보호(/api/Users 401) 경계, 과다 노출(/api/Feedbacks → UserId/이메일), BOLA 시도(Users/{id} 401 보호)
+      ## 2. 영향: PII 유출(과다 노출), 타인 데이터(BOLA), 권한상승(mass assignment)
+      ## 3. 방어: 객체수준 인가 + 응답/입력 allowlist + 토큰검증
+      ## 결론: API는 UI 없는 공격 표면. 서버측 객체수준 인가와 입출력 allowlist가 근본 방어
+    verify:
+      type: output_contains
+      expect: 'allowlist'
+      field: stdout
+      semantic:
+        intent: "API 보안 종합 보고"
+        success_criteria: ["API 발견/인가 방어"]
+        acceptable_methods: ["**[관리적] 보고서 (권장)**"]
+    target_vm: web

@@ -1,0 +1,296 @@
+id: "secuops-w08"
+category: "secuops"
+title: "[보안운영 W8] 중간고사 — 한 침입 사슬을 5종 장비로 끝까지 막아내기"
+difficulty: "hard"
+time_limit: 3600
+battle_type: "1v1"
+description: |
+  중간 평가다. 지난 7주 동안 방화벽·IDS·WAF·SIEM·osquery를 하나씩 익혔다. 이번엔 **한 침입자가 전체
+  사슬**(정찰 → 웹 침투 → 호스트 발판)을 시도하고, 운영자(너)는 **5종 장비를 모두 동원**해 각 단계를
+  막고 추적해야 한다. 단일 장비 실력이 아니라 "사슬 전체를 어느 장비로 끊을지 판단하는 능력"을 본다.
+
+  ▸ 이야기
+    침입자가 ① 스캐너로 정찰하고 ② SQLi로 웹에 침투한 뒤 ③ 호스트에 발판(리스너·계정)을 심는다.
+    운영자는 ① 방화벽의 정책·NAT를 점검하고 ② IDS 룰로 정찰을 잡고 ③ WAF의 anomaly 차단을 확인하고
+    ④ osquery로 호스트 발판을 사냥하고 ⑤ 모든 흔적이 SIEM으로 수렴하는지 확인한다.
+
+  ▸ 모드: solo(침입자→5종 운영자) / duel(상대 침입→본인 5종 방어). 대상=solo 본인 / duel 상대.
+
+  ▸ 알아둘 점 — 시험 단계는 **독립 채점**된다(변경 후 정리 권장). 미션 전용 태그·마커:
+    웹 침투 태그 **`mt8r1-<id>`**, IDS 룰 **sid 9508001**, 호스트 발판 **리스너 포트 38080 / 계정 `mtuser`**.
+
+# ───────────── RED : 침입자 — "사슬 전체를 뚫어라" ─────────────
+red_missions:
+  - order: 1
+    assess_target: opponent
+    target_vm: web
+    points: 20
+    instruction: |
+      ## 🎯 RED-1 — 스캐너 정찰 → 웹 침투 (WAF에 두 종류 흔적)
+
+      ### 상황
+      스캐너 도구(자기 이름을 User-Agent에 노출)로 표면을 훑고, 곧바로 SQLi로 침투한다. WAF는 이
+      **두 종류**를 모두 본다 — 스캐너 UA(913 scanner)와 SQLi(942). (같은 sqlmap UA는 BLUE-2에서 네가
+      만들 IDS 룰로 IPS에도 잡힌다 — 두 장비 관점은 BLUE에서 교차한다.)
+
+      ### 할 일
+      이 미션 전용 태그 `mt8r1-<id>`를 붙여, 스캐너 UA로 SQLi를 보낸다.
+      ```bash
+      curl -s -A "sqlmap/1.7" -H "Host: dvwa.el34.lab" \
+        "http://{{WEB_ENTRY}}/?id=mt8r1-kim-1%20UNION%20SELECT%20user,password%20FROM%20users"
+      ```
+
+      ### 채점 방법
+      대상 **WAF audit에 SQLi(942)와 스캐너 UA(913)**가 모두 남았는지로 채점한다. 태그로 네 공격을
+      귀속한다. (IPS 노이즈가 아닌, 귀속 가능한 WAF 흔적으로 본다.)
+
+      ### 합격 기준
+      대상 WAF audit에 (mt8r1 태그 포함) SQLi(942)와 스캐너(913) 탐지가 남는다.
+    hint: "태그(mt8r1) 붙인 sqlmap UA SQLi. 채점: 대상 ModSec 942 + 913 scanner(둘 다 귀속 가능)."
+    verify:
+      type: "log_contains"
+      expect: "942"
+      checks:
+        - { id: "red-1-1", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "942100", since_sec: 1800 } }
+        - { id: "red-1-2", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "scanner", since_sec: 1800 } }
+      semantic:
+        intent: |
+          다계층 침투 — 스캐너 UA(913)+SQLi(942)가 WAF audit에 함께. 같은 sqlmap UA는 BLUE-2의 커스텀
+          IDS 룰로 IPS(eve.json)에도 잡혀 두 장비 관점이 교차. 대상 WAF audit으로 판정(IPS 앰비언트
+          노이즈는 귀속 불가하므로 사용 안 함). 태그로 귀속.
+        success_criteria:
+          - "대상 WAF audit에 SQLi(942) + 스캐너(913) 탐지(최근)"
+          - "SQLi에 미션 전용 태그(mt8r1)를 붙여 귀속"
+          - "(개념) 같은 sqlmap UA를 WAF는 HTTP 의미(913+942)로, IDS는 네트워크 UA 문자열로 본다는 점을 개념적으로 서술(IPS 증거는 BLUE-2 룰 작성 후에 생기므로 여기선 설명만)"
+        acceptable_methods:
+          - "외부 공격자 VM({{ATTACKER_IP}})에서 태그 붙인 sqlmap UA SQLi"
+        negative_signs:
+          - "대상 미도달 / 태그 누락으로 귀속 실패"
+
+  - order: 2
+    assess_target: opponent
+    target_vm: web
+    points: 15
+    instruction: |
+      ## 🎯 RED-2 — 호스트 발판 (리스너 + 계정)
+
+      ### 상황
+      웹 침투를 발판으로 호스트에 **지속 접근 수단**을 심는다 — 비표준 포트 리스너와 백도어 계정.
+      osquery 사냥(BLUE-4)의 표적이다.
+
+      ### 할 일
+      대상 호스트에 리스너 **포트 38080**과 계정 **`mtuser`**를 만든다.
+      ```bash
+      nohup ncat -lk 38080 >/dev/null 2>&1 &
+      sudo useradd -m -s /bin/bash mtuser
+      ```
+
+      ### 채점 방법
+      대상 호스트에 포트 38080 listening 또는 `/etc/passwd`에 `mtuser`가 있는지로 채점.
+
+      ### 합격 기준
+      포트 38080 listening 또는 `/etc/passwd`에 `mtuser`.
+    hint: "ncat -lk 38080 + useradd mtuser. 채점: port_listening 38080 + file_contains passwd mtuser."
+    verify:
+      type: "port_listening"
+      expect: "38080"
+      checks:
+        - { id: "red-2-1", type: "port_listening", target: "web", params: { port: 38080 } }
+        - { id: "red-2-2", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "mtuser" } }
+      semantic:
+        intent: "MITRE T1571/T1136 — 호스트 발판(리스너/계정). osquery 사냥 표적."
+        success_criteria:
+          - "포트 38080 listening 또는 mtuser 계정"
+          - "발판 기법과 정상 대비 식별 신호 서술"
+        acceptable_methods:
+          - "ncat 리스너 / useradd 백도어 계정"
+        negative_signs:
+          - "발판 미생성"
+
+# ───────────── BLUE : 운영자 — "5종 장비로 사슬을 끊어라" ─────────────
+blue_missions:
+  - order: 1
+    assess_target: self
+    target_vm: fw
+    points: 15
+    instruction: |
+      ## 🛡️ BLUE-1 [방화벽] — 정책·NAT 점검 (사슬의 입구)
+
+      ### 상황
+      모든 공격은 방화벽을 거쳐 들어온다. nftables 정책과 HAProxy reverse proxy(공개 80/443 → 내부
+      web 10.20.32.80)의 NAT 흐름을 점검해, 무엇이 허용·차단되는지 안다.
+
+      ### 할 일
+      fw의 `/etc/nftables.conf` 정책과 HAProxy 가동을 확인하고, 공개 진입 → 내부 web NAT 경로를 서술한다.
+
+      ### 채점 방법
+      fw에 `/etc/nftables.conf`가 있고 HAProxy가 가동 중인지로 확인.
+
+      ### 합격 기준
+      fw에 nftables.conf가 존재하고 HAProxy가 running이다.
+    hint: "fw의 /etc/nftables.conf + HAProxy(공개→10.20.32.80 NAT)."
+    verify:
+      type: "file_exists"
+      expect: "nftables"
+      checks:
+        - { id: "blue-1-1", type: "file_exists", target: "fw", params: { path: "/etc/nftables.conf" } }
+        - { id: "blue-1-2", type: "process_running", target: "fw", params: { name: "haproxy" } }
+      semantic:
+        intent: "방화벽 baseline — nftables 정책 + HAProxy reverse proxy(공개→내부 web NAT). 4-tier chained 라우팅."
+        success_criteria:
+          - "nftables.conf 존재 + HAProxy 가동"
+          - "공개 진입 → HAProxy → web(10.20.32.80) NAT 흐름 서술"
+        acceptable_methods:
+          - "file_exists nftables.conf / nft list ruleset / haproxy.cfg"
+        negative_signs:
+          - "NAT/프록시 흐름 미이해"
+
+  - order: 2
+    assess_target: self
+    target_vm: ips
+    points: 20
+    instruction: |
+      ## 🛡️ BLUE-2 [IDS] — 정찰 탐지 룰 작성 (sid 9508001)
+
+      ### 상황
+      RED-1의 스캐너 정찰을 IDS가 잡아야 사슬을 초기에 끊는다. Suricata `local.rules`에 스캐너 UA 탐지
+      룰(**sid 9508001**)을 작성하고, fast_pattern으로 성능을 챙긴다.
+
+      ### 할 일
+      ```
+      alert http any any -> any any (msg:"MT8 sqlmap UA"; http.user_agent; content:"sqlmap"; nocase; fast_pattern; classtype:web-application-attack; sid:9508001; rev:1;)
+      ```
+      작성 후 reload하고 eve.json에서 트리거를 확인한다.
+
+      ### 채점 방법
+      `/etc/suricata/rules/local.rules`에 sid 9508001 룰이 있는지로 확인.
+
+      ### 합격 기준
+      local.rules에 9508001 룰이 있다.
+    hint: "local.rules에 sqlmap UA fast_pattern 룰(sid 9508001) → reload."
+    verify:
+      type: "file_contains"
+      expect: "9508001"
+      checks:
+        - { id: "blue-2-1", type: "file_contains", target: "ips",
+            params: { path: "/etc/suricata/rules/local.rules", pattern: "9508001" } }
+      semantic:
+        intent: "IDS 룰 — fast_pattern으로 스캐너 정찰 탐지. 사슬 초기 차단."
+        success_criteria:
+          - "local.rules에 sid 9508001"
+          - "fast_pattern/적절한 버퍼 사용"
+          - "eve.json에서 트리거 확인 서술"
+        acceptable_methods:
+          - "local.rules 작성 + reload + eve.json 검증"
+        negative_signs:
+          - "문법 오류로 로딩 실패"
+
+  - order: 3
+    assess_target: self
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-3 [WAF] — anomaly 차단 확인
+
+      ### 상황
+      RED-1의 SQLi가 WAF의 anomaly 누적 차단(949110)에 걸리는지 확인한다. 단일 룰이 아닌 누적 결정임을
+      안다(W6 복습).
+
+      ### 할 일
+      SQLi 공격 후 modsec audit에서 `Inbound Anomaly Score Exceeded` / 949110 차단을 찾는다.
+
+      ### 채점 방법
+      web modsec audit에 949110 흔적이 있는지로 확인.
+
+      ### 합격 기준
+      audit에 949110 anomaly 차단이 있다.
+    hint: "SQLi 후 audit의 949110. 누적 점수 차단."
+    verify:
+      type: "log_contains"
+      expect: "949110"
+      checks:
+        - { id: "blue-3-1", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "949110", since_sec: 1800 } }
+      semantic:
+        intent: "WAF anomaly — SQLi(942)+다중 룰 누적 → 949110 차단. 누적 결정 이해."
+        success_criteria:
+          - "audit에 949110 / Anomaly Score Exceeded"
+          - "누적 점수 메커니즘 서술"
+        acceptable_methods:
+          - "공격 재현 후 audit의 949110 확인"
+        negative_signs:
+          - "단일 룰 차단 오해"
+
+  - order: 4
+    assess_target: self
+    target_vm: web
+    points: 15
+    instruction: |
+      ## 🛡️ BLUE-4 [osquery] — 호스트 발판 사냥
+
+      ### 상황
+      RED-2가 심은 호스트 발판(리스너 38080 / 계정 mtuser)을 osquery로 사냥한다. 네트워크 장비가
+      못 보는 호스트 내부를 SQL로 질의한다.
+
+      ### 할 일
+      `listening_ports JOIN processes`(38080)와 `users`/`/etc/passwd`(mtuser)를 질의한다.
+
+      ### 채점 방법
+      대상 호스트에 포트 38080 listening 또는 `/etc/passwd`에 mtuser가 확인되는지로 채점.
+
+      ### 합격 기준
+      포트 38080 listening 또는 `/etc/passwd`에 mtuser.
+    hint: "osquery listening_ports JOIN processes(38080) / users(mtuser). 채점: port_listening 38080 + file_contains passwd mtuser."
+    verify:
+      type: "file_contains"
+      expect: "mtuser"
+      checks:
+        - { id: "blue-4-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "mtuser" } }
+        - { id: "blue-4-2", type: "port_listening", target: "web", params: { port: 38080 } }
+      semantic:
+        intent: "osquery 사냥 — 리스너(JOIN)/계정(users) 발판 식별. 호스트 내부 가시성."
+        success_criteria:
+          - "발판(38080 또는 mtuser) 확인"
+          - "osquery 질의 결과 제시 + baseline 대비 식별"
+        acceptable_methods:
+          - "osquery listening_ports JOIN processes / users 질의"
+        negative_signs:
+          - "osquery 미사용 / 발판 누락"
+
+  - order: 5
+    assess_target: self
+    target_vm: siem
+    points: 12
+    instruction: |
+      ## 🛡️ BLUE-5 [SIEM] — 5계층 흔적의 수렴
+
+      ### 상황
+      중간고사의 종합 — 개별 장비가 아니라 **5계층의 흔적이 SIEM 한 화면으로 수렴**해 한 침입 사슬로
+      엮이는지 확인한다.
+
+      ### 할 일
+      본인 SIEM(Wazuh)에 방화벽·IDS·WAF·호스트의 최근 경보가 모였는지 확인하고, 각 단계가 어느 장비에서
+      잡혔는지 한 시간선으로 정리한다.
+
+      ### 채점 방법
+      본인 SIEM에 최근 경보가 수집됐는지로 확인.
+
+      ### 합격 기준
+      본인 SIEM에 최근 경보가 수집돼 있다.
+    hint: "본인 Wazuh에 IDS/WAF/host 경보 수렴 + 시간선 정리."
+    verify:
+      type: "wazuh_alert"
+      expect: "alert"
+      checks:
+        - { id: "blue-5-1", type: "wazuh_alert", target: "siem", params: { since_sec: 1800 } }
+      semantic:
+        intent: "통합 관제 — 5계층 흔적의 Wazuh 수렴. 종합 평가의 핵심은 단일 도구가 아닌 통합 가시성."
+        success_criteria:
+          - "본인 Wazuh에 최근 경보(다계층)"
+          - "각 단계가 어느 장비에서 잡혔는지 시간선으로 정리"
+        acceptable_methods:
+          - "siem wazuh_alert / 중앙 SIEM 탭"
+        negative_signs:
+          - "수집이 비어있음"

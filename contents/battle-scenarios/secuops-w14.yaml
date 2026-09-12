@@ -1,0 +1,299 @@
+id: "secuops-w14"
+category: "secuops"
+title: "[보안운영 W14] 기다리지 말고 사냥하라 — 가설 세우고, 데이터를 질의하고, Sighting을 남기기"
+difficulty: "hard"
+time_limit: 3300
+battle_type: "1v1"
+description: |
+  지금까지는 경보가 **오기를 기다렸다**. 능숙한 분석가는 다르다 — **가설을 세우고 먼저 사냥한다**.
+  "외부 정찰이 있었으니 그 뒤 호스트에 persistence가 생겼을 것"이라는 **가설(Hypothesis)**을 세우고,
+  실 데이터를 **질의(Query)**해 잠복한 침입을 끄집어낸 뒤, 발견을 **STIX Sighting/Report**로 문서화하고
+  **MISP**로 **TLP** 등급을 붙여 공유한다. 능동적 위협 헌팅의 5단계를 한 바퀴 돈다.
+
+  ▸ 이야기
+    공격자가 APT처럼 ① 정찰 후 ② 호스트에 조용히 persistence를 심는다(경보가 안 뜰 수도 있다).
+    헌터(너)는 가설을 세워 잠복한 발판을 **선제 발견**하고, 그걸 표준(STIX Sighting)으로 문서화해
+    재발 시 자동 탐지되도록 운영 룰로 굳히고, TLP를 붙여 커뮤니티에 공유한다.
+
+  ▸ 모드: solo(다단계 침투→위협 헌터) / duel(상대 침투→본인 헌팅). 대상=solo 본인 / duel 상대.
+
+  ▸ 알아둘 점 — OpenCTI/MISP 미설치 → Sighting/Report/공유는 STIX 객체 작성·설계로, **헌팅 운영화는
+    Wazuh 룰(id 101401)**. 웹공격 태그 **`ct14r1-<id>`**, 호스트 persistence 마커 **계정 `huntme`**.
+
+# ───────────── RED : 침입자 — "조용히 잠복하라" ─────────────
+red_missions:
+  - order: 1
+    assess_target: opponent
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🎯 RED-1 — 정찰 (헌터의 가설 출발점)
+
+      ### 상황
+      APT 유사 다단계의 1단계 — 저소음 정찰. 헌터가 "정찰이 있었으니 다음은 침투/persistence"라는
+      가설을 세울 단서를 남긴다.
+
+      ### 할 일
+      이 미션 전용 태그 `ct14r1-<id>`를 붙여 정찰성 공격(스캐너 UA)을 보낸다.
+      ```bash
+      curl -s -A "nikto/2.1.5" -H "Host: dvwa.el34.lab" \
+        "http://{{WEB_ENTRY}}/?id=ct14r1-kim-probe"
+      ```
+
+      ### 채점 방법
+      대상 WAF audit에 (ct14r1 태그 포함) 정찰/스캐너 탐지가 남았는지로 채점.
+
+      ### 합격 기준
+      대상 WAF audit에 ct14r1 태그가 포함된 정찰 탐지가 남는다.
+    hint: "태그(ct14r1) 스캐너 정찰. 채점: 대상 modsec audit의 scanner + 태그."
+    verify:
+      type: "log_contains"
+      expect: "scanner"
+      checks:
+        - { id: "red-1-1", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "ct14r1", since_sec: 1800 } }
+      semantic:
+        intent: "APT 1단계 정찰 — 헌터의 가설(정찰→침투→persistence) 출발점. 대상 WAF audit으로 판정. 태그 귀속."
+        success_criteria:
+          - "대상 WAF audit에 (ct14r1 태그 포함) 정찰/스캐너 탐지(최근)"
+          - "이 정찰이 헌팅 가설의 어느 단계인지 서술"
+        acceptable_methods:
+          - "외부 공격자 VM({{ATTACKER_IP}})에서 태그 붙인 스캐너/정찰"
+        negative_signs:
+          - "대상 미도달 / 태그 누락"
+
+  - order: 2
+    assess_target: opponent
+    target_vm: web
+    points: 17
+    instruction: |
+      ## 🎯 RED-2 — 조용한 persistence (헌팅 표적)
+
+      ### 상황
+      정찰 후 **조용히** 발판을 심는다 — 요란한 공격이 아니라 백도어 계정 하나. 경보가 안 떠도 헌터의
+      가설 기반 질의에는 걸린다.
+
+      ### 할 일
+      대상 호스트에 백도어 계정 **`huntme`**를 만든다.
+      ```bash
+      sudo useradd -m -s /bin/bash huntme
+      ```
+
+      ### 채점 방법
+      대상 호스트 `/etc/passwd`에 `huntme`가 추가됐는지로 채점(헌팅 표적).
+
+      ### 합격 기준
+      `/etc/passwd`에 `huntme`가 있다.
+    hint: "useradd huntme(조용한 persistence). 채점: file_contains passwd huntme."
+    verify:
+      type: "file_contains"
+      expect: "huntme"
+      checks:
+        - { id: "red-2-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "huntme" } }
+      semantic:
+        intent: "MITRE T1136 — 조용한 계정 persistence. 경보 없이 잠복, 헌터의 가설 기반 질의 표적."
+        success_criteria:
+          - "/etc/passwd에 huntme"
+          - "왜 이런 조용한 발판이 경보를 안 띄우는지(그래서 헌팅이 필요한지) 서술"
+        acceptable_methods:
+          - "useradd / authorized_keys(대안)"
+        negative_signs:
+          - "흔적 미생성"
+
+# ───────────── BLUE : 위협 헌터 — "가설→질의→Sighting" ─────────────
+blue_missions:
+  - order: 1
+    assess_target: self
+    target_vm: siem
+    points: 12
+    instruction: |
+      ## 🛡️ BLUE-1 — MISP 5 객체 + OpenCTI 비교
+
+      ### 상황
+      위협 공유 플랫폼 MISP의 5 핵심 객체(Event/Attribute/Object/Tag/Galaxy)의 관계·사용 시점을
+      학습하고 OpenCTI와 비교한다. 두 플랫폼의 양방향 sync와 circular loop 회피도 안다.
+
+      ### 할 일
+      MISP 5 객체 관계와 OpenCTI 비교, circular loop 회피 3 방법을 정리한다.
+
+      ### 채점 방법
+      인텔 운영 기반(manager)이 가동 중인지로 확인.
+
+      ### 합격 기준
+      siem에 wazuh-analysisd가 running이다(+ 학습은 제출로 검증).
+    hint: "MISP 5객체 + OpenCTI 비교 + circular loop 회피. 채점: process_running siem wazuh-analysisd."
+    verify:
+      type: "process_running"
+      expect: "analysisd"
+      checks:
+        - { id: "blue-1-1", type: "process_running", target: "siem", params: { name: "wazuh-analysisd" } }
+      semantic:
+        intent: "MISP vs OpenCTI — Event/Attribute/Object/Tag/Galaxy. 양방향 sync + circular loop 회피(방향 태그/timestamp/UUID)."
+        success_criteria:
+          - "MISP 5객체 관계+사용 시점"
+          - "manager 가동"
+          - "OpenCTI↔MISP sync circular 회피 3방법"
+        acceptable_methods:
+          - "MISP 5객체 + 비교 + sync 설계"
+        negative_signs:
+          - "객체 관계 미이해 / circular loop 회피 누락"
+
+  - order: 2
+    assess_target: self
+    target_vm: web
+    points: 20
+    instruction: |
+      ## 🛡️ BLUE-2 — 5단계 헌팅 (가설 → 질의 → 발견)
+
+      ### 상황
+      이번 주 핵심 — 경보를 기다리지 말고 **가설**을 세워 사냥한다. "외부 정찰 후 호스트에 persistence가
+      생겼을 것"이라는 가설을 세우고, 실 데이터(osquery users 등)를 **질의**해 RED-2의 조용한 발판
+      (`huntme`)을 끄집어낸다.
+
+      ### 할 일
+      가설을 명시하고, osquery로 질의해 백도어 계정을 발견한다.
+      ```
+      Hypothesis: 정찰 IP → 발판 → 새 계정 persistence
+      Query: osquery "SELECT uid,username,shell,directory FROM users WHERE uid>=1000;"
+      Analyze → Document(Sighting)
+      ```
+
+      ### 채점 방법
+      대상 호스트에서 헌팅으로 persistence(`huntme`)가 확인되는지로 채점.
+
+      ### 합격 기준
+      `/etc/passwd`에 `huntme`가 있고 가설 기반 질의로 찾아냈다.
+    hint: "가설 명시 + osquery users 질의로 huntme 발견. 채점: file_contains passwd huntme."
+    verify:
+      type: "file_contains"
+      expect: "huntme"
+      checks:
+        - { id: "blue-2-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "huntme" } }
+      semantic:
+        intent: "능동적 헌팅 — Hypothesis→Collect→Query→Analyze→Document. 가설 기반 질의로 잠복 침해를 선제 발견. 채점 핵심은 발견(아티팩트 확인)+명시적 가설+질의내용 제시(특정 도구 실행 증거는 비요구)."
+        success_criteria:
+          - "persistence(huntme) 발견 확인"
+          - "명시적 hypothesis 제시"
+          - "호스트 질의 내용과 발견 결과(uid/shell 등 구체) 제시"
+        acceptable_methods:
+          - "가설 기반 호스트 질의로 발견 — osquery users / ss / grep /etc/passwd / Wazuh 등(도구보다 가설·발견·추론이 핵심)"
+        negative_signs:
+          - "가설 없이 무작정 탐색 / 발견 미문서화"
+
+  - order: 3
+    assess_target: self
+    target_vm: siem
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-3 — Sighting + Report로 문서화
+
+      ### 상황
+      발견을 머릿속에만 두면 공유도 재현도 안 된다. **STIX 2.1 Sighting**(언제/어디서 IOC가 관측됐는지)과
+      **Report**(분석 종합)로 표준화한다.
+
+      ### 할 일
+      헌팅 발견을 STIX Sighting + Report 객체로 작성한다(Sighting은 indicator와 연결).
+
+      ### 채점 방법
+      인텔 문서화의 적용 기반(CDB 인프라)이 있는지로 확인.
+
+      ### 합격 기준
+      siem에 CDB list 디렉토리가 존재한다(+ Sighting/Report는 제출로 검증).
+    hint: "STIX Sighting(관측)+Report(종합) 작성. 채점: file_exists /var/ossec/etc/lists."
+    verify:
+      type: "file_exists"
+      expect: "lists"
+      checks:
+        - { id: "blue-3-1", type: "file_exists", target: "siem", params: { path: "/var/ossec/etc/lists" } }
+      semantic:
+        intent: "STIX Sighting/Report — Sighting(IOC 관측 사실, count/observed_data) + Report(분석 서사). 공유 가능한 표준 표현."
+        success_criteria:
+          - "Sighting + Report STIX 객체 제시"
+          - "Sighting↔indicator 연결"
+          - "두 객체의 의미 차이"
+        acceptable_methods:
+          - "STIX Sighting/Report JSON 작성"
+        negative_signs:
+          - "Sighting과 Report 혼동 / indicator 미연결"
+
+  - order: 4
+    assess_target: self
+    target_vm: siem
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-4 — 헌팅을 운영으로 굳히기 (룰 id 101401)
+
+      ### 상황
+      일회성 사냥으로 끝내면 다음에 또 손으로 찾아야 한다. 발견한 침해 패턴을 **운영 룰(id 101401)**로
+      굳혀 재발 시 자동 탐지되게 한다 — 헌팅 → 룰의 선순환.
+
+      ### 할 일
+      `local_rules.xml`에 발견 패턴 기반 룰을 추가하고 `wazuh-control restart`한다.
+      ```xml
+      <group name="edu,syscheck,">
+        <rule id="101401" level="12">
+          <if_group>syscheck</if_group>
+          <field name="file">/etc/passwd</field>
+          <description>EDU W14 - hunted persistence pattern operationalized</description>
+        </rule>
+      </group>
+      ```
+
+      ### 채점 방법
+      `local_rules.xml`에 id 101401 룰이 있는지로 확인.
+
+      ### 합격 기준
+      local_rules.xml에 101401 룰이 있다.
+    hint: "발견 패턴을 local_rules.xml 룰(id 101401)로 운영화 → restart."
+    verify:
+      type: "file_contains"
+      expect: "101401"
+      checks:
+        - { id: "blue-4-1", type: "file_contains", target: "siem",
+            params: { path: "/var/ossec/etc/rules/local_rules.xml", pattern: "101401" } }
+      semantic:
+        intent: "헌팅→탐지 선순환 — 발견 침해 패턴을 룰로 굳혀 재발 자동 탐지. 헌팅 결과가 영구 가시성으로."
+        success_criteria:
+          - "local_rules.xml에 rule id 101401"
+          - "헌팅 발견 패턴 기반 로직"
+          - "헌팅→룰화 선순환의 의의"
+        acceptable_methods:
+          - "발견 기반 local_rules.xml 101401 + restart"
+        negative_signs:
+          - "헌팅만 하고 운영화 누락(재발 미탐) / XML 오류"
+
+  - order: 5
+    assess_target: self
+    target_vm: siem
+    points: 12
+    instruction: |
+      ## 🛡️ BLUE-5 — TLP로 공유 통제
+
+      ### 상황
+      발견 인텔을 아무에게나 뿌리면 사고가 난다. **TLP**(RED/AMBER/GREEN/CLEAR) 4 등급으로 배포 범위를
+      통제하고 MISP로 공유한다.
+
+      ### 할 일
+      발견 인텔에 TLP 등급을 적용하고 배포 범위를 정리한다(잘못된 TLP 사고 사례도).
+
+      ### 채점 방법
+      본인 SIEM에 최근 경보(헌팅 대상)가 수집됐는지로 확인.
+
+      ### 합격 기준
+      본인 SIEM에 최근 경보가 수집돼 있다(+ TLP 적용은 제출로 검증).
+    hint: "TLP 4등급 적용 + MISP 공유. 채점: wazuh_alert."
+    verify:
+      type: "wazuh_alert"
+      expect: "alert"
+      checks:
+        - { id: "blue-5-1", type: "wazuh_alert", target: "siem", params: { since_sec: 1800 } }
+      semantic:
+        intent: "배포 통제 — TLP 4등급으로 공유 범위 제한 + MISP 공유. 잘못된 TLP의 정보 유출 위험."
+        success_criteria:
+          - "최근 경보 수집"
+          - "TLP 4등급 분류 + 배포 범위 서술"
+          - "잘못된 TLP 사고 사례"
+        acceptable_methods:
+          - "TLP 분류 + MISP 공유 설계"
+        negative_signs:
+          - "TLP 미적용(무분별 공유)"

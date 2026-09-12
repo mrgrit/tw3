@@ -1,0 +1,761 @@
+lab_id: standalone-secuops-week08
+title: "중간고사 — 한 침입 사슬을 5종 장비(fw/IDS/WAF/osquery/SIEM)로 끝까지 막기"
+version: standalone-secuops
+course: secuops
+week: 8
+description: |
+  W01–W07 종합 실기(중간고사). 한 외부 침입자(출처 192.168.0.202)가 정찰 → 웹 침투(SQLi) →
+  호스트 발판의 한 공격 사슬(kill chain)을 시도한다. 운영자(학생)는 지난 7주 동안 하나씩 익힌
+  5종 보안 장비 — 방화벽(W02)·IDS(W03–04)·WAF(W05)·osquery(W06)·엔드포인트 IR(W07) — 을 모두
+  동원해, "어느 단계를 어느 장비로 끊을지" 판단하고, 각 단계를 알맞은 장비로 차단·사냥하며,
+  그 증거(로그/audit/eve.json/osquery 결과)를 제시한다. 마지막에는 el34 가 SNAT 를 하지 않아
+  출처 IP 가 끝까지 보존된다는 사실을 이용해, IDS 의 src_ip 와 WAF 의 remote_address 가 같은
+  192.168.0.202 임을 확인하여 5계층의 흔적을 한 타임라인으로 상관(correlation)한다.
+
+  핵심 메시지 — 어떤 단일 장비도 사슬 전체를 못 막는다. 방화벽은 호스트 내부를 못 보고(L4),
+  osquery 는 네트워크 정찰을 못 본다(호스트 한정). 다층 방어(defense in depth) + 통합 가시성
+  (SIEM 수렴)이 정답이다.
+
+  인프라 주의 — el34 에는 HAProxy 가 없다. 공개 진입은 el34-fw(nftables: inet six_filter 필터 +
+  ip six_nat DNAT), L7 라우팅+WAF 는 el34-web(Apache 2.4 + ModSecurity/CRS). 모든 명령은 el34
+  각 장비에 직접 접속(fw 10.20.30.1/ips 31.2/web 32.80/siem 32.100, 공격 192.168.0.202)해 실행한다. 공유
+  인프라이므로 baseline 은 수정하지 말고, 각 단계에서 심은 흔적은 그 단계에서 스스로 정리한다(self-clean).
+difficulty: hard
+duration_minutes: 240
+prerequisites:
+  - "W01–W07 통과 (방화벽/IDS/WAF/osquery/엔드포인트 IR)"
+  - "장비 직접 SSH: ssh ccc@<장비IP>(fw 10.20.30.1/ips 31.2/web 32.80/siem 32.100, root은 sudo) + 공격 ssh att@192.168.0.202 (비번 1)"
+  - "lecture §2(kill chain) §5(판단표) §6(상관) 숙지"
+objectives:
+  - "동원할 5종 장비(fw/ips/web/host/siem)의 가용성을 시험 전 점검한다"
+  - "공격 사슬 ① 정찰(스캐너 UA)을 IDS 커스텀 룰(sid 9008001)로 탐지하고 끝나면 베이스 룰을 보존한다"
+  - "같은 sqlmap UA 가 WAF(913)와 IDS(네트워크 UA 문자열)에 서로 다른 층위로 잡힘을 증거로 본다"
+  - "공격 사슬 ② 웹 침투(SQLi)가 WAF anomaly 누적(942100→949110)으로 403 차단됨을 audit 로 확인한다"
+  - "방화벽 정책·DNAT 경로(공개→web 10.20.32.80)를 점검하고 L7/WAF=Apache(HAProxy 아님)임을 안다"
+  - "공격 사슬 ③ 호스트 발판(리스너 38088/계정 w08user/cron)을 osquery 로 사냥하고 즉시 self-clean 한다"
+  - "5계층 흔적의 SIEM(Wazuh) 수렴을 확인하고 출처 IP(192.168.0.202)로 한 타임라인으로 상관한다"
+  - "사슬 단계별로 끊은 장비와 증거를 종합 보고서로 정리하고 공유 인프라 흔적을 0 으로 정리한다"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 점검 — 5종 장비가 모두 살아있나
+
+      **개념 한 줄.** 종합 대응의 전제는 동원할 5종 장비가 모두 가용해야 한다는 것이다. 운영자는
+      사건 대응에 들어가기 전 항상 도구의 가용성부터 확인한다 — 막상 끊으려는데 장비가 죽어 있으면
+      그 계층은 사슬에서 빈틈이 된다.
+
+      중간고사에서 동원할 5계층은 **방화벽(el34-fw / nftables)** · **IDS(el34-ips / Suricata)** ·
+      **WAF(el34-web / Apache+ModSecurity)** · **호스트 가시화(el34-web / osquery)** ·
+      **SIEM(el34-siem / Wazuh manager + web·ips agent)** 다. 각 컨테이너에 버전/상태를 물어 응답을 본다.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 5종 장비를 각 컨테이너에서 점검(주석의 `el34-<host>` 에 접속해 실행).
+
+      ```bash
+      # ── el34-fw: nftables 정책 줄 수 ──
+      sudo nft list ruleset | wc -l
+      # ── el34-ips: Suricata 버전 ──
+      suricata -V
+      # ── el34-web: ModSec 모듈 + osquery 버전 ──
+      sudo apache2ctl -M | grep -i security
+      osqueryi --version
+      # ── el34-siem: web/ips agent ──
+      /var/ossec/bin/agent_control -l | grep -E "web,|ips,"
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `nft list ruleset` — nftables 의 현재 정책 전체를 출력한다. `wc -l` 로 줄 수만 세어 "정책이
+        비어 있지 않은지(>0)"를 빠르게 본다.
+      - `suricata -V` — Suricata 버전(el34 = 6.0.4)을 출력한다. 응답이 있으면 IDS 바이너리 가용.
+      - `apache2ctl -M | grep -i security` — Apache 에 로드된 모듈 중 ModSecurity(`security2_module`)가
+        있는지 확인한다. 보이면 WAF 엔진이 떠 있는 것.
+      - `osqueryi --version` — osquery 버전(el34 = 5.23.0)을 출력한다.
+      - `agent_control -l` — Wazuh manager 에 등록된 agent 목록. `web,`(004)·`ips,`(003)가 Active 면
+        SIEM 수렴 경로가 살아 있다.
+
+      ## ✅ 합격 기준
+      osquery 5.x + suricata + modsec + web/ips agent 가 모두 응답한다(어느 하나라도 무응답이면 그
+      계층은 시험에서 동원 불가 — 먼저 원인부터 파악).
+    hint: 'fw nft / ips suricata -V / web modsec+osquery / siem agent_control'
+    category: survey
+    points: 8
+    answer: |
+      echo "=== fw nftables (정책 줄 수) ==="
+      ssh ccc@10.20.30.1 'sudo nft list tables'
+      echo "=== ips suricata ==="
+      ssh ccc@10.20.31.2 'suricata -V'
+      echo "=== web modsec ==="
+      ssh ccc@10.20.32.80 'sudo apache2ctl -M | grep -i security'
+      echo "=== host osquery ==="
+      ssh ccc@10.20.32.80 sudo osqueryi --version
+      echo "=== siem agents ==="
+      ssh ccc@10.20.32.100 sudo /var/ossec/bin/agent_control -l | grep -E "web,|ips," || echo "(agent 확인)"
+    answer_detail: "5종 장비 가용성 확인은 종합 대응의 전제다. 다층 방어는 5계층이 모두 살아 있어야 성립한다. 점검 대상은 fw(nftables 정책 존재)·ips(Suricata 동작)·web(Apache 에 ModSec 로드)·host(osquery 5.23.0)·siem(Wazuh manager + web(004)/ips(003) agent Active). 어느 하나라도 무응답이면 그 계층이 사슬의 빈틈이 되므로, 시험 본 단계 전에 반드시 확인한다."
+    verify:
+      type: output_contains
+      expect: '5.23'
+      field: stdout
+      semantic:
+        intent: "5종 장비 가용성 점검"
+        success_criteria: ["nftables 정책 존재", "Suricata 동작", "ModSec 로드", "osquery 5.x", "web/ips agent active"]
+        acceptable_methods:
+          - "**[OSS] 각 컨테이너 버전/상태 질의 (권장)**"
+          - "**[설명] 5계층 = 다층 방어 전제**"
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 ① 정찰 재현 — 스캐너 UA (WAF 가 913 으로 본다)
+
+      **개념 한 줄.** 공격 사슬의 첫 단계인 **정찰(Recon)** 은 공격 전에 표적의 표면을 자동화
+      스캐너로 훑어 약점을 찾는 것이다. sqlmap·nikto 같은 스캐너는 자기 정체를 드러내는
+      **User-Agent(UA)** 문자열(예: `sqlmap/1.7`)을 HTTP 헤더에 담는다.
+
+      외부 공격자(`el34-attacker`, 출처 192.168.0.202)가 sqlmap UA 로 `dvwa.el34.lab` 표면을 훑으면,
+      WAF(ModSecurity/CRS)의 **913 룰군(scanner detection)** 이 이를 audit 에 기록한다. 같은 UA 는
+      다음 미션에서 학생이 만들 IDS 룰로 IPS 에도 잡힌다 — **한 사건을 두 장비가 다른 층위로 본다.**
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 정찰은 `el34-attacker`, audit 확인은 `el34-web`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-attacker 에서: sqlmap UA 정찰 (진짜 스캐너) ──
+      # 💡 sqlmap 이 자체 UA(sqlmap/x.y)로 dvwa 표면을 훑는다 → WAF 의 913(scanner detection) 룰군이 audit 에 기록. dvwa 는 차단 모드라 403 이 돌아오지만 UA 흔적은 남는다.
+      sqlmap -u 'http://dvwa.el34.lab/?id=w08mt1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS|403' | head -2
+
+      # ── el34-web 에서: WAF audit 의 913 scanner (정찰 3초 후) ──
+      sudo tail -60 /var/log/apache2/modsec_audit.log | grep -c "913"
+      sudo tail -60 /var/log/apache2/modsec_audit.log | grep -o "sqlmap" | head -1
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `sqlmap -u '...?id=w08mt1'` — 실제 SQLi 스캐너. 자체 UA(`sqlmap/x.y`)를 HTTP 헤더에 담아
+        표면을 훑는다 → WAF 의 913 스캐너 탐지 룰군에 걸린다.
+      - `--batch` 무인 진행 / `--level=1 --risk=1` 가벼운 정찰 / `--flush-session` 이전 세션 캐시 무시 /
+        `--disable-coloring` 로그 파싱용 평문 출력.
+      - 자연 URL `http://dvwa.el34.lab/` — 호스트명이 web 의 Apache vhost(dvwa, 차단 모드)를 고른다.
+      - `grep -c "913"` — audit 로그 최근 60줄에서 CRS 913xxx(스캐너 탐지) 흔적의 개수를 센다.
+
+      ## ✅ 합격 기준
+      WAF audit 에 스캐너 탐지(`913`)가 남는다(방화벽은 L4 라 이 UA 를 못 본다 — 정찰은 IDS/WAF 의 영역).
+    hint: '외부 attacker 의 sqlmap UA 요청 → modsec audit 의 913'
+    category: recon
+    points: 10
+    answer: |
+      echo "=== sqlmap UA 정찰 ==="
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=w08mt1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS|403' | head -2"
+      # 고정 sleep 대신 로그에 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.32.80 "timeout 10 bash -c 'until sudo grep -q "913" /var/log/apache2/modsec_audit.log; do :; done'" || true
+      echo "=== modsec audit 913 scanner ==="
+      ssh ccc@10.20.32.80 'sudo tail -60 /var/log/apache2/modsec_audit.log | grep "913"' | jq -s length
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "913[0-9]{3}" | sort -u'
+    answer_detail: "스캐너 UA(sqlmap)는 OWASP CRS 의 913xxx 룰군(scanner detection)에 매치되어 modsec_audit.log 에 기록된다. 핵심 깨달음 — 방화벽은 패킷의 IP/포트(L3/L4)만 보므로 HTTP 헤더 안의 UA 문자열을 못 본다. 따라서 정찰 탐지는 방화벽이 아니라 IDS/WAF 의 영역이다. 같은 sqlmap UA 가 다음 미션의 IDS 룰로도 잡히며, 두 장비가 한 사건을 다른 층위(HTTP 의미 vs 네트워크 문자열)로 본다는 것이 종합 평가의 핵심이다."
+    verify:
+      type: output_contains
+      expect: '913'
+      field: stdout
+      semantic:
+        intent: "스캐너 UA 정찰을 WAF(913)로 식별"
+        success_criteria: ["modsec audit 에 913xxx", "sqlmap UA 흔적", "방화벽이 못 보는 층위 이해"]
+        acceptable_methods:
+          - "**[OSS] 외부 attacker sqlmap UA → audit 913 (권장)**"
+          - "**[설명] L4(fw) vs L7(WAF) 가시성 차이**"
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 ① IDS 룰 — 스캐너 UA 탐지(sid 9008001) 작성→reload→트리거→정리
+
+      **개념 한 줄.** 정찰을 사슬 초기에 끊으려면 IDS 가 잡아야 한다. WAF 는 HTTP 가 도착한 뒤 보지만,
+      IDS(Suricata)는 네트워크를 흐르는 페이로드 안에서 본다. 이 미션은 학생이 직접 탐지 룰을 설계해
+      "탐지를 만드는" 능력을 평가한다.
+
+      Suricata `local.rules` 에 스캐너 UA 탐지 룰(sid **9008001**, `http.user_agent` + `content:"sqlmap"`
+      + `fast_pattern`)을 추가하고, **문법 검사(-T) → 무중단 reload → 트리거 → eve.json 확인 → sid 로
+      삭제(베이스 보존)** 의 룰 수명주기 전체를 수행한다. 내 룰은 `9008xxx` 네임스페이스를 쓰고, base
+      룰(sid 1000001–1000005)은 절대 건드리지 않는다.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** IDS 룰 작성·reload·검증·정리는 `el34-ips`, 트리거는 `el34-attacker`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: 룰 작성 + 문법검사(-T) + 무중단 reload ──
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 W08 sqlmap scanner UA\"; http.user_agent; content:\"sqlmap\"; nocase; fast_pattern; classtype:web-application-attack; sid:9008001; rev:1;)
+      EOF"
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -2
+      sudo suricatasc -c reload-rules
+
+      # ── el34-attacker 에서: 트리거 (진짜 sqlmap — 자체 UA) ──
+      sqlmap -u 'http://dvwa.el34.lab/?id=w08mt3' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS|403' | head -2
+
+      # ── el34-ips 에서: eve.json 확인 + 정리(sid 삭제, 베이스 보존) (트리거 4초 후) ──
+      sudo grep "9008001" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature, src:.src_ip}'
+      sudo sed -i "/sid:9008001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null
+      ```
+
+      ## 🔍 룰·옵션 풀이
+      - `alert http any any -> any any` — HTTP 트래픽 전 방향에 대해 매치 시 alert 를 낸다.
+      - `http.user_agent; content:"sqlmap"; nocase;` — HTTP 의 User-Agent 헤더에서 대소문자 무시하고
+        문자열 `sqlmap` 을 찾는다.
+      - `fast_pattern` — Suricata 가 룰 전체를 검사하기 전에 이 문자열로 1차 후보를 빠르게 거른다(성능).
+      - `sid:9008001; rev:1;` — 룰의 고유 번호(시험용 네임스페이스 9008xxx)와 리비전.
+      - `suricata -T -S <파일>` — `-T` 는 테스트(문법 검사) 모드, `-S` 는 검사할 룰 파일 지정. 적용 전
+        문법 오류를 잡는다.
+      - `suricatasc -c reload-rules` — Suricata 소켓 클라이언트로 데몬을 멈추지 않고 룰만 다시 읽게 한다
+        (무중단 reload).
+      - `sed -i "/sid:9008001/d"` — 끝나면 내 룰 한 줄을 sid 로 찾아 삭제하고 다시 reload — baseline 보존.
+
+      ## ✅ 합격 기준
+      eve.json 에 `el34 W08 sqlmap` 시그니처가 잡힌다(정리 후 local.rules 에서 9008001 이 사라져 베이스 보존).
+    hint: 'local.rules 에 sqlmap UA fast_pattern 룰(9008001) → reload → 트리거 → eve → sid 삭제'
+    category: manipulation
+    points: 15
+    answer: |
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"el34 W08 sqlmap scanner UA\"; http.user_agent; content:\"sqlmap\"; nocase; fast_pattern; classtype:web-application-attack; sid:9008001; rev:1;)
+      EOF"'
+      echo "=== syntax ==="
+      ssh ccc@10.20.31.2 'sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -2'
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      # 고정 sleep 대신 로그에 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.31.2 "timeout 10 bash -c 'until sudo grep -q "9008001" /var/log/suricata/eve.json; do :; done'" || true
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=w08mt3' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'sqlmap|WAF/IPS|403' | head -2"
+      # 고정 sleep 대신 로그에 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.31.2 "timeout 10 bash -c 'until sudo grep -q "9008001" /var/log/suricata/eve.json; do :; done'" || true
+      echo "=== eve.json alert ==="
+      ssh ccc@10.20.31.2 'sudo grep "9008001" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature, src:.src_ip}"'
+      echo "=== 정리(베이스 보존) ==="
+      ssh ccc@10.20.31.2 'sudo sed -i "/sid:9008001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null; echo rule_removed'
+    answer_detail: "같은 sqlmap UA 를 WAF 는 HTTP 의미(CRS 913 스캐너 룰)로, IDS 는 네트워크 페이로드의 UA 문자열(content:\"sqlmap\")로 본다 — 한 사건의 두 관점. fast_pattern 으로 매칭 전 prefilter 해 성능을 확보한다. 룰 수명주기는 작성 → 문법 검사(-T) → 무중단 reload(suricatasc) → 트리거 → eve.json 검증 → sid 로 삭제다. 끝나면 sid 9008001 을 삭제해 base 룰(1000001–5)을 보존하는 것이 공유 인프라의 규율이다."
+    verify:
+      type: output_contains
+      expect: 'W08 sqlmap'
+      field: stdout
+      semantic:
+        intent: "정찰(스캐너 UA)을 커스텀 IDS 룰로 탐지 + 베이스 보존"
+        success_criteria: ["sid 9008001 룰 작성·reload", "eve.json 에 시그니처 트리거", "sid 삭제로 base 보존"]
+        acceptable_methods:
+          - "**[OSS] http.user_agent fast_pattern 룰 (권장)**"
+          - "**[OSS] suricatasc reload-rules**"
+          - "**[설명] WAF/IDS 의 같은 사건 다른 관점**"
+    target_vm: ips
+
+  - order: 4
+    instruction: |
+      ## 🎯 ② 웹 침투 재현 — SQLi → 403
+
+      **개념 한 줄.** 사슬의 두 번째 단계인 **웹 침투(Exploit)** 는 정찰로 찾은 약점을 실제로 악용하는
+      것이다. 대표적 기법인 **SQL Injection(SQLi)** 은 파라미터에 `' UNION SELECT ...` 같은 SQL 조각을
+      끼워 넣어 웹앱이 의도하지 않은 DB 질의(예: users 테이블의 비밀번호 탈취)를 실행하게 만든다.
+
+      el34 의 `dvwa.el34.lab` vhost 는 **차단 모드**다(W05: dvwa 는 차단·juice 는 탐지만). 따라서
+      WAF(ModSecurity/CRS)가 이 SQLi 를 잡아 **403(Forbidden)** 으로 막는다.
+
+      ## 💻 실행 명령
+
+      **공격 VM 장비:** `ssh att@192.168.0.202`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      # 💡 sqlmap 이 마커 w08mt4 를 base 값으로 두고 UNION SELECT 페이로드를 자동 생성·주입한다 → dvwa(차단 모드)의 WAF 가 anomaly 누적으로 403 차단. 마커가 URL 에 남아 audit 에서 grep w08mt4 로 격리된다.
+      sqlmap -u 'http://dvwa.el34.lab/?id=w08mt4' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `sqlmap -u '...?id=w08mt4'` — 실제 SQLi 도구가 id 파라미터에 `' UNION SELECT ...` 류 페이로드를
+        자동 생성·주입한다(수작업 URL 인코딩 불필요).
+      - `--level=2 --risk=2` — 테스트 깊이/위험도를 올려 UNION·오류 기반 등 더 많은 SQLi 페이로드를 시도한다.
+      - 자연 URL `http://dvwa.el34.lab/` — 차단 모드 vhost(dvwa)를 고른다.
+      - `grep -iE 'sqlmap|403|WAF/IPS'` — sqlmap 출력에서 WAF 차단(403)·WAF/IPS 감지 라인만 추린다.
+
+      ## ✅ 합격 기준
+      sqlmap 의 주입 시도가 WAF 에 `403` 으로 차단된다(출력에 403/WAF/IPS 라인 — osquery 는 이 네트워크 단계를 못 본다, 웹 침투 차단은 WAF 의 영역).
+    hint: 'attacker 의 UNION SELECT → dvwa 403'
+    category: response
+    points: 12
+    answer: |
+      echo "=== SQLi 침투 시도 (sqlmap) ==="
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=w08mt4' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head"
+    answer_detail: "SQLi(UNION SELECT)는 dvwa(차단 모드) vhost 에서 WAF 의 anomaly score 누적 → 949110 발동 → 403 으로 막힌다(메커니즘 상세는 미션 5). 핵심 깨달음 — osquery 는 호스트 내부를 보는 도구이므로 이 네트워크 단계를 못 본다. 따라서 웹 침투 차단은 osquery 가 아니라 WAF 의 영역이다. 같은 SQLi 를 juice 같은 탐지만 모드 vhost 에 보냈다면 200 으로 통과(탐지 기록만)했을 것이다."
+    verify:
+      type: output_contains
+      expect: '403'
+      field: stdout
+      semantic:
+        intent: "SQLi 웹 침투가 WAF 에 차단(403)됨을 확인"
+        success_criteria: ["UNION SELECT 요청", "응답 403", "차단 모드 vhost(dvwa) 이해"]
+        acceptable_methods:
+          - "**[OSS] 외부 attacker SQLi → 403 (권장)**"
+          - "**[설명] 차단(dvwa) vs 탐지만(juice) 모드 차이**"
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 ② WAF 확인 — 942(SQLi) + 949110(anomaly 누적 차단)
+
+      **개념 한 줄.** "막았다"를 넘어 **왜·어떻게** 막혔는지를 audit 로그로 증명하는 단계다. CRS 의
+      차단은 단일 룰이 아니라 **anomaly score 누적**의 결과다(W05 복습) — 룰 위반마다 점수가 쌓이고,
+      누적 점수가 임계값을 넘으면 차단 룰이 발동한다.
+
+      구체적으로 SQLi 를 잡는 **942100** 이 점수를 올리고, 누적 점수가 임계를 넘으면 **949110(Inbound
+      Anomaly Score Exceeded)** 이 발동해 403 으로 차단한다. audit 로그에서 이 두 룰 ID 와 차단 status,
+      그리고 출처가 보존된 `remote_address` 를 확인한다.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** SQLi 재현은 `el34-attacker`, audit 확인은 `el34-web`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-attacker 에서: SQLi 재현 (sqlmap, 마커 w08mt5) ──
+      sqlmap -u 'http://dvwa.el34.lab/?id=w08mt5' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head
+
+      # ── el34-web 에서: audit 의 942/949 + 응답/출처 (3초 후) ──
+      sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "94[29]1[0-9]{2}" | sort -u
+      sudo tail -1 /var/log/apache2/modsec_audit.log | jq '{status:.response.status, remote:.transaction.remote_address}'
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `grep -oE "94[29]1[0-9]{2}"` — 정규식으로 `942100`(SQLi)과 `949110`(anomaly 차단) 같은 94x1xx
+        룰 ID 만 뽑아내고, `sort -u` 로 중복을 제거한다.
+      - `jq "{status:.response.status, remote:.transaction.remote_address}"` — JSON audit 로그에서 응답
+        코드(403)와 공격자 출처 IP(remote_address)만 추출한다.
+      - **942100 → anomaly +5 → 949110 → 403** 의 2 단계 메커니즘이 핵심 — 단일 룰 차단이 아니다.
+
+      ## ✅ 합격 기준
+      audit 에 `949110`(anomaly 누적 차단)이 보인다(942100 도 함께 보이고, remote_address 가 출처
+      192.168.0.202 로 보존됨).
+    hint: 'SQLi 재현 후 audit 의 942100 + 949110, remote_address=공격자'
+    category: detect
+    points: 15
+    answer: |
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=w08mt5' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head"
+      # 고정 sleep 대신 로그에 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.32.80 "timeout 10 bash -c 'until sudo grep -q "94[29]1[0-9]{2}" /var/log/apache2/modsec_audit.log; do :; done'" || true
+      echo "=== audit 의 942/949 룰 ==="
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "94[29]1[0-9]{2}" | sort -u'
+      echo "=== 마지막 audit 요약 ==="
+      ssh ccc@10.20.32.80 'sudo tail -1 /var/log/apache2/modsec_audit.log | jq "{status:.response.status, remote:.transaction.remote_address}"'
+    answer_detail: "942100(SQL Injection) 매치가 anomaly score 를 올리고, 누적 점수가 임계를 넘으면 949110(Inbound Anomaly Score Exceeded)이 발동해 403 으로 차단한다. 즉 '942 가 직접 차단'이 아니라 '942 가 점수를 올리고 949110 이 누적 임계 초과로 차단'하는 2 단계 결정이다. 이 누적 구조를 이해해야 오탐/정탐 튜닝 시 임계값과 paranoia 수준을 조정할 수 있다. remote_address=192.168.0.202 는 fw 가 SNAT 를 하지 않아 출처가 보존된 것으로, 미션 10 의 상관 분석의 키가 된다."
+    verify:
+      type: output_contains
+      expect: '949110'
+      field: stdout
+      semantic:
+        intent: "WAF anomaly 누적 차단(942→949110) 메커니즘 확인"
+        success_criteria: ["audit 에 942100 + 949110", "remote_address=공격자(보존)", "누적 점수 이해"]
+        acceptable_methods:
+          - "**[OSS] audit grep 94x + jq (권장)**"
+          - "**[설명] anomaly score 누적 차단**"
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 방화벽 점검 — 정책·DNAT 경로 (HAProxy 아님)
+
+      **개념 한 줄.** 모든 공격은 fw 를 거쳐 들어온다. 방화벽 계층(el34-fw)은 **무엇이 들어오고(허용
+      포트) 어디로 가는지(DNAT)** 를 결정하는 L4 정책이다. 침해 추적의 출발점은 "공격이 어느 공개
+      포트로 들어와 어디로 갔는가"를 DNAT 테이블로 읽는 것이다.
+
+      el34 의 nftables 는 `inet six_filter`(필터)와 `ip six_nat`(DNAT) 두 테이블을 쓴다. 공개 80/443 →
+      DNAT → web `10.20.32.80` 경로를 점검한다.
+
+      > ⚠️ **자주 하는 오해 — "리버스 프록시가 HAProxy 다."** el34 에는 HAProxy 가 없다. L7 라우팅+WAF 는
+      > fw 가 아니라 **el34-web 의 Apache(vhost ServerName + ModSecurity)** 가 담당한다. fw 는 L4(DNAT),
+      > web 은 L7(라우팅+WAF)로 역할이 명확히 분리된 구조다.
+      >
+      > **정책은 수정 금지(점검만)** — 공유 인프라이기 때문.
+
+      ## 💻 실행 명령
+
+      **방화벽 장비:** `ssh ccc@10.20.30.1`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      sudo nft list table ip six_nat | grep -iE "dnat|10.20.32.80" | head
+      sudo nft list ruleset | grep -ciE "dnat"
+      echo "L7 라우팅/WAF = el34-web Apache vhost (HAProxy 없음, 출처 IP SNAT 없이 보존)"
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `nft list table ip six_nat` — el34 의 NAT 테이블(DNAT 규칙)을 출력한다. `grep -iE "dnat|10.20.32.80"`
+        로 "공개 → web 10.20.32.80" 매핑 줄만 본다.
+      - `nft list ruleset | grep -ciE "dnat"` — 전체 정책에서 DNAT 규칙의 개수를 센다(>0 이면 DNAT 활성).
+      - **SNAT 없음** — fw 는 DNAT(목적지 변환)만 하고 SNAT(출발지 변환)는 하지 않는다. 그래서 안쪽
+        장비가 공격자의 진짜 출처 IP 를 본다(미션 10 의 상관 키).
+
+      ## ✅ 합격 기준
+      DNAT 매핑(공개 → web `10.20.32.80`)이 보인다(L7/WAF 는 Apache — HAProxy 가 아님을 이해).
+    hint: 'nft list table ip six_nat 의 DNAT → 10.20.32.80; HAProxy 아님'
+    category: analysis
+    points: 10
+    answer: |
+      echo "=== DNAT 테이블 (공개 → web 10.20.32.80) ==="
+      ssh ccc@10.20.30.1 'sudo nft list table ip six_nat | grep -iE "dnat|10.20.32" | head'
+      echo "=== DNAT 규칙 수 ==="
+      ssh ccc@10.20.30.1 'sudo nft list ruleset | grep -ciE "dnat"'
+      echo "L7 라우팅/WAF = el34-web Apache vhost (HAProxy 없음)"
+    answer_detail: "el34-fw = nftables(inet six_filter 필터 + ip six_nat DNAT). 공개 80/443 → DNAT → web 10.20.32.80. SNAT 없음 → 출처 IP 보존. L7 라우팅/WAF 는 web 의 Apache+ModSec — HAProxy 는 el34 에 없다."
+    verify:
+      type: output_contains
+      expect: '10.20.32.80'
+      field: stdout
+      semantic:
+        intent: "방화벽 정책·DNAT 경로 점검 (HAProxy 부재 이해)"
+        success_criteria: ["six_nat DNAT 테이블", "공개→web 10.20.32.80 매핑", "L7/WAF=Apache(HAProxy 아님)"]
+        acceptable_methods:
+          - "**[OSS] nft list table ip six_nat (권장)**"
+          - "**[설명] fw=L4 DNAT / web=L7 WAF 분리, 출처 보존**"
+    target_vm: fw
+
+  - order: 7
+    instruction: |
+      ## 🎯 ③ 호스트 발판 1 — 비표준 포트 리스너(38088) → osquery 사냥 → 정리
+
+      **개념 한 줄.** 사슬의 세 번째 단계인 **호스트 발판(Foothold)** 은 침투에 성공한 공격자가
+      호스트에 재진입·통신 수단을 심는 것이다. 비표준 포트 리스너는 외부와 통신할 통로를 여는 행위로,
+      MITRE ATT&CK **T1571(Non-Standard Port)** 에 해당한다.
+
+      이 행위는 네트워크 장비(방화벽·IDS·WAF)가 모두 못 보는 **호스트 내부**에서 일어난다. 그래서
+      osquery 로 OS 를 SQL 질의해 "어느 프로세스가 이 포트를 듣는가"를 사냥하고 즉시 종료(contain)한다.
+      공유 인프라이므로 심자마자 정리한다(self-clean).
+
+      ## 💻 실행 명령
+
+      **WAF/웹 장비:** `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      nohup python3 -m http.server 38088 >/dev/null 2>&1 & echo listener_started
+      # 고정 sleep 대신 리스너/프로세스가 뜰 때까지 조건 대기(zero-sleep)
+      timeout 10 bash -c 'until pgrep -f "http.server 38088" >/dev/null; do :; done' || true
+      osqueryi --json 'SELECT p.pid,p.name,s.port FROM processes p JOIN listening_ports s USING(pid) WHERE s.port=38088;'
+      pkill -f "http.server 38088"; echo killed
+      ```
+
+      ## 🔍 도구·쿼리 풀이
+      - `nohup python3 -m http.server 38088 &` — 비표준 포트 38088 에 간이 리스너를 백그라운드로 띄워
+        발판을 재현한다(`nohup` 은 셸 종료 후에도 유지, `&` 는 백그라운드 실행).
+      - `processes p JOIN listening_ports s USING(pid)` — osquery 의 두 테이블을 공통 키 `pid` 로
+        결합한다. listening_ports 는 "어떤 포트가 열려 있나", processes 는 "그 pid 가 어떤 프로세스인가"
+        를 알려주므로, JOIN 하면 **"포트 38088 을 듣는 프로세스의 정체"** 가 한 줄로 나온다.
+      - `pkill -f "http.server 38088"` — 이름 패턴으로 그 리스너 프로세스를 종료(contain)한다.
+
+      ## ✅ 합격 기준
+      osquery 가 포트 `38088` 리스너와 그 주인 프로세스를 잡는다(종료 후 잔재 0).
+    hint: 'python3 리스너 38088 → osquery listening_ports JOIN processes → pkill'
+    category: response
+    points: 12
+    answer: |
+      ssh ccc@10.20.32.80 'nohup python3 -m http.server 38088 >/dev/null 2>&1 & echo listener_started'
+      # 고정 sleep 대신 리스너/프로세스가 뜰 때까지 조건 대기(zero-sleep)
+      timeout 10 bash -c 'until pgrep -f "http.server 38088" >/dev/null; do :; done' || true
+      echo "=== osquery 리스너 사냥 (포트의 주인 프로세스) ==="
+      ssh ccc@10.20.32.80 sudo osqueryi --json 'SELECT p.pid,p.name,s.port FROM processes p JOIN listening_ports s USING(pid) WHERE s.port=38088;'
+      ssh ccc@10.20.32.80 'pkill -f "http.server 38088"; echo killed'
+      echo "self-clean done"
+    answer_detail: "비표준 리스너는 listening_ports 와 processes 를 pid 로 JOIN 해 '어느 프로세스가 그 포트를 듣나'를 식별한다. 핵심 깨달음 — 방화벽/IDS 는 네트워크 시그니처를 보는 장비라 호스트 내부의 리스너 자체는 못 본다. 호스트 발판 사냥은 osquery 의 영역이다(MITRE T1571). 식별 후 pkill 로 즉시 종료해 contain 하고, 공유 인프라이므로 잔재를 남기지 않는다. 실전에서는 C2 통신·역방향 셸의 비표준 리스너를 이 JOIN 패턴으로 사냥한다."
+    verify:
+      type: output_contains
+      expect: '38088'
+      field: stdout
+      semantic:
+        intent: "호스트 발판(리스너)을 osquery 로 사냥 + 종료"
+        success_criteria: ["listening_ports JOIN processes 에 38088", "주인 프로세스 식별", "pkill contain"]
+        acceptable_methods:
+          - "**[OSS] osquery JOIN 으로 포트 소유 추적 (권장)**"
+          - "**[설명] 호스트 내부 = 네트워크 장비 사각**"
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 ③ 호스트 발판 2 — 백도어 계정(w08user) + cron → osquery 사냥 → 정리
+
+      **개념 한 줄.** 발판의 또 다른 형태는 **지속성(persistence)** — 재부팅·로그아웃 후에도 살아남는
+      재진입 수단이다. 백도어 계정은 MITRE **T1136(Create Account)**, cron 항목은 **T1053(Scheduled
+      Task)** 에 해당한다. 공격자는 정상 계정처럼 보이는 백도어로 다시 로그인하고, cron 으로 자기 도구를
+      주기적으로 실행한다.
+
+      이 역시 호스트 내부 행위이므로 osquery 의 `users`(이상 uid/shell 의 신규 계정)와 `crontab`(새 cron
+      항목)으로 사냥한다. Wazuh 의 FIM 도 `/etc/cron.d` 변경을 교차로 잡는다(W07). 식별 후 즉시 제거하되
+      **베이스 계정·cron 은 보존**한다(self-clean).
+
+      ## 💻 실행 명령
+
+      **WAF/웹 장비:** `ssh ccc@10.20.32.80`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      id w08user >/dev/null 2>&1 && userdel -r w08user; useradd -m -s /bin/bash -u 1098 w08user && echo account_created
+      echo "* * * * * root /tmp/.w08.sh" > /etc/cron.d/w08_backdoor
+      osqueryi --json 'SELECT username,uid,shell FROM users WHERE username="w08user";'
+      osqueryi --json 'SELECT command,path FROM crontab WHERE path LIKE "%w08_backdoor%";'
+      id w08user >/dev/null 2>&1 && userdel -r w08user; rm -f /etc/cron.d/w08_backdoor; echo cleaned
+      ```
+
+      ## 🔍 도구·쿼리 풀이
+      - `useradd -m -s /bin/bash -u 1098 w08user` — 백도어 계정을 재현한다(`-m` 홈 생성, `-s` 로그인
+        셸 부여, `-u 1098` 고정 uid — 시험 네임스페이스).
+      - `echo "* * * * * root /tmp/.w08.sh" > /etc/cron.d/w08_backdoor` — 매 분 root 로 실행되는 cron
+        persistence 를 재현한다(`* * * * *` = 매 분).
+      - `SELECT username,uid,shell FROM users WHERE username="w08user"` — osquery 의 users 테이블로
+        신규 계정의 uid·shell 을 확인한다(baseline 과 대조 시 비표준 uid/shell 이 단서).
+      - `SELECT command,path FROM crontab WHERE path LIKE "%w08_backdoor%"` — crontab 테이블로 새 cron
+        항목의 명령·경로를 확인한다.
+      - `userdel -r` + `rm -f` — 계정(홈 포함)과 cron 파일을 제거해 contain 한다(베이스는 보존).
+
+      ## ✅ 합격 기준
+      osquery 가 `w08user` 계정을 잡는다(crontab 의 w08_backdoor 도 보이고, 제거 후 잔재 0).
+    hint: 'useradd w08user + cron.d → osquery users/crontab → userdel + rm'
+    category: response
+    points: 13
+    answer: |
+      ssh ccc@10.20.32.80 'sudo id w08user >/dev/null 2>&1 && userdel -r w08user; useradd -m -s /bin/bash -u 1098 w08user && echo account_created'
+      ssh ccc@10.20.32.80 'echo "* * * * * root /tmp/.w08.sh" > /etc/cron.d/w08_backdoor'
+      echo "=== osquery 계정 사냥 ==="
+      ssh ccc@10.20.32.80 sudo osqueryi --json 'SELECT username,uid,shell FROM users WHERE username="w08user";'
+      echo "=== osquery cron persistence 사냥 ==="
+      ssh ccc@10.20.32.80 sudo osqueryi --json 'SELECT command,path FROM crontab WHERE path LIKE "%w08_backdoor%";'
+      ssh ccc@10.20.32.80 'sudo id w08user >/dev/null 2>&1 && userdel -r w08user; rm -f /etc/cron.d/w08_backdoor; echo cleaned'
+      echo "self-clean done"
+    answer_detail: "백도어 계정(users 테이블의 이상 uid/shell)과 cron persistence(crontab 테이블)는 osquery 의 SQL 질의로 사냥한다(MITRE T1136/T1053). Wazuh 의 FIM(syscheck)도 /etc/cron.d 디렉토리 변경을 교차로 잡으므로, osquery 와 FIM 두 신호가 같은 발판을 가리키면 신뢰도가 높다. 실전에서는 계정 이름이 backup·monitor 처럼 평범하게 위장되므로, 'baseline 에 없던 신규 uid + 동시각 cron/키 추가' 패턴이 핵심 단서다. userdel+rm 으로 contain 하되 베이스 계정/cron 은 보존한다."
+    verify:
+      type: output_contains
+      expect: 'w08user'
+      field: stdout
+      semantic:
+        intent: "호스트 발판(계정+cron persistence)을 osquery 로 사냥 + 제거"
+        success_criteria: ["users 에 w08user", "crontab 에 w08_backdoor", "userdel+rm 로 베이스 보존"]
+        acceptable_methods:
+          - "**[OSS] osquery users + crontab (권장)**"
+          - "**[OSS] Wazuh FIM 교차**"
+          - "**[설명] persistence baseline 대조**"
+    target_vm: web
+
+  - order: 9
+    instruction: |
+      ## 🎯 SIEM 수렴 — 5계층 흔적이 Wazuh 로 모이나
+
+      **개념 한 줄.** 종합의 핵심은 개별 장비를 따로 보는 것이 아니라, 5계층 흔적이 **SIEM 한 곳으로
+      수렴**하는지를 보는 것이다. 통합 관제의 전제는 모든 소스가 SIEM(Wazuh manager)으로 모여, 각
+      단계가 어느 장비에서 잡혔는지를 한 시간선에서 볼 수 있어야 한다는 것이다.
+
+      el34 의 활성 agent 는 **ips(003)** 와 **web(004)** 둘이다. 이 두 agent 가 Active 이고, 최근
+      다계층 경보(suricata/modsec/syscheck 등)가 한 manager 의 alerts.json 에 수집되는지 확인한다.
+
+      ## 💻 실행 명령
+
+      **SIEM 장비:** `ssh ccc@10.20.32.100`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      /var/ossec/bin/agent_control -l | grep -E "web,|ips,"
+      tail -n 400 /var/ossec/logs/alerts/alerts.json | grep -iE "suricata|modsec|sql|integrity|syscheck" | tail -4
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `agent_control -l` — Wazuh manager 에 등록된 agent 와 연결 상태를 나열한다. `web,`(004)·`ips,`(003)
+        가 Active 면 호스트측 끝단이 살아 있어 SIEM 수렴 경로가 건강한 것.
+      - `alerts.json` — manager 가 디코더·룰을 거쳐 만든 경보가 한 줄에 한 JSON 으로 쌓이는 파일이다.
+        `grep -iE "suricata|modsec|sql|integrity|syscheck"` 로 IDS·WAF·FIM 등 다계층 경보가 함께
+        수집됐는지 본다.
+      - (참고) manager 가 raw 로그를 어떻게 디코더 → 룰 → 평결로 만드는지는 다음 주차 W09 에서 본격적으로 연다.
+
+      ## ✅ 합격 기준
+      web/ips agent Active + 최근 다계층 경보가 수집돼 있다(agent 가 Disconnected 면 SIEM 수렴이 깨진 것).
+    hint: 'agent_control web/ips Active + alerts.json 의 suricata/modsec/syscheck'
+    category: detect
+    points: 8
+    answer: |
+      echo "=== Wazuh agents ==="
+      ssh ccc@10.20.32.100 sudo /var/ossec/bin/agent_control -l | grep -E "web,|ips," || echo "(agent)"
+      echo "=== 최근 다계층 경보 ==="
+      ssh ccc@10.20.32.100 'tail -n 400 /var/ossec/logs/alerts/alerts.json | grep -iE "suricata|modsec|sql|integrity|syscheck" | tail -4' || echo "(최근 경보 적재 대기)"
+      echo "siem 수렴 확인"
+    answer_detail: "ips(003)+web(004) agent 의 경보가 한 Wazuh manager 의 alerts.json 으로 수렴한다. IDS(Suricata)·WAF(ModSec)·호스트(FIM/syscheck) 흔적이 흩어진 도구가 아니라 한 화면에서 한 사건으로 보인다는 것이 통합 가시성이며, 종합 평가의 핵심이다. agent 연결 상태(Active/Disconnected)가 수렴 경로의 건강도를 나타낸다. manager 내부의 디코더·룰 동작은 W09 에서 본격적으로 다룬다."
+    verify:
+      type: output_contains
+      expect: 'web'
+      field: stdout
+      semantic:
+        intent: "5계층 흔적의 SIEM(Wazuh) 수렴 확인"
+        success_criteria: ["web/ips agent Active", "다계층 경보 수집", "통합 가시성 이해"]
+        acceptable_methods:
+          - "**[OSS] agent_control + alerts.json (권장)**"
+          - "**[설명] 개별 도구 → 통합 관제**"
+    target_vm: siem
+
+  - order: 10
+    instruction: |
+      ## 🎯 상관 분석 — 출처 IP 로 5계층을 한 타임라인으로
+
+      **개념 한 줄.** 종합 사고의 정점은 흩어진 흔적을 **출처 IP 하나로 한 사건에 엮는** 상관
+      (correlation)이다. el34 는 SNAT(출발지 변환)를 하지 않으므로, fw 를 통과한 뒤에도 모든 계층이
+      공격자의 진짜 출처 IP(192.168.0.202)를 본다.
+
+      이 한 IP 가 정찰·침투·발판이라는 흩어진 흔적을 **한 공격자의 한 사슬**로 묶는 키다. 여기서는 IDS
+      의 `src_ip` 와 WAF 의 `remote_address` 가 같은 192.168.0.202 임을 확인한다(시각까지 더하면 완전한
+      타임라인이 된다).
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** IDS 출처는 `el34-ips`, WAF 출처는 `el34-web`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: IDS 가 본 출처 ──
+      sudo grep -E '"event_type":"alert"' /var/log/suricata/eve.json | tail -1 | jq -c '{src:.src_ip,sig:.alert.signature}'
+
+      # ── el34-web 에서: WAF 가 본 출처 ──
+      sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "10\.20\.30\.202" | head -1
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `grep "event_type":"alert" ... | jq "{src:.src_ip,sig:.alert.signature}"` — eve.json 에서 alert
+        이벤트만 골라 출처 IP(`src_ip`)와 시그니처를 뽑는다. 이것이 IDS 가 본 출처다.
+      - `grep -oE "10\.20\.30\.202"` — modsec audit 에서 WAF 가 기록한 출처 IP(remote_address)가
+        192.168.0.202 인지 확인한다.
+      - **두 값이 같으면** — fw 의 SNAT 부재로 출처가 보존됐고, IDS·WAF 가 본 것이 같은 공격자임을 증명한다.
+
+      ## ✅ 합격 기준
+      양쪽이 같은 출처 IP `192.168.0.202` 를 가리킨다(두 IP 가 다르면 SNAT 가 끼었거나 다른 사건을 본 것).
+    hint: 'eve.json src_ip == modsec remote_address == 192.168.0.202 (출처 보존)'
+    category: analysis
+    points: 12
+    answer: |
+      echo "=== IDS(eve.json) 가 본 출처 ==="
+      ssh ccc@10.20.31.2 'sudo grep -E "\"event_type\":\"alert\"" /var/log/suricata/eve.json | tail -1 | jq -c "{src:.src_ip,sig:.alert.signature}"' >/dev/null 2>&1 || echo "(eve alert)"
+      echo "=== WAF(modsec) 가 본 출처 ==="
+      ssh ccc@10.20.32.80 'sudo tail -120 /var/log/apache2/modsec_audit.log | grep -oE "10\.20\.30\.202" | head -1'
+      # → 두 장비가 같은 출처 192.168.0.202 를 가리킴 = 한 사건
+    answer_detail: "출처 IP 보존(fw 가 SNAT 를 안 함)이 상관의 핵심이다. IDS 의 src_ip = WAF 의 remote_address = 192.168.0.202 라는 일치가, 정찰·침투·발판이 한 공격자의 한 사슬임을 입증한다. 만약 두 IP 가 달랐다면(예: 한쪽이 fw IP) SNAT 가 끼었거나 서로 다른 사건을 본 것이다. 시각까지 더하면 완전한 타임라인이 된다. 실전 사고 조사에서 출처 IP + 시각으로 다중 소스 로그를 한 타임라인으로 재구성하는 것이 바로 이 기법이다."
+    verify:
+      type: output_contains
+      expect: '192.168.0.202'
+      field: stdout
+      semantic:
+        intent: "출처 IP 로 5계층을 한 타임라인으로 상관"
+        success_criteria: ["IDS src_ip = WAF remote_address", "192.168.0.202(보존)", "한 공격자 한 사슬 입증"]
+        acceptable_methods:
+          - "**[OSS] eve.json src_ip + modsec remote_address 대조 (권장)**"
+          - "**[설명] SNAT 부재 → 출처 보존 → 상관 가능**"
+    target_vm: web
+
+  - order: 11
+    instruction: |
+      ## 🎯 종합 보고서 — 사슬 단계별 끊은 장비 + 증거
+
+      **개념 한 줄.** 미션 1–10 을 한 침입 사슬의 단계별로 정리해, 종합 판단을 문서로 입증한다. 이것은
+      실제 사고 대응 후 경영진·감사에 제출하는 사고 보고서의 표준 구조(개요 → 단계별 대응 → 상관
+      타임라인 → 결론)와 같다. "막았다"가 아니라 **각 단계를 어느 장비로 끊었는지 + 증거 + 출처 상관**
+      을 한 표로 종합하는 능력이 채점 대상이다.
+
+      ## 💻 보고서 양식
+      ```markdown
+      # el34 W08 중간고사 보고서 (학번, 이름)
+      ## 1. 사슬 개요 (출처 192.168.0.202, 정찰→침투→발판)
+      ## 2. 단계별 대응 (장비/증거)
+      ## 3. 출처 IP 상관 타임라인 (5계층)
+      ## 4. 다층 방어 결론 — 단일 장비로 못 막는 이유
+      ```
+
+      ## 🔍 작성 가이드
+      - **1. 사슬 개요** — 한 외부 공격자(192.168.0.202)가 정찰 → 웹 침투(SQLi) → 호스트 발판의 순서로
+        시도했음을 한 문단으로.
+      - **2. 단계별 대응** — 각 단계(① 정찰 / ② 침투 / 입구(fw) / ③ 발판 / 수렴(SIEM))마다 "공격 / 끊은
+        장비 / 증거"를 표로. 증거는 eve.json 시그니처, audit 의 942·949110·403, six_nat DNAT, osquery
+        JOIN/uid, agent alerts 처럼 구체적으로.
+      - **3. 상관 타임라인** — 모든 계층이 출처 192.168.0.202(SNAT 없음)를 가리켜 한 사슬임을 명시.
+      - **4. 결론** — fw 는 호스트 내부를, osquery 는 네트워크 정찰을 못 본다 → 다층 방어 + SIEM 수렴이
+        정답이라는 핵심 메시지로 마무리.
+
+      ## ✅ 합격 기준
+      보고서에 5계층 단계별 표 + 출처 상관이 포함된다.
+    hint: '단계별 장비/증거 표 + 출처 IP 상관'
+    category: report
+    points: 5
+    answer: |
+      cat > ~/w08_note1.md <<'EOF'
+      # el34 W08 중간고사 보고서
+      ## 1. 사슬 개요: 외부 공격자 192.168.0.202 → 정찰 → 웹 침투(SQLi) → 호스트 발판
+      ## 2. 단계별 대응 (5계층)
+      | 단계 | 공격 | 끊은 장비 | 증거 |
+      |------|------|-----------|------|
+      | ① 정찰 | sqlmap UA | IDS(sid 9008001) + WAF(913) | eve.json sig / audit 913 |
+      | ② 침투 | SQLi UNION | WAF(942→949110) | audit 403 + remote 192.168.0.202 |
+      | (입구) | — | fw(nftables DNAT) | six_nat 공개→10.20.32.80 |
+      | ③ 발판 | 리스너 38088 | osquery(listening_ports) | JOIN pid:port |
+      | ③ 발판 | 계정 w08user + cron | osquery(users/crontab) | uid 1098 / cron.d |
+      | (수렴) | — | SIEM(Wazuh) | web/ips agent alerts |
+      ## 3. 상관: 모든 계층이 출처 192.168.0.202(SNAT 없음) → 한 사슬
+      ## 4. 결론: fw 는 호스트 내부를, osquery 는 네트워크 정찰을 못 본다 → 다층 방어 + SIEM 수렴이 정답
+      EOF
+      cat ~/w08_note1.md
+    answer_detail: "중간고사의 핵심은 단일 장비 실력이 아니라 '사슬 전체를 어느 장비로 끊을지' 판단 + 5계층 통합. 출처 IP 보존이 상관의 키."
+    verify:
+      type: output_contains
+      expect: '5계층'
+      field: stdout
+      semantic:
+        intent: "사슬 단계별 대응 + 출처 상관 종합 보고"
+        success_criteria: ["단계별 장비/증거 표", "출처 IP 상관", "다층 방어 결론"]
+        acceptable_methods:
+          - "**[관리적] 보고서 양식 (권장)**"
+          - "**[설명] 판단 프레임워크 적용**"
+    target_vm: web
+
+  - order: 12
+    instruction: |
+      ## 🎯 정리 확인 — 공유 인프라 베이스 보존
+
+      **개념 한 줄.** el34 는 여러 학생이 함께 쓰는 공유 인프라다. 각 미션에서 self-clean 을 했으므로,
+      실습 흔적(계정 w08user / cron w08_backdoor / 리스너 38088 / IDS 룰 sid 9008001)이 하나도 남아
+      있지 않아야 한다. 변경분을 추적·원복하는 변경 관리 규율을 마지막에 검증한다.
+
+      ## 💻 확인 명령
+
+      **실습 컨테이너:** 호스트 잔재는 `el34-web`, IDS 룰 잔재는 `el34-ips`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-web 에서: 계정/cron/리스너 잔재 ──
+      id w08user >/dev/null 2>&1 && echo "USER 잔재!" || echo "user ok"; ls /etc/cron.d/w08_backdoor >/dev/null 2>&1 && echo "cron 잔재!" || echo "cron ok"; pgrep -f "http.server 38088" && echo "리스너 잔재!" || echo "listener ok"
+
+      # ── el34-ips 에서: IDS local.rules 의 9008001 잔재 수 (0 이어야 base 보존) ──
+      sudo grep -c "9008001" /etc/suricata/rules/local.rules
+
+      echo "---check done---"
+      ```
+
+      ## 🔍 도구·옵션 풀이
+      - `id w08user` — 계정이 남아 있으면 정보를 출력(잔재!), 없으면 실패해 `user ok` 로 분기.
+      - `ls /etc/cron.d/w08_backdoor` — cron 파일 잔재 확인.
+      - `pgrep -f "http.server 38088"` — 리스너 프로세스가 아직 살아 있는지 확인.
+      - `grep -c "9008001" .../local.rules` — IDS 커스텀 룰 잔재 수. **0 이어야** base 룰(1000001–5)만
+        남아 baseline 이 보존된 것.
+
+      ## ✅ 합격 기준
+      실습 흔적이 0 이고 `check done` 이 출력된다(IDS local.rules 의 9008001 = 0, base 룰·정상 계정·정책 보존).
+    hint: '계정/cron/리스너/IDS룰 잔재 0 확인'
+    category: cleanup
+    points: 5
+    answer: |
+      ssh ccc@10.20.32.80 'id w08user >/dev/null 2>&1 && echo "USER 잔재!" || echo "user ok"; ls /etc/cron.d/w08_backdoor >/dev/null 2>&1 && echo "cron 잔재!" || echo "cron ok"; pgrep -f "http.server 38088" && echo "리스너 잔재!" || echo "listener ok"'
+      echo "=== IDS local.rules 의 9008001 잔재 수 ==="
+      ssh ccc@10.20.31.2 'sudo grep "9008001" /etc/suricata/rules/local.rules'
+      echo "---check done---"
+    answer_detail: "공유 인프라에선 self-clean 이 필수. 계정/cron/리스너/IDS 룰을 끝까지 남기지 않는다(base 룰 1000001–5 + 정상 계정/정책 보존)."
+    verify:
+      type: output_contains
+      expect: 'check done'
+      field: stdout
+      semantic:
+        intent: "실습 아티팩트 정리 확인 — 공유 인프라 보존"
+        success_criteria: ["계정/cron/리스너 잔재 0", "IDS 9008001 = 0", "base 보존"]
+        acceptable_methods:
+          - "**[OSS] 잔재 일괄 점검 (권장)**"
+          - "**[설명] 공유 인프라 정리 의무**"
+    target_vm: web

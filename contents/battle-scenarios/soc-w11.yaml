@@ -1,0 +1,276 @@
+id: "soc-w11"
+category: "soc"
+title: "[SOC관제 W11] 악성코드 감염 — C2 비콘을 IOC로 잡고 호스트를 격리하기"
+difficulty: "medium"
+time_limit: 2700
+battle_type: "1v1"
+description: |
+  인시던트 대응 실습(2) — **악성코드**. 침투 후 악성코드가 실행돼 **C2(지휘통제) 비콘**으로 외부와
+  통신하고 **persistence**를 심는다. 대응자는 악성 프로세스·C2 연결·드롭 파일을 **IOC**로 식별하고,
+  감염 호스트를 네트워크에서 **격리**하며, 악성코드와 발판을 제거한다. 핵심은 **IOC 추출**과 **확산
+  차단**이다.
+
+  ▸ 모드: solo(공격자→악성코드 IR) / duel(상대 감염→본인 IR). 대상=solo 본인 / duel 상대.
+
+  ▸ 알아둘 점 — Red 채점은 대상 호스트 흔적(C2 포트/계정)으로. C2 비콘 마커 **포트 51515**, persistence
+    계정 **mw11bot**, 격리 차단룰 Suricata **sid 9511001**.
+
+red_missions:
+  - order: 1
+    assess_target: opponent
+    target_vm: web
+    points: 20
+    instruction: |
+      ## 🎯 RED-1 — 악성코드 C2 비콘 (포트 51515)
+
+      ### 상황
+      감염 호스트에서 악성코드가 외부 C2와 통신하는 비콘을 모사한다(리스너/콜백 포트 **51515**).
+      대응자의 C2 탐지·IOC 추출 표적이다.
+
+      ### 할 일
+      대상 호스트에 C2 비콘 리스너 포트 51515를 연다.
+      ```bash
+      nohup ncat -lk 51515 >/dev/null 2>&1 &
+      ```
+
+      ### 채점 방법
+      대상 호스트에서 포트 51515가 listening인지로 채점.
+
+      ### 합격 기준
+      대상 호스트에서 포트 51515가 listening이다.
+    hint: "ncat -lk 51515 (C2 비콘). 채점: port_listening 51515."
+    verify:
+      type: "port_listening"
+      expect: "51515"
+      checks:
+        - { id: "red-1-1", type: "port_listening", target: "web", params: { port: 51515 } }
+      semantic:
+        intent: "T1071 — 악성코드 C2 비콘. 대응자의 C2 탐지/IOC 추출 표적."
+        success_criteria:
+          - "포트 51515 listening"
+          - "C2 통신 패턴과 IOC(IP/포트) 서술"
+        acceptable_methods:
+          - "ncat 리스너 / 주기적 콜백 모사"
+        negative_signs:
+          - "비콘 미생성"
+
+  - order: 2
+    assess_target: opponent
+    target_vm: web
+    points: 15
+    instruction: |
+      ## 🎯 RED-2 — 악성코드 persistence (계정 mw11bot)
+
+      ### 상황
+      악성코드가 재부팅 후에도 살아남도록 백도어 계정(**mw11bot**)을 심는다. 대응자의 Eradicate 표적이다.
+
+      ### 할 일
+      대상 호스트에 계정 `mw11bot`을 만든다.
+      ```bash
+      sudo useradd -m -s /bin/bash mw11bot
+      ```
+
+      ### 채점 방법
+      대상 호스트 `/etc/passwd`에 `mw11bot`이 추가됐는지로 채점.
+
+      ### 합격 기준
+      `/etc/passwd`에 `mw11bot`이 있다.
+    hint: "useradd mw11bot. 채점: file_contains passwd mw11bot."
+    verify:
+      type: "file_contains"
+      expect: "mw11bot"
+      checks:
+        - { id: "red-2-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "mw11bot" } }
+      semantic:
+        intent: "T1136 — 악성코드 persistence(계정). 재부팅 생존. Eradicate 표적."
+        success_criteria:
+          - "/etc/passwd에 mw11bot"
+          - "persistence 메커니즘 서술"
+        acceptable_methods:
+          - "useradd / cron / service 등록"
+        negative_signs:
+          - "persistence 미생성"
+
+blue_missions:
+  - order: 1
+    assess_target: self
+    target_vm: web
+    points: 15
+    instruction: |
+      ## 🛡️ BLUE-1 [Identify] — 악성코드 식별 + IOC 추출
+
+      ### 상황
+      감염을 식별하고 IOC를 추출한다. 악성 프로세스(비정상 경로/이름), C2 연결(목적지/포트), 드롭 파일을
+      IOC로 정리한다.
+
+      ### 할 일
+      C2 비콘(51515)과 그 프로세스를 IOC(포트/경로)로 추출한다.
+
+      ### 채점 방법
+      대상 호스트에 C2 비콘(51515)이 식별되는지로 채점.
+
+      ### 합격 기준
+      포트 51515가 listening이며 IOC로 식별했다.
+    hint: "악성 프로세스/C2 연결 IOC 추출. 채점: port_listening 51515."
+    verify:
+      type: "port_listening"
+      expect: "51515"
+      checks:
+        - { id: "blue-1-1", type: "port_listening", target: "web", params: { port: 51515 } }
+      semantic:
+        intent: "악성코드 식별 — 프로세스/C2/드롭파일을 IOC(IP/포트/해시/경로)로 추출. 채점 핵심은 발견+IOC 정리(도구 실행 증거 비요구)."
+        success_criteria:
+          - "C2 비콘 식별"
+          - "프로세스 경로 + C2 IP/포트 IOC 정리"
+          - "IOC 간 관계"
+        acceptable_methods:
+          - "ss/osquery C2 연결 + 프로세스(도구보다 발견 핵심)"
+        negative_signs:
+          - "IOC 추출 없이 포트만"
+
+  - order: 2
+    assess_target: self
+    target_vm: web
+    points: 20
+    instruction: |
+      ## 🛡️ BLUE-2 [Hunt] — 감염 범위 헌팅
+
+      ### 상황
+      감염 범위를 전수 헌팅한다. C2 리스너(51515)와 프로세스, persistence 계정(mw11bot), 자동 실행
+      (cron/service)을 모두 찾아 감염의 전모를 파악한다.
+
+      ### 할 일
+      C2/계정/자동실행을 전수 점검해 감염 범위를 파악한다.
+
+      ### 채점 방법
+      대상 호스트에 persistence 계정(mw11bot)이 헌팅으로 확인되는지로 채점.
+
+      ### 합격 기준
+      `/etc/passwd`에 `mw11bot`이 있고 헌팅으로 찾아냈다.
+    hint: "C2/계정/cron/service 전수 헌팅. 채점: file_contains passwd mw11bot."
+    verify:
+      type: "file_contains"
+      expect: "mw11bot"
+      checks:
+        - { id: "blue-2-1", type: "file_contains", target: "web", params: { path: "/etc/passwd", pattern: "mw11bot" } }
+      semantic:
+        intent: "감염 범위 헌팅 — C2/계정/자동실행 전수 조사. 채점 핵심은 발견+전수조사(도구 실행 증거 비요구)."
+        success_criteria:
+          - "persistence(mw11bot) 확인"
+          - "프로세스/연결/계정/cron/service 전수 점검"
+          - "감염 호스트·계정 범위"
+        acceptable_methods:
+          - "osquery/ss 전수 헌팅(도구보다 전수 조사가 핵심)"
+        negative_signs:
+          - "일부만 확인(잔존 위험)"
+
+  - order: 3
+    assess_target: self
+    target_vm: ips
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-3 [Contain] — 호스트 네트워크 격리 (C2 차단룰 sid 9511001)
+
+      ### 상황
+      감염 호스트를 네트워크에서 격리한다. Suricata `local.rules`에 C2 목적지/포트 차단(drop)룰
+      (**sid 9511001**)을 작성해 C2 통신을 끊는다.
+
+      ### 할 일
+      ```
+      drop tcp any any -> any 51515 (msg:"IR W11 contain C2 beacon"; sid:9511001; rev:1;)
+      ```
+      작성 후 reload한다.
+
+      ### 채점 방법
+      ips의 `local.rules`에 sid 9511001 C2 차단룰이 있는지로 확인.
+
+      ### 합격 기준
+      local.rules에 9511001 룰이 있다.
+    hint: "local.rules에 C2 차단(drop)룰(sid 9511001) → reload."
+    verify:
+      type: "file_contains"
+      expect: "9511001"
+      checks:
+        - { id: "blue-3-1", type: "file_contains", target: "ips",
+            params: { path: "/etc/suricata/rules/local.rules", pattern: "9511001" } }
+      semantic:
+        intent: "IR Contain — 감염 호스트 네트워크 격리(C2 차단). 확산 차단하며 증거 보존."
+        success_criteria:
+          - "local.rules에 sid 9511001 C2 차단"
+          - "C2 목적지/포트 차단 범위"
+          - "증거 보존 고려"
+        acceptable_methods:
+          - "local.rules drop / 방화벽 C2 차단"
+        negative_signs:
+          - "격리 전 증거 파괴 / 확산 방치"
+
+  - order: 4
+    assess_target: self
+    target_vm: web
+    points: 15
+    instruction: |
+      ## 🛡️ BLUE-4 [Eradicate+Recover] — 악성코드 제거 + 복구
+
+      ### 상황
+      악성코드와 모든 발판(프로세스/파일/계정/자동실행)을 제거하고 호스트를 정상 복구한다.
+
+      ### 할 일
+      악성코드/발판을 전수 제거하고 apache를 복구한다.
+
+      ### 채점 방법
+      web 서버(Apache)가 정상 가동 중인지로 채점.
+
+      ### 합격 기준
+      web의 apache2가 running이다.
+    hint: "악성코드/발판 전수 제거 + apache 복구. 채점: process_running web apache2."
+    verify:
+      type: "process_running"
+      expect: "apache"
+      checks:
+        - { id: "blue-4-1", type: "process_running", target: "web", params: { name: "apache2" } }
+      semantic:
+        intent: "IR Eradicate+Recover — 악성코드/발판 전수 제거 + 정상 복구 + 취약점 패치(재감염 방지)."
+        success_criteria:
+          - "apache2 가동(복구)"
+          - "프로세스/파일/계정/자동실행 전수 제거"
+          - "침투 취약점 보완"
+        acceptable_methods:
+          - "발판 제거 + 서비스 복구 + 패치"
+        negative_signs:
+          - "발판 잔존 / 취약점 미패치"
+
+  - order: 5
+    assess_target: self
+    target_vm: siem
+    points: 12
+    instruction: |
+      ## 🛡️ BLUE-5 [Report] — 악성코드 IR 보고서 + IOC 공유
+
+      ### 상황
+      감염→C2→persistence→대응 전 과정을 보고서로 정리하고, 추출한 IOC(해시/IP/포트)를 탐지룰·CDB로
+      공유해 조직 전체 가시성을 높인다.
+
+      ### 할 일
+      악성코드 IR 보고서 + IOC(해시/IP/포트) 공유를 정리한다.
+
+      ### 채점 방법
+      Wazuh에 경보가 있는지 + 보고서/IOC(제출)로 채점.
+
+      ### 합격 기준
+      본인 SIEM에 경보가 수집돼 있다(+ 보고서/IOC는 제출로 검증).
+    hint: "악성코드 IR 보고서 + IOC 공유. 채점: wazuh_alert + 보고서 제출."
+    verify:
+      type: "wazuh_alert"
+      expect: "alert"
+      checks:
+        - { id: "blue-5-1", type: "wazuh_alert", target: "siem", params: { since_sec: 1800 } }
+      semantic:
+        intent: "악성코드 IR 보고서 — 타임라인 + IOC + 재발 방지. IOC를 탐지룰/CDB로 환류."
+        success_criteria:
+          - "경보 수집 확인"
+          - "타임라인 + IOC 목록 + 근본 원인"
+          - "IOC를 룰/CDB로 환류"
+        acceptable_methods:
+          - "IR 보고서 + IOC 공유"
+        negative_signs:
+          - "IOC 미공유(재발 시 미탐)"

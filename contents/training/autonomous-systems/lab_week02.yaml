@@ -1,0 +1,173 @@
+lab_id: autonomous-systems-week02
+title: "W02 — 드론 기초: WiFi/MAVLink 통신 보안 평가·공격 표면·기본 강화"
+version: ai
+course: autonomous-systems
+week: 2
+description: |
+  드론 아키텍처·통신. WiFi/MAVLink 통신 링크 보안 평가(COMMS_INSECURE), 드론 공격 표면 매핑
+  (SURFACE_MAPPED), WiFi·MAVLink 기본 강화(COMMS_HARDENED), 종합(Assessment).
+  ⚠️ 드론은 실물 하드웨어 필요 — 통신·표면·강화 로직 결정론 시뮬.
+difficulty: medium
+duration_minutes: 120
+audience: 자율 시스템 보안 (2주차)
+prerequisites:
+  - el34 호스트 접속 (`ssh ccc@{{TARGET_IP}}`, 비밀번호 `1`)
+  - GPU Ollama 도달 — gemma3:4b
+  - W02 강의안 정독 — §0.5(드론 아키텍처·MAVLink·통신 강화)
+objectives:
+  - "GPU 헬스체크(GEN_OK)"
+  - "WiFi/MAVLink 통신 보안 평가(COMMS_INSECURE)"
+  - "드론 공격 표면 매핑(SURFACE_MAPPED)"
+  - "WiFi·MAVLink 기본 강화(COMMS_HARDENED)"
+  - "종합(Assessment)"
+pass_threshold: 0.6
+
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — GPU 헬스체크 → GEN_OK
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+      ```
+      ✅ 마지막 줄 `GEN_OK`.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+    answer_detail: "GPU 응답 확인."
+    verify:
+      type: output_contains
+      expect: GEN_OK
+      field: stdout
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 통신 링크 보안 평가 → COMMS_INSECURE
+      > **🎯 목표:** 드론 WiFi/MAVLink 링크의 보안 취약성을 평가.
+      > **개념:** 약한 WiFi·무인증 MAVLink는 무방비.
+      ```bash
+      # 드론 통신 링크 상태를 파일로 기록한다.
+      cat > /tmp/link_STU42.txt <<'EOF'
+      wifi_encryption=open
+      mavlink_signing=false
+      mavlink_encryption=false
+      telemetry_encryption=false
+      EOF
+      grep -E "open|false" /tmp/link_STU42.txt
+      # 취약 항목(개방 WiFi·무서명·평문)이 3개 이상이면 통신 취약.
+      [ "$(grep -cE 'open|=false' /tmp/link_STU42.txt)" -ge 3 ] && echo COMMS_INSECURE || echo SECURE
+      ```
+      ✅ 마지막 줄 `COMMS_INSECURE` (개방 WiFi+무서명·평문 MAVLink+평문 텔레메트리).
+      🔎 개방 WiFi는 누구나 접속, 무서명 MAVLink는 명령 주입, 평문은 감청. 통신이 무방비면 하이재킹.
+    answer: |
+      # 드론 통신 링크 상태를 파일로 기록한다.
+      cat > /tmp/link_STU42.txt <<'EOF'
+      wifi_encryption=open
+      mavlink_signing=false
+      mavlink_encryption=false
+      telemetry_encryption=false
+      EOF
+      grep -E "open|false" /tmp/link_STU42.txt
+      # 취약 항목(개방 WiFi·무서명·평문)이 3개 이상이면 통신 취약.
+      [ "$(grep -cE 'open|=false' /tmp/link_STU42.txt)" -ge 3 ] && echo COMMS_INSECURE || echo SECURE
+    answer_detail: "드론 WiFi/MAVLink 통신 취약성 평가 → COMMS_INSECURE."
+    verify:
+      type: output_contains
+      expect: COMMS_INSECURE
+      field: stdout
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 공격 표면 매핑 → SURFACE_MAPPED
+      > **🎯 목표:** 드론의 공격 표면을 유형별로 매핑.
+      > **개념:** 제어·텔레메트리·GPS·페이로드 모두 표면.
+      ```bash
+      # 공격 표면(벡터→위협)을 파일로 매핑한다.
+      cat > /tmp/surface_STU42.txt <<'EOF'
+      control   control link (WiFi/MAVLink): hijack, deauth
+      telemetry telemetry: eavesdrop position
+      gps       GPS: spoofing (W05)
+      payload   payload/firmware: malicious update
+      EOF
+      cat /tmp/surface_STU42.txt
+      M=""; for k in control telemetry gps payload; do grep -q "^$k" /tmp/surface_STU42.txt || M=1; done
+      [ -z "$M" ] && echo SURFACE_MAPPED || echo INCOMPLETE
+      ```
+      ✅ 마지막 줄 `SURFACE_MAPPED` (제어·텔레메트리·GPS·페이로드 4대 표면).
+      🔎 제어 링크(하이재킹)·텔레메트리(감청)·GPS(스푸핑)·페이로드(악성 업데이트) 모두 공격 표면.
+    answer: |
+      # 공격 표면(벡터→위협)을 파일로 매핑한다.
+      cat > /tmp/surface_STU42.txt <<'EOF'
+      control   control link (WiFi/MAVLink): hijack, deauth
+      telemetry telemetry: eavesdrop position
+      gps       GPS: spoofing (W05)
+      payload   payload/firmware: malicious update
+      EOF
+      cat /tmp/surface_STU42.txt
+      M=""; for k in control telemetry gps payload; do grep -q "^$k" /tmp/surface_STU42.txt || M=1; done
+      [ -z "$M" ] && echo SURFACE_MAPPED || echo INCOMPLETE
+    answer_detail: "드론 공격 표면(제어·텔레메트리·GPS·페이로드) 매핑 → SURFACE_MAPPED."
+    verify:
+      type: output_contains
+      expect: SURFACE_MAPPED
+      field: stdout
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 통신 기본 강화 → COMMS_HARDENED
+      > **🎯 목표:** WiFi·MAVLink·페일세이프로 통신을 강화.
+      > **개념:** 링크 강화가 드론 방어의 첫걸음.
+      ```bash
+      # 강화된 통신 설정을 파일로 작성한다.
+      cat > /tmp/link_hardened_STU42.txt <<'EOF'
+      wifi=WPA2/WPA3
+      mavlink_signing=true
+      mavlink_encryption=true
+      telemetry_encryption=true
+      failsafe=RTL on link loss
+      EOF
+      grep -E "true|WPA|RTL" /tmp/link_hardened_STU42.txt
+      [ "$(grep -cE 'true|WPA|RTL' /tmp/link_hardened_STU42.txt)" -ge 4 ] && echo COMMS_HARDENED || echo CHECK
+      ```
+      ✅ 마지막 줄 `COMMS_HARDENED` (WPA2+MAVLink2 서명·암호화+RTL 페일세이프).
+      🔎 WiFi WPA2+MAVLink2 메시지 서명·암호화+텔레메트리 암호화+링크 끊김 시 자동 귀환(RTL). 통신 방어의 기본.
+    answer: |
+      # 강화된 통신 설정을 파일로 작성한다.
+      cat > /tmp/link_hardened_STU42.txt <<'EOF'
+      wifi=WPA2/WPA3
+      mavlink_signing=true
+      mavlink_encryption=true
+      telemetry_encryption=true
+      failsafe=RTL on link loss
+      EOF
+      grep -E "true|WPA|RTL" /tmp/link_hardened_STU42.txt
+      [ "$(grep -cE 'true|WPA|RTL' /tmp/link_hardened_STU42.txt)" -ge 4 ] && echo COMMS_HARDENED || echo CHECK
+    answer_detail: "WiFi·MAVLink·페일세이프 통신 강화 → COMMS_HARDENED."
+    verify:
+      type: output_contains
+      expect: COMMS_HARDENED
+      field: stdout
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 종합 → Assessment
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W02 on drone fundamentals. Findings: an open WiFi and unsigned plaintext MAVLink link were assessed as insecure (COMMS_INSECURE), the drone attack surface was mapped across control link, telemetry, GPS, and payload (SURFACE_MAPPED), and WPA2, MAVLink2 signing and encryption, and an RTL failsafe hardened the comms (COMMS_HARDENED). Explain that the communication link is the largest attack surface (weak WiFi, unauthenticated MAVLink) and defense hardens the link and adds failsafes. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+      ```
+      ✅ 출력에 `Assessment`.
+      🔎 정리: 드론은 통신 링크가 최대 표면(약한 WiFi·무인증 MAVLink). WPA2+MAVLink 서명+페일세이프로 방어.
+      다음 주(W03)는 **드론 해킹**.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W02 on drone fundamentals. Findings: an open WiFi and unsigned plaintext MAVLink link were assessed as insecure (COMMS_INSECURE), the drone attack surface was mapped across control link, telemetry, GPS, and payload (SURFACE_MAPPED), and WPA2, MAVLink2 signing and encryption, and an RTL failsafe hardened the comms (COMMS_HARDENED). Explain that the communication link is the largest attack surface (weak WiFi, unauthenticated MAVLink) and defense hardens the link and adds failsafes. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+    answer_detail: "W02 드론 기초 종합(Assessment). 통신 링크·공격 표면·강화."
+    verify:
+      type: output_contains
+      expect: Assessment
+      field: stdout

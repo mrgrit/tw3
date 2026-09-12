@@ -1,0 +1,501 @@
+lab_id: standalone-secuops-week12
+title: "위협의 언어 — STIX/OpenCTI의 IOC를 Wazuh가 알아보게(CDB + 매칭 격상)"
+version: standalone-secuops
+course: secuops
+week: 12
+description: |
+  W09–W11 동안 모은 것은 모두 "내가 본 것"(텔레메트리 — Suricata·ModSec·Sysmon 로그)이었다.
+  이번 주는 거기에 "세상이 이미 아는 것"(외부 위협 인텔리전스 = 알려진 악성 IOC)을 더해, 같은
+  공격이 평범한 경보에 묻히지 않고 "알려진 위협"으로 격상되게 만든다.
+
+  핵심 흐름은 네 부품의 연결이다 — (1) 위협을 기계가 읽는 표준 객체로 적는 STIX/TAXII, (2) 그
+  객체를 보관·공유하는 OpenCTI/MISP(el34에 실제 가동 중), (3) IOC를 SIEM이 빠르게 조회하는 형식
+  으로 옮긴 Wazuh CDB list, (4) IOC 매칭 시 경보를 격상하는 룰. 학생은 알려진 악성 도구(sqlmap)로
+  공격을 흘려 IOC를 텔레메트리에 출현시키고, 그 IOC를 CDB list(key:value)로 표현한 뒤, 매칭 룰
+  (id 101210, level 12)로 격상을 wazuh-logtest로 검증한다(라이브 매니저 무중단). 끝으로 IOC를
+  ATT&CK technique(T1190 등)에 매핑해 "어느 단계의 공격인가"라는 맥락을 더한다.
+
+  ⚠️ el34-siem은 모든 학생이 공유하는 단일 manager다. CDB list의 운영 적용(<list> 등록 + .cdb
+  컴파일 + manager 재시작)은 다른 학생의 ingest를 끊으므로 하지 않는다. 대신 IOC 저장소(list 파일)
+  는 형식만 작성·확인하고, 매칭/격상 로직은 wazuh-logtest로만 검증하며, 끝나면 커스텀 룰·list 잔재
+  를 전부 삭제해 베이스를 원상복구한다(공유 인프라 보존). 모든 명령은 el34 호스트
+  에서, 각 장비에 직접 접속(fw 10.20.30.1/ips 31.2/web 32.80/siem 32.100, 공격 192.168.0.202, root은 sudo)해 실행한다.
+difficulty: hard
+duration_minutes: 200
+prerequisites:
+  - "W09(Wazuh manager/룰/logtest) 통과"
+  - "장비 직접 SSH: ssh ccc@<장비IP>(fw 10.20.30.1/ips 31.2/web 32.80/siem 32.100) + 공격 ssh att@192.168.0.202 (비번 1)"
+  - "lecture §2(STIX/TAXII) §4(CDB) §5(매칭격상) §6(ATT&CK) 숙지"
+objectives:
+  - "위협인텔 스택 점검 — 적용 지점(Wazuh manager analysisd)과 인텔 소스(OpenCTI/MISP) 가용성을 따로 확인"
+  - "알려진 악성 도구(sqlmap) IOC로 공격 → 도구 시그니처(UA)가 텔레메트리(ModSec audit 913 scanner)에 출현"
+  - "IOC를 Wazuh CDB list(key:value 빠른 조회 테이블)로 표현 — 운영의 등록+컴파일+restart와 공유 인프라 제약 구분"
+  - "IOC 매칭/격상 룰(id 101210, level 12)을 local_rules.xml에 작성 → wazuh-logtest로 격상 발화 검증 → self-clean"
+  - "IOC를 MITRE ATT&CK technique(T1190 등)에 매핑해 공격 단계 맥락 부여"
+  - "IOC 공격이 Wazuh alerts.json(ids 그룹)으로 수렴 + 출처 IP(192.168.0.202) 보존 확인 + 커스텀 룰·list 잔재 0으로 베이스 보존"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 점검 — 위협인텔 스택(Wazuh + OpenCTI + MISP)
+
+      ## 개념 (왜 이걸 하나)
+      IOC(외부 인텔)를 SIEM에 연결하려면 두 곳이 모두 살아야 한다 — IOC를 **적용하는 지점**
+      (Wazuh manager, 평결 엔진 `analysisd`)과 IOC를 **보관·공유하는 소스**(OpenCTI/MISP). 인텔
+      소스와 적용 지점은 분리돼 있어 따로 점검한다(lecture §3). analysisd가 멈추면 격상은커녕 평결
+      자체가 안 나므로, 인텔 연결 작업의 전제 점검이다.
+
+      ## 처음 나오는 것
+      - **analysisd**: Wazuh manager의 평결 엔진(decoder→rule). 이게 죽으면 alert가 안 난다(W09).
+      - **OpenCTI**: STIX 객체 저장·시각화·ATT&CK 연동 플랫폼. **MISP**: IOC 공유 플랫폼. el34에
+        `el34-opencti-1`/`el34-misp-core-1`로 실제 가동 중.
+      - `docker ps` 의 `healthy`: 컨테이너 자체 헬스체크 통과 상태.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** analysisd 는 `el34-siem`, `docker ps` 는 el34 호스트에서.
+
+      ```bash
+      # ── el34-siem 에서: manager 심장(analysisd) ──
+      /var/ossec/bin/wazuh-control status | grep analysisd
+
+      # ── el34 호스트에서: OpenCTI/MISP 컨테이너 상태 ──
+      docker ps --format '{{.Names}}\t{{.Status}}' | grep -iE 'opencti|misp' | head
+      ```
+      ## ✅ 합격 기준
+      analysisd running + OpenCTI/MISP 컨테이너 `healthy`. (OpenCTI가 `starting`이면 잠시 후 재확인.)
+    hint: 'wazuh-control analysisd + docker ps 의 opencti/misp healthy'
+    category: survey
+    points: 10
+    answer: |
+      echo "=== Wazuh manager ==="
+      ssh ccc@10.20.32.100 sudo /var/ossec/bin/wazuh-control status | grep analysisd
+      echo "=== 인텔 플랫폼(OpenCTI/MISP) ==="
+      docker ps --format '{{.Names}}\t{{.Status}}' | grep -iE 'opencti|misp' | head
+    answer_detail: "Wazuh(평결) + OpenCTI(STIX 저장/ATT&CK/시각화) + MISP(IOC 공유)가 el34의 위협인텔 스택. OpenCTI/MISP가 인텔 소스, Wazuh가 적용 지점."
+    verify:
+      type: output_contains
+      expect: 'healthy'
+      field: stdout
+      semantic:
+        intent: "위협인텔 스택(Wazuh+OpenCTI+MISP) 가용성 점검"
+        success_criteria: ["analysisd running", "OpenCTI healthy", "MISP healthy"]
+        acceptable_methods:
+          - "**[OSS] wazuh-control + docker ps opencti/misp (권장)**"
+          - "**[설명] 인텔 소스→SIEM 적용 흐름**"
+    target_vm: siem
+
+  - order: 2
+    instruction: |
+      ## 🎯 IOC 공격 재현 — 알려진 악성 도구(sqlmap)
+
+      ## 개념 (왜 이걸 하나)
+      인텔 매칭을 검증하려면 먼저 IOC가 실제 텔레메트리에 나타나야 한다. 굳이 새 수법을 만들 필요가
+      없다 — 이미 CTI에 "악성"으로 등록된 자동화 도구 **sqlmap**으로 공격하면, 그 도구가 요청
+      User-Agent(UA)에 자기 이름을 박으므로 **그 UA 문자열 자체가 곧 IOC**다(lecture §1·§4). 외부
+      공격자가 dvwa vhost를 치면 web의 ModSecurity가 그 UA를 스캐너로 탐지해 audit 로그에 남긴다.
+
+      ## 처음 나오는 것
+      - **sqlmap**: 알려진 악성 자동화 도구. 자체 UA(`sqlmap/1.x`)를 요청에 박으므로 그 UA 문자열이 곧 IOC다.
+      - dvwa vhost(`http://dvwa.el34.lab/`): sqlmap 이 이 URL 로 요청하면 web Apache 가 dvwa vhost 로 라우팅한다.
+      - **modsec_audit.log**: ModSecurity(WAF)의 JSON audit 로그. **913xxx**는 CRS의 스캐너 탐지
+        룰군(자동화 도구·스캐너 식별).
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** 공격은 `el34-attacker`, audit 확인은 `el34-web`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-attacker 에서: 알려진 악성 도구 sqlmap 으로 공격(IOC=도구 UA) ──
+      sqlmap -u 'http://dvwa.el34.lab/?id=ct12-1' --batch --level=1 --risk=1 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head -2
+
+      # ── el34-web 에서: modsec audit 의 IOC(sqlmap UA) (공격 3초 후) ──
+      sudo tail -80 /var/log/apache2/modsec_audit.log | grep -o "sqlmap" | head -1
+      ```
+      ## ✅ 합격 기준
+      WAF audit에 IOC(`sqlmap` UA) 흔적이 남는다(보강 답안은 913 scanner 룰 매치도 함께 확인).
+    hint: '외부 attacker sqlmap UA → modsec audit 의 sqlmap(=IOC)'
+    category: recon
+    points: 10
+    answer: |
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=ct12-1' --batch --level=1 --risk=1 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head -2"
+      # 고정 sleep 대신 로그에 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.32.80 "timeout 10 bash -c 'until sudo grep -q "sqlmap" /var/log/apache2/modsec_audit.log; do :; done'" || true
+      echo "=== modsec audit 의 IOC(sqlmap UA) ==="
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -o "sqlmap" | head -1'
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "913[0-9]{3}" | sort -u'
+    answer_detail: "sqlmap은 알려진 악성 도구 IOC — UA에 이름이 박혀 modsec audit(913 scanner)에 남는다. 이 도구 시그니처를 STIX indicator로 표현하고 CDB로 매칭한다."
+    verify:
+      type: output_contains
+      expect: 'sqlmap'
+      field: stdout
+      semantic:
+        intent: "알려진 악성 도구(IOC)로 공격 → telemetry 출현"
+        success_criteria: ["sqlmap UA가 audit에", "IOC=도구 시그니처 이해"]
+        acceptable_methods:
+          - "**[OSS] 외부 attacker sqlmap UA → audit (권장)**"
+          - "**[설명] 도구 시그니처=IOC**"
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 CDB list — IOC를 SIEM이 읽는 형식(저장소)
+
+      ## 개념 (왜 이걸 하나)
+      IOC가 OpenCTI/MISP에 STIX로 있어도 Wazuh는 그대로는 못 읽는다. "STIX(공유 언어) → CDB(SIEM
+      언어)" 번역이 한 단계 필요한데, 그 SIEM 언어가 **CDB(Constant DataBase) list**다 — IOC를
+      `key:value`로 담은 빠른 조회 테이블(`/var/ossec/etc/lists/`). 검문소의 색인된 수배 명단처럼,
+      룰이 로그의 한 필드 값을 던지면 수천 IOC라도 한 번의 조회로 일치 여부를 돌려준다(lecture §4).
+
+      ## 처음 나오는 것
+      - **CDB list**: `key:value` 형식. 여기선 `sqlmap:known-bad-tool` — 키 `sqlmap`이 찾을 IOC,
+        값 `known-bad-tool`이 매치 시 활용할 태그.
+      - `/var/ossec/etc/lists/`: Wazuh가 CDB list를 두는 디렉터리.
+      - 운영 적용은 `ossec.conf`에 `<list>` 등록 + manager가 `.cdb`로 컴파일(restart 필요) + 룰의
+        `<list lookup>` 조회. **공유 el34는 restart 금지**라 여기선 형식만 작성·확인 후 삭제한다.
+
+      ## 💻 실행 명령
+
+      **SIEM 장비:** `ssh ccc@10.20.32.100`(비번 `1`)로 접속해 실행한다.
+      (이 단계는 이미 bare — el34-siem 안에서 그대로 실행한다.)
+
+      ```bash
+      sudo bash -c 'printf "sqlmap:known-bad-tool\nnikto:known-bad-tool\n" > /var/ossec/etc/lists/edu-w12-ioc'
+      cat /var/ossec/etc/lists/edu-w12-ioc
+      sudo rm -f /var/ossec/etc/lists/edu-w12-ioc   # 실습 후 정리(운영은 <list>등록+컴파일)
+      ```
+      ## ✅ 합격 기준
+      CDB list에 IOC(`known-bad-tool`)가 key:value로 작성된다. (list 작성만으로는 탐지가 안 되고,
+      등록+컴파일+룰 조회가 모두 맞아야 라이브 탐지됨을 이해할 것.)
+    hint: 'CDB list /var/ossec/etc/lists/edu-w12-ioc 에 key:value IOC'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh ccc@10.20.32.100 'sudo bash -c "printf \"sqlmap:known-bad-tool\nnikto:known-bad-tool\n\" > /var/ossec/etc/lists/edu-w12-ioc"'
+      echo "=== CDB list (IOC 저장소) ==="
+      ssh ccc@10.20.32.100 'sudo cat /var/ossec/etc/lists/edu-w12-ioc'
+      ssh ccc@10.20.32.100 'sudo rm -f /var/ossec/etc/lists/edu-w12-ioc; echo list_cleaned'
+    answer_detail: "CDB list = key:value 빠른 조회 테이블. IOC(도구/IP/해시)를 여기 모은다. 운영은 ossec.conf <list> 등록 + manager 컴파일(restart) + 룰의 <list lookup>로 수천 IOC를 한 번에 조회. 공유 인프라라 여기선 저장소 형식만 작성·확인."
+    verify:
+      type: output_contains
+      expect: 'known-bad-tool'
+      field: stdout
+      semantic:
+        intent: "IOC를 Wazuh CDB list(key:value) 저장소로 표현"
+        success_criteria: ["CDB list 작성", "key:value 형식", "운영 적용(list 등록+컴파일) 이해"]
+        acceptable_methods:
+          - "**[OSS] /var/ossec/etc/lists/ 에 key:value (권장)**"
+          - "**[설명] CDB 조회 + <list lookup>**"
+    target_vm: siem
+
+  - order: 4
+    instruction: |
+      ## 🎯 IOC 매칭/격상 룰 — 평범한 경보를 "알려진 위협"으로 (id 101210)
+
+      ## 개념 (왜 이걸 하나)
+      이번 주의 심장이다. IOC가 탐지에 나타나면 경보의 level을 상위로 **격상(escalation)**하는 룰을
+      쓴다 — 그래야 같은 sqlmap 공격이 분당 수백 건 경보 속에 묻히지 않고 분석가 시선을 먼저 끈다
+      (lecture §5). W09에서 익힌 local_rules.xml 커스텀 룰 패턴 그대로지만, 매치 조건이 "내 환경의
+      패턴"이 아니라 **"외부 인텔의 IOC"**라는 점이 다르다. 공유 인프라라 라이브 반영(restart) 대신
+      **wazuh-logtest로 격상 발화만 검증**하고, 끝나면 룰을 지워 베이스를 보존한다.
+
+      ## 처음 나오는 것
+      - **wazuh-logtest**: 로그 한 줄을 넣어 룰 매치를 안전하게 검증하는 도구. 현재 룰셋을 새로 읽어
+        **별도 테스트 인스턴스**에서 판결하므로 라이브 analysisd를 안 건드린다(=모의재판, W09 §0.5.3).
+      - 룰 요소: `<decoded_as>json</decoded_as>`(json decoder가 잡은 로그만), `<field name="tool">
+        sqlmap</field>`(tool 필드 값이 IOC면 매치). 운영은 이 한 줄을 `<list lookup>`으로 바꿔 CDB의
+        수천 IOC를 한 번에 본다(격상 논리는 동일).
+      - **level 12**: 고위험(W09 §5.2 — 7 이상 기록, 12 이상 고위험).
+      - **id 1012xx**: 본 트랙 W12 룰 네임스페이스(100000 미만은 Wazuh 예약이라 금지).
+      - 절차: (1) cp 백업 → (2) 룰 추가 → (3) logtest 검증 → (4) cp 복원(self-clean).
+
+      ## 💻 실행 명령
+
+      **SIEM 장비:** `ssh ccc@10.20.32.100`(비번 `1`)로 접속해 실행한다.
+      (이 단계는 이미 bare — el34-siem 안에서 그대로 실행한다.)
+
+      ```bash
+      sudo cp /var/ossec/etc/rules/local_rules.xml /tmp/w12_lr.bak
+      sudo bash -c 'cat >> /var/ossec/etc/rules/local_rules.xml <<EOF
+      <group name="edu_w12,">
+        <rule id="101210" level="12">
+          <decoded_as>json</decoded_as>
+          <field name="tool">sqlmap</field>
+          <description>EDU W12 - known IOC (sqlmap) matched, escalate</description>
+        </rule>
+      </group>
+      EOF'
+      echo '{"tool":"sqlmap","src_ip":"9.9.9.9"}' | sudo /var/ossec/bin/wazuh-logtest
+      sudo cp /tmp/w12_lr.bak /var/ossec/etc/rules/local_rules.xml; sudo rm -f /tmp/w12_lr.bak
+      ```
+      ## ✅ 합격 기준
+      logtest Phase 3 에 rule `101210` level 12 격상이 발화한다(정리 후 베이스 보존).
+    hint: 'local_rules.xml IOC 매칭 룰(101210) → logtest 발화 → cp 복원'
+    category: manipulation
+    points: 18
+    answer: |
+      ssh ccc@10.20.32.100 'sudo cp /var/ossec/etc/rules/local_rules.xml /tmp/w12_lr.bak'
+      ssh ccc@10.20.32.100 'sudo bash -c "cat >> /var/ossec/etc/rules/local_rules.xml <<EOF
+      <group name=\"edu_w12,\">
+        <rule id=\"101210\" level=\"12\">
+          <decoded_as>json</decoded_as>
+          <field name=\"tool\">sqlmap</field>
+          <description>EDU W12 known IOC sqlmap matched escalate</description>
+        </rule>
+      </group>
+      EOF"'
+      ssh ccc@10.20.32.100 'cat > /tmp/w12t.json <<EOF
+      {"tool":"sqlmap","src_ip":"9.9.9.9"}
+      EOF'
+      echo "=== IOC 매칭/격상 logtest ==="
+      ssh ccc@10.20.32.100 'sudo /var/ossec/bin/wazuh-logtest < /tmp/w12t.json 2>&1 | grep -aE "id:|level:|Alert to be" | head -4; rm -f /tmp/w12t.json'
+      echo "=== self-clean (베이스 복원) ==="
+      ssh ccc@10.20.32.100 'sudo cp /tmp/w12_lr.bak /var/ossec/etc/rules/local_rules.xml; sudo rm -f /tmp/w12_lr.bak; echo "복원 잔재=$(grep -c 101210 /var/ossec/etc/rules/local_rules.xml)"'
+    answer_detail: "IOC(tool=sqlmap)가 매칭되면 level 12로 격상 → 평범한 경보가 '알려진 위협'으로 분석가 시선을 먼저 끈다. 운영은 <field> 대신 <list lookup>로 CDB의 수천 IOC를 조회. logtest로 격상 로직 검증, cp 복원으로 베이스 보존."
+    verify:
+      type: output_contains
+      expect: '101210'
+      field: stdout
+      semantic:
+        intent: "IOC 매칭 시 경보 격상 룰 작성 + logtest 검증 + 베이스 보존"
+        success_criteria: ["id 101210 작성", "logtest Phase3 level 12 발화", "cp 복원 self-clean"]
+        acceptable_methods:
+          - "**[OSS] field/list 매칭 룰 + wazuh-logtest (권장)**"
+          - "**[설명] <list lookup>로 CDB 대량 조회**"
+    target_vm: siem
+
+  - order: 5
+    instruction: |
+      ## 🎯 ATT&CK 매핑 — IOC에 맥락을 더한다
+
+      ## 개념 (왜 이걸 하나)
+      IOC 하나(sqlmap)는 점(point) 정보다. 그것을 **MITRE ATT&CK** technique에 연결하면 "어느 단계의
+      공격인가"라는 공격 사슬 위의 위치(line)가 된다(lecture §6). 분석가는 IOC를 보는 순간 "이건 초기
+      침투구나, 다음은 권한상승…" 하고 대응을 설계한다. el34의 OpenCTI MITRE connector가 technique를
+      STIX attack-pattern 객체로 보관하므로, indicator(sqlmap)를 relationship으로 연결해두면 IOC와
+      ATT&CK 맥락을 함께 본다.
+
+      ## 처음 나오는 것
+      - **MITRE ATT&CK**: 공격 전술·기법을 표준 코드로 정리한 체계. **T1190** = Exploit
+        Public-Facing Application(공개 웹 앱 익스플로잇), **T1059** = Command and Scripting
+        Interpreter, **T1136** = Create Account.
+      - **attack-pattern / relationship**: ATT&CK technique를 담는 STIX 객체, 그리고 indicator를
+        technique에 잇는 STIX 연결(lecture §2.3).
+
+      ## 💻 실행 명령
+      ```bash
+      echo "sqlmap SQLi (공개 웹 익스플로잇) → T1190 Exploit Public-Facing Application"
+      echo "base64 인코딩 셸(W11)          → T1059 Command and Scripting Interpreter"
+      echo "백도어 계정(W08/W11)           → T1136 Create Account"
+      ```
+      ## ✅ 합격 기준
+      IOC/행위가 ATT&CK technique(예: `T1190`)에 매핑된다. (IOC 하나가 여러 technique에 걸칠 수 있음.)
+    hint: 'IOC → ATT&CK technique (T1190/T1059/T1136)'
+    category: analysis
+    points: 8
+    answer: |
+      echo "=== IOC → ATT&CK 매핑 ==="
+      echo "sqlmap SQLi (공개 웹 익스플로잇) → T1190 Exploit Public-Facing Application"
+      echo "base64 인코딩 셸(W11)           → T1059 Command and Scripting Interpreter"
+      echo "백도어 계정(W08/W11)            → T1136 Create Account"
+      echo "(OpenCTI MITRE connector가 attack-pattern STIX 객체로 보관 → indicator와 relationship 연결)"
+    answer_detail: "IOC 하나도 ATT&CK technique에 연결하면 공격 단계 맥락이 생긴다. OpenCTI MITRE connector가 technique를 STIX attack-pattern으로 보관하고, indicator를 relationship으로 연결해 분석가가 IOC와 ATT&CK 맥락을 같이 본다."
+    verify:
+      type: output_contains
+      expect: 'T1190'
+      field: stdout
+      semantic:
+        intent: "IOC를 ATT&CK technique에 매핑해 맥락 부여"
+        success_criteria: ["IOC→technique 매핑", "T1190 등", "attack-pattern/relationship 이해"]
+        acceptable_methods:
+          - "**[관리적] ATT&CK 매핑 (권장)**"
+          - "**[설명] indicator-attack-pattern relationship**"
+    target_vm: siem
+
+  - order: 6
+    instruction: |
+      ## 🎯 인텔 플랫폼 — OpenCTI(STIX/ATT&CK) + MISP + MITRE connector
+
+      ## 개념 (왜 이걸 하나)
+      인텔 소스의 자산 인벤토리 점검이다. "우리가 어떤 인텔 소스를 갖고 있나"를 즉시 답한다(lecture
+      §3·§6). OpenCTI가 STIX 객체·ATT&CK을 보관하고, **connector**가 외부 피드(여기선 MITRE ATT&CK)
+      를 STIX로 자동 수집해 채운다. 운영에선 이 소스들 → (stream connector/스크립트) → Wazuh CDB로
+      IOC를 내려보내 자동 매칭한다.
+
+      ## 처음 나오는 것
+      - **connector**: OpenCTI가 외부 피드를 STIX 객체로 자동 수집·가공하는 모듈. `el34-connector
+        -mitre-1`이 ATT&CK technique를 attack-pattern STIX로 들여온다.
+      - 이번 점검은 인텔 **소스**(OpenCTI/MISP)를 보는 것이고, 적용 지점(Wazuh)은 STEP 1에서 봤다.
+
+      ## 💻 실행 명령
+      ```bash
+      docker ps --format '{{.Names}}\t{{.Status}}' | grep -iE 'opencti|misp|connector-mitre'
+      ```
+      ## ✅ 합격 기준
+      `opencti` + MITRE connector + MISP 가 가동 중이다.
+    hint: 'docker ps 의 opencti/misp/connector-mitre'
+    category: survey
+    points: 8
+    answer: |
+      echo "=== OpenCTI + connector + MISP ==="
+      docker ps --format '{{.Names}}\t{{.Status}}' | grep -iE 'opencti|misp|connector-mitre'
+    answer_detail: "OpenCTI = STIX 저장·시각화·ATT&CK 연동(MITRE connector가 ATT&CK을 STIX로 수집). MISP = IOC 공유. 운영에선 이들 → (stream connector/스크립트) → Wazuh CDB로 IOC를 내려보내 자동 매칭한다."
+    verify:
+      type: output_contains
+      expect: 'opencti'
+      field: stdout
+      semantic:
+        intent: "실제 인텔 플랫폼(OpenCTI/MISP/MITRE connector) 가동 확인"
+        success_criteria: ["opencti 가동", "MITRE connector", "MISP 가동"]
+        acceptable_methods:
+          - "**[OSS] docker ps 인텔 컨테이너 (권장)**"
+          - "**[설명] OpenCTI→CDB→Wazuh 운영 흐름**"
+    target_vm: siem
+
+  - order: 7
+    instruction: |
+      ## 🎯 IOC가 Wazuh로 수렴 — 출처 보존
+
+      ## 개념 (왜 이걸 하나)
+      준비(STEP 3–5)가 책상 위 이론이 아니라 실제로 도는지 증명한다. IOC 공격(sqlmap UA + SQLi)을
+      재현해 Suricata eve → ips agent → manager → `alerts.json`(ids 그룹)까지 수렴하는지, 그리고
+      **출처 IP가 보존**되는지 확인한다(lecture §7). 출처 보존이 중요한 이유 — el34는 fw가 SNAT를
+      안 해 공격자 IP(내부 192.168.0.202)가 전 계층에 그대로 남고, 그래야 "이 IOC 도구를 누가 썼나"를
+      IP로 추적·상관할 수 있다. 격상 룰이 라이브였다면 이 경보가 STEP 4의 로직대로 level 12로 떴을
+      바로 그 대상이다.
+
+      ## 처음 나오는 것
+      - **alerts.json**: Wazuh manager의 최종 평결 출력(`/var/ossec/logs/alerts/`). **ids 그룹**은
+        Suricata(네트워크) 디코딩 경보 분류.
+      - `jq -c 'select(.rule.groups|index("ids"))'`: alerts.json에서 ids 그룹 경보만 골라 룰 id·출처
+        IP를 뽑는 필터.
+      - 조건 폴링(로그 흔적 대기): 공격이 eve.json을 거쳐 alerts.json에 반영되기까지의 파이프라인 지연을 기다림.
+
+      ## 💻 실행 명령
+
+      **실습 컨테이너:** IOC 공격은 `el34-attacker`, 수렴 확인은 `el34-siem`.
+      각 장비에 `ssh ccc@<장비IP>`(fw 10.20.30.1 / ips 31.2 / web 32.80 / siem 32.100)로 접속해 실행한다.
+
+      ```bash
+      # ── el34-attacker 에서: IOC 공격(sqlmap 자체 UA + id 파라미터 SQLi 인젝션) ──
+      sqlmap -u 'http://dvwa.el34.lab/?id=ct12-7' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head
+
+      # ── el34-siem 에서: alerts.json IOC 공격 경보 (공격 8초 후, 출처 보존) ──
+      tail -300 /var/ossec/logs/alerts/alerts.json | jq -c 'select(.rule.groups|index("ids"))|{r:.rule.id,s:.data.src_ip}' | tail -2
+      ```
+      ## ✅ 합격 기준
+      alerts.json 에 출처 `192.168.0.202` 의 IOC 공격 경보가 적재된다.
+    hint: 'IOC 공격 → alerts.json ids 그룹 src 192.168.0.202'
+    category: detect
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=ct12-7' --batch --level=2 --risk=2 --disable-coloring 2>&1 | grep -iE 'sqlmap|403|WAF/IPS' | head"
+      # 고정 sleep 대신 로그에 공격 흔적이 나타날 때까지 조건 대기(zero-sleep)
+      ssh ccc@10.20.32.100 "timeout 12 bash -c 'until sudo grep -q 192.168.0.202 /var/ossec/logs/alerts/alerts.json; do :; done'" || true
+      echo "=== alerts.json IOC 공격 경보 (출처 보존) ==="
+      ssh ccc@10.20.32.100 'tail -300 /var/ossec/logs/alerts/alerts.json | jq -c "select(.rule.groups|index(\"ids\"))|{r:.rule.id,s:.data.src_ip}" | tail -2'
+    answer_detail: "IOC 공격이 Suricata eve → Wazuh alerts.json(ids)로 수렴, 출처 192.168.0.202 보존. CDB 매칭 룰이 라이브면 이 경보가 level 12로 격상돼 분석가 우선순위를 먼저 차지한다(STEP 4 로직)."
+    verify:
+      type: output_contains
+      expect: '192.168.0.202'
+      field: stdout
+      semantic:
+        intent: "IOC 공격이 Wazuh로 수렴(출처 보존) — 격상 대상"
+        success_criteria: ["alerts.json ids 경보", "출처 192.168.0.202 보존", "격상 연결"]
+        acceptable_methods:
+          - "**[OSS] 공격 재현 후 alerts.json (권장)**"
+          - "**[설명] IOC→격상 흐름**"
+    target_vm: siem
+
+  - order: 8
+    instruction: |
+      ## 🎯 종합 보고서 — STIX → CDB → Wazuh 격상
+
+      ## 개념 (왜 이걸 하나)
+      STEP 1–7을 "위협인텔 운영화" 관점으로 한 장에 묶는다. 핵심은 "막았다"가 아니라 **"외부 지식
+      (IOC)을 어떻게 내 탐지에 합쳤는가"**를 단계별 증거로 쓰는 것이다(lecture §8). STIX(외부 표준
+      언어) → CDB(SIEM 언어) → 매칭 룰 → 격상으로 이어지는 다리를, 두 줄기(외부 인텔 + 내 텔레메트리)
+      가 만나 격상되는 지점까지 서술한다. 이는 인텔 도입 보고·사고 보고의 기본 양식이다.
+
+      ## 💻 보고서 양식
+      ```markdown
+      # el34 W12 위협인텔 보고서 (학번, 이름)
+      ## 1. 인텔 스택 (OpenCTI/MISP → Wazuh)
+      ## 2. IOC (sqlmap=known-bad) + STIX indicator 표현
+      ## 3. CDB list + 매칭 룰(101210) → 격상(level 12)
+      ## 4. ATT&CK 매핑 (T1190 등)
+      ## 5. IOC가 Wazuh로 수렴(출처 보존) + 베이스 보존
+      ```
+      ## ✅ 합격 기준
+      보고서에 IOC → CDB → 격상 흐름이 포함된다.
+    hint: 'STIX/IOC → CDB list → 매칭 격상 → ATT&CK'
+    category: report
+    points: 5
+    answer: |
+      cat > ~/w12_note1.md <<'EOF'
+      # el34 W12 위협인텔 보고서
+      ## 1. 인텔 스택: OpenCTI(STIX/ATT&CK)+MISP → (CDB) → Wazuh
+      ## 2. IOC: sqlmap = known-bad-tool. STIX indicator(도구 UA 패턴)로 표현
+      ## 3. CDB list(/var/ossec/etc/lists/edu-w12-ioc) + 매칭 룰 101210 → level 12 격상(logtest 검증)
+      ## 4. ATT&CK: sqlmap→T1190, 인코딩셸→T1059, 백도어→T1136
+      ## 5. IOC 공격 → alerts.json(ids, src 192.168.0.202 보존). 룰/list 정리로 베이스 보존
+      ## 결론: 외부 지식(IOC)을 SIEM 언어(CDB+룰)로 옮겨야 "알려진 위협"이 격상된다
+      EOF
+      cat ~/w12_note1.md
+    answer_detail: "위협인텔 운영화 = 외부 IOC(OpenCTI/MISP) → CDB list → 매칭 룰 → 격상. 같은 공격도 '알려진 악성'으로 우선순위가 올라간다. ATT&CK 매핑으로 맥락까지."
+    verify:
+      type: output_contains
+      expect: 'CDB'
+      field: stdout
+      semantic:
+        intent: "IOC→CDB→격상 운영화 종합 보고"
+        success_criteria: ["인텔 스택", "CDB+매칭룰 격상", "ATT&CK 매핑"]
+        acceptable_methods:
+          - "**[관리적] 보고서 양식 (권장)**"
+          - "**[설명] 인텔 운영화 흐름**"
+    target_vm: siem
+
+  - order: 9
+    instruction: |
+      ## 🎯 정리 확인 — 공유 인프라 보존
+
+      ## 개념 (왜 이걸 하나)
+      el34-siem은 모든 학생이 공유하는 단일 manager다. 내가 심은 커스텀 룰(101210)이나 CDB list
+      (edu-w12-ioc) 잔재가 남으면 다른 학생의 평결에 영향을 준다(lecture §0.5.3·§5.4). "내가 심은
+      것은 내가 정리한다"가 공유 SIEM 운영의 기본 의무다. STEP 3·4에서 self-clean 했으니 라이브
+      룰셋·CDB·백업 파일이 모두 원래 상태인지 최종 확인한다(라이브 매니저는 logtest로만 검증해 무재시작).
+
+      ## 처음 나오는 것
+      - `grep -c 101210 ...`: 커스텀 룰 잔재 줄 수(0이어야 함).
+      - 점검 대상: 룰 잔재(local_rules.xml) + CDB list 파일(edu-w12-ioc) + 백업(/tmp/w12_lr.bak).
+
+      ## 💻 확인 명령
+
+      **SIEM 장비:** `ssh ccc@10.20.32.100`(비번 `1`)로 접속해 실행한다.
+
+      ```bash
+      echo "101210 잔재=$(grep -c 101210 /var/ossec/etc/rules/local_rules.xml)"; ls /var/ossec/etc/lists/edu-w12-ioc >/dev/null 2>&1 && echo "list 잔재!" || echo "list ok"; ls /tmp/w12_lr.bak >/dev/null 2>&1 && echo "백업 잔재!" || echo "tmp ok"
+      echo "---check done---"
+      ```
+      ## ✅ 합격 기준
+      101210/list/백업 잔재 0 + `check done`.
+    hint: '커스텀 룰·CDB list·백업 잔재 0 확인'
+    category: cleanup
+    points: 5
+    answer: |
+      ssh ccc@10.20.32.100 'echo "101210 잔재=$(grep -c 101210 /var/ossec/etc/rules/local_rules.xml)"; ls /var/ossec/etc/lists/edu-w12-ioc >/dev/null 2>&1 && echo "list 잔재!" || echo "list ok"; ls /tmp/w12_lr.bak >/dev/null 2>&1 && echo "백업 잔재!" || echo "tmp ok"'
+      echo "---check done---"
+    answer_detail: "공유 manager 보존 — 커스텀 룰 cp 복원, CDB list 삭제, 라이브 무재시작. base local_rules.xml + lists 디렉터리 원상태."
+    verify:
+      type: output_contains
+      expect: 'check done'
+      field: stdout
+      semantic:
+        intent: "커스텀 룰·CDB list 정리 확인 — 공유 인프라 보존"
+        success_criteria: ["101210 잔재 0", "list 잔재 0", "라이브 manager 무재시작"]
+        acceptable_methods:
+          - "**[OSS] 잔재 점검 (권장)**"
+          - "**[설명] 공유 SIEM 보존**"
+    target_vm: siem

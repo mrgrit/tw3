@@ -1,0 +1,181 @@
+lab_id: autonomous-systems-week07
+title: "W07 — 자율주행 공격: 적대적 패치 탐지·센서 스푸핑 탐지·OTA 무결성 검증"
+version: ai
+course: autonomous-systems
+week: 7
+description: |
+  자율주행 인식·업데이트 공격. 적대적 패치 오분류 탐지(ADVERSARIAL_DETECTED), 센서 스푸핑(라이다 유령/제거)
+  탐지(SENSOR_SPOOFED), OTA 서명 무결성 검증(OTA_VERIFIED), 종합(Assessment).
+  ⚠️ 자율주행 공격은 실물·안전·인가 필요 — 탐지·무결성 로직 결정론 시뮬.
+difficulty: medium
+duration_minutes: 130
+audience: 자율 시스템 보안 (7주차)
+prerequisites:
+  - el34 호스트 접속 (`ssh ccc@{{TARGET_IP}}`, 비밀번호 `1`)
+  - GPU Ollama 도달 — gemma3:4b
+  - W07 강의안 정독 — §0.5(적대적 패치·센서 스푸핑·OTA)
+objectives:
+  - "GPU 헬스체크(GEN_OK)"
+  - "적대적 패치 오분류 탐지(ADVERSARIAL_DETECTED)"
+  - "센서 스푸핑 탐지(SENSOR_SPOOFED)"
+  - "OTA 무결성 검증(OTA_VERIFIED)"
+  - "종합(Assessment)"
+pass_threshold: 0.6
+
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — GPU 헬스체크 → GEN_OK
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+      ```
+      ✅ 마지막 줄 `GEN_OK`.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+    answer_detail: "GPU 응답 확인."
+    verify:
+      type: output_contains
+      expect: GEN_OK
+      field: stdout
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 적대적 패치 탐지 → ADVERSARIAL_DETECTED
+      > **🎯 목표:** 표지판 오분류(패치)를 정합성·신뢰도로 탐지.
+      > **개념:** AI가 속아도 맥락·중복으로 이상 포착.
+      ```bash
+      # 표지판 인식 결과와 맥락(형상·지도)을 기록해 이상을 찾는다.
+      cat > /tmp/detect_STU42.txt <<'EOF'
+      model_class=speed_limit_45
+      confidence=0.55
+      shape=octagon
+      map_context=intersection with historical STOP sign
+      EOF
+      cat /tmp/detect_STU42.txt
+      # 이상: 낮은 신뢰도 + 형상(팔각형=STOP)과 클래스 불일치 + 지도상 STOP.
+      A=0
+      awk -F= '/confidence/{if($2<0.7)exit 0; else exit 1}' /tmp/detect_STU42.txt && A=$((A+1))
+      { grep -q "shape=octagon" /tmp/detect_STU42.txt && ! grep -q "model_class=stop" /tmp/detect_STU42.txt; } && A=$((A+1))
+      grep -q "map_context.*STOP" /tmp/detect_STU42.txt && ! grep -q "model_class=stop" /tmp/detect_STU42.txt && A=$((A+1))
+      echo "이상 신호 $A개"; [ "$A" -ge 2 ] && echo ADVERSARIAL_DETECTED || echo NORMAL
+      ```
+      ✅ 마지막 줄 `ADVERSARIAL_DETECTED` (팔각형·지도는 정지인데 모델은 속도제한 = 불일치).
+      🔎 모델이 패치에 속아 "속도제한"으로 봐도, 형상(팔각형)·지도(정지 표지 위치)·낮은 신뢰도가 불일치 → 적대적 패치 탐지.
+    answer: |
+      # 표지판 인식 결과와 맥락(형상·지도)을 기록해 이상을 찾는다.
+      cat > /tmp/detect_STU42.txt <<'EOF'
+      model_class=speed_limit_45
+      confidence=0.55
+      shape=octagon
+      map_context=intersection with historical STOP sign
+      EOF
+      cat /tmp/detect_STU42.txt
+      # 이상: 낮은 신뢰도 + 형상(팔각형=STOP)과 클래스 불일치 + 지도상 STOP.
+      A=0
+      awk -F= '/confidence/{if($2<0.7)exit 0; else exit 1}' /tmp/detect_STU42.txt && A=$((A+1))
+      { grep -q "shape=octagon" /tmp/detect_STU42.txt && ! grep -q "model_class=stop" /tmp/detect_STU42.txt; } && A=$((A+1))
+      grep -q "map_context.*STOP" /tmp/detect_STU42.txt && ! grep -q "model_class=stop" /tmp/detect_STU42.txt && A=$((A+1))
+      echo "이상 신호 $A개"; [ "$A" -ge 2 ] && echo ADVERSARIAL_DETECTED || echo NORMAL
+    answer_detail: "형상·지도·신뢰도 불일치로 적대적 패치 탐지 → ADVERSARIAL_DETECTED."
+    verify:
+      type: output_contains
+      expect: ADVERSARIAL_DETECTED
+      field: stdout
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 센서 스푸핑 탐지 → SENSOR_SPOOFED
+      > **🎯 목표:** 라이다 유령/제거 물체를 다른 센서로 검증해 탐지.
+      > **개념:** 한 센서만 보고/못 보는 물체는 스푸핑 의심.
+      ```bash
+      # 물체별 센서 감지(라이다/카메라/레이더)를 기록한다.
+      cat > /tmp/objsense_STU42.txt <<'EOF'
+      A lidar=yes camera=no radar=no
+      B lidar=no camera=yes radar=yes
+      EOF
+      cat /tmp/objsense_STU42.txt
+      # A=라이다만(유령 반사), B=라이다만 못 봄(제거) → 2건이면 스푸핑.
+      S=0
+      grep -q "A lidar=yes camera=no radar=no" /tmp/objsense_STU42.txt && { echo "A: phantom (lidar-only)"; S=$((S+1)); }
+      grep -q "B lidar=no camera=yes radar=yes" /tmp/objsense_STU42.txt && { echo "B: removed (lidar blinded)"; S=$((S+1)); }
+      [ "$S" -ge 2 ] && echo SENSOR_SPOOFED || echo CONSISTENT
+      ```
+      ✅ 마지막 줄 `SENSOR_SPOOFED` (라이다만 보는 유령 A + 라이다만 못 보는 제거 B).
+      🔎 라이다만 보는 물체는 유령(가짜 반사), 라이다만 못 보는 물체는 제거(블라인딩). 센서 간 불일치로 스푸핑 탐지.
+    answer: |
+      # 물체별 센서 감지(라이다/카메라/레이더)를 기록한다.
+      cat > /tmp/objsense_STU42.txt <<'EOF'
+      A lidar=yes camera=no radar=no
+      B lidar=no camera=yes radar=yes
+      EOF
+      cat /tmp/objsense_STU42.txt
+      # A=라이다만(유령 반사), B=라이다만 못 봄(제거) → 2건이면 스푸핑.
+      S=0
+      grep -q "A lidar=yes camera=no radar=no" /tmp/objsense_STU42.txt && { echo "A: phantom (lidar-only)"; S=$((S+1)); }
+      grep -q "B lidar=no camera=yes radar=yes" /tmp/objsense_STU42.txt && { echo "B: removed (lidar blinded)"; S=$((S+1)); }
+      [ "$S" -ge 2 ] && echo SENSOR_SPOOFED || echo CONSISTENT
+    answer_detail: "센서 간 불일치로 라이다 유령/제거 스푸핑 탐지 → SENSOR_SPOOFED."
+    verify:
+      type: output_contains
+      expect: SENSOR_SPOOFED
+      field: stdout
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — OTA 무결성 검증 → OTA_VERIFIED
+      > **🎯 목표:** OTA 업데이트의 서명·무결성을 검증해 변조 거부.
+      > **개념:** 서명 없는/변조 업데이트는 전 차량 위협.
+      ```bash
+      # OTA 업데이트 패키지의 서명 검증 로그를 기록한다.
+      cat > /tmp/ota_STU42.txt <<'EOF'
+      package=fw_v2.3.bin
+      signature=verify OK (vendor key)
+      version=2.3 > current 2.2 (anti-rollback OK)
+      EOF
+      cat /tmp/ota_STU42.txt
+      # 서명 검증 OK + 롤백 방지 OK 이면 안전한 업데이트.
+      grep -q "verify OK" /tmp/ota_STU42.txt && grep -q "anti-rollback OK" /tmp/ota_STU42.txt && echo OTA_VERIFIED || echo REJECT
+      ```
+      ✅ 마지막 줄 `OTA_VERIFIED` (정품 서명 설치, 변조·무서명 거부).
+      🔎 OEM 서명 검증+해시 무결성으로 정품만 설치, 변조(무서명·해시 불일치)는 거부. 전 차량 공급망 공격 차단.
+    answer: |
+      # OTA 업데이트 패키지의 서명 검증 로그를 기록한다.
+      cat > /tmp/ota_STU42.txt <<'EOF'
+      package=fw_v2.3.bin
+      signature=verify OK (vendor key)
+      version=2.3 > current 2.2 (anti-rollback OK)
+      EOF
+      cat /tmp/ota_STU42.txt
+      # 서명 검증 OK + 롤백 방지 OK 이면 안전한 업데이트.
+      grep -q "verify OK" /tmp/ota_STU42.txt && grep -q "anti-rollback OK" /tmp/ota_STU42.txt && echo OTA_VERIFIED || echo REJECT
+    answer_detail: "OTA 서명·해시 무결성 검증(변조 거부) → OTA_VERIFIED."
+    verify:
+      type: output_contains
+      expect: OTA_VERIFIED
+      field: stdout
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 종합 → Assessment
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W07 on self-driving attacks. Findings: an adversarial patch misclassifying a stop sign was detected by shape/map/confidence mismatch (ADVERSARIAL_DETECTED), lidar phantom and removed objects were detected via cross-sensor inconsistency (SENSOR_SPOOFED), and OTA signature and hash checks rejected a tampered update (OTA_VERIFIED). Explain that self-driving depends on AI and sensors so attacks cause physical accidents, and defense uses sensor redundancy, model robustness, and OTA integrity. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+      ```
+      ✅ 출력에 `Assessment`.
+      🔎 정리: 자율주행 공격=적대적 패치·센서 스푸핑·OTA 변조(물리 사고). 센서 중복성+모델 강건성+OTA 서명으로 방어.
+      다음 주(W08)는 **중간 평가 — 드론/자율주행 보안 종합**.
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a short note for W07 on self-driving attacks. Findings: an adversarial patch misclassifying a stop sign was detected by shape/map/confidence mismatch (ADVERSARIAL_DETECTED), lidar phantom and removed objects were detected via cross-sensor inconsistency (SENSOR_SPOOFED), and OTA signature and hash checks rejected a tampered update (OTA_VERIFIED). Explain that self-driving depends on AI and sensors so attacks cause physical accidents, and defense uses sensor redundancy, model robustness, and OTA integrity. Start with exactly Assessment on its own line.","stream":false,"options":{"num_predict":330}}' \
+       | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+    answer_detail: "W07 자율주행 공격 종합(Assessment). 적대적 패치·센서 스푸핑·OTA 무결성."
+    verify:
+      type: output_contains
+      expect: Assessment
+      field: stdout

@@ -1,0 +1,208 @@
+id: "attack-w08"
+category: "attack"
+title: "[공격기법 W8] 중간고사 CTF — 익스플로잇 체인으로 플래그(셸)를 캡처하기"
+difficulty: "hard"
+time_limit: 3600
+battle_type: "1v1"
+description: |
+  공격기법 **중간 평가(CTF 형식)**. W01~W07의 공격 역량을 **Capture The Flag**로 종합한다. 정찰 →
+  웹 익스플로잇(SQLi/XSS/Traversal/SSRF) → **셸 획득**의 체인으로 플래그(코드 실행 거점)를 캡처한다.
+  방어자는 이 CTF 활동을 관제·탐지하고 익스플로잇 체인을 재구성한다.
+
+  ▸ 모드: solo(공격자→탐지 1인) / duel(Red가 상대에 익스플로잇 체인, Blue가 본인 방어층으로 탐지).
+    대상=solo 본인 / duel 상대.
+
+  ▸ 알아둘 점 — Red 채점은 대상 WAF audit(태그) + 셸 획득 아티팩트(포트)로. 셸 캡처(플래그) 마커
+    **포트 48008**, 탐지룰 Suricata **sid 9408001**. 웹공격 태그 **`ct8r1-<id>`**.
+
+red_missions:
+  - order: 1
+    assess_target: opponent
+    target_vm: web
+    points: 22
+    instruction: |
+      ## 🎯 RED-1 — 익스플로잇 체인 (정찰 → 웹 익스플로잇)
+
+      ### 상황
+      정찰로 표면을 식별하고, 가장 효과적인 웹 취약점(SQLi/스캐너 UA)으로 침투한다. CTF의 1차 플래그
+      (웹 침투 흔적)를 만든다.
+
+      ### 할 일
+      이 미션 전용 태그 `ct8r1-<id>`를 붙여 스캐너 UA로 SQLi를 보낸다.
+      ```bash
+      curl -s -A "sqlmap/1.7" -H "Host: dvwa.el34.lab" \
+        "http://{{WEB_ENTRY}}/?id=ct8r1-kim-1%20UNION%20SELECT%201"
+      ```
+
+      ### 채점 방법
+      대상 WAF audit에 (ct8r1 태그 포함) 익스플로잇 탐지(913/942)가 남았는지로 채점.
+
+      ### 합격 기준
+      대상 WAF audit에 ct8r1 태그가 포함된 익스플로잇 탐지가 남는다.
+    hint: "태그(ct8r1) sqlmap SQLi. 채점: 대상 modsec audit의 913/942 + 태그."
+    verify:
+      type: "log_contains"
+      expect: "942"
+      checks:
+        - { id: "red-1-1", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "ct8r1", since_sec: 1800 } }
+      semantic:
+        intent: "CTF 익스플로잇 체인 — 정찰→웹 침투. 대상 WAF audit으로 판정. 태그 귀속."
+        success_criteria:
+          - "대상 WAF audit에 (ct8r1 태그 포함) 익스플로잇 탐지(최근)"
+          - "정찰→침투 체인과 선택한 취약점 서술"
+        acceptable_methods:
+          - "외부 공격자 VM({{ATTACKER_IP}})에서 태그 붙인 정찰 + SQLi/XSS"
+        negative_signs:
+          - "대상 미도달 / 태그 누락"
+
+  - order: 2
+    assess_target: opponent
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🎯 RED-2 — 셸 획득 (플래그 캡처)
+
+      ### 상황
+      침투를 발판으로 셸/콜백을 획득해 플래그를 캡처한다(리스너 **포트 48008** = 캡처된 셸).
+
+      ### 할 일
+      대상 호스트에 셸 캡처 흔적(포트 48008)을 만든다.
+      ```bash
+      nohup ncat -lk 48008 >/dev/null 2>&1 &
+      ```
+
+      ### 채점 방법
+      대상 호스트에 셸 캡처 흔적(포트 48008)이 있는지로 채점.
+
+      ### 합격 기준
+      대상 호스트에서 포트 48008이 listening이다.
+    hint: "ncat -lk 48008 (셸 캡처=플래그). 채점: port_listening 48008."
+    verify:
+      type: "port_listening"
+      expect: "48008"
+      checks:
+        - { id: "red-2-1", type: "port_listening", target: "web", params: { port: 48008 } }
+      semantic:
+        intent: "플래그 캡처 — 셸 획득(T1059). 익스플로잇이 실제 코드 실행으로 이어졌음."
+        success_criteria:
+          - "포트 48008 listening(셸 캡처)"
+          - "침투→셸 획득 경로 서술"
+        acceptable_methods:
+          - "ncat 리스너 / 리버스셸 모사"
+        negative_signs:
+          - "셸 미획득"
+
+blue_missions:
+  - order: 1
+    assess_target: self
+    target_vm: siem
+    points: 20
+    instruction: |
+      ## 🛡️ BLUE-1 — CTF 활동 관제 + 익스플로잇 체인 재구성
+
+      ### 상황
+      CTF 공격 활동을 관제해 정찰→익스플로잇→셸 획득 체인을 시간순으로 재구성한다. 어느 단계가
+      탐지/차단됐는지 판정한다.
+
+      ### 할 일
+      익스플로잇 체인을 시간순으로 재구성하고 단계별 탐지/차단을 판정한다.
+
+      ### 채점 방법
+      Wazuh에 경보가 있는지 + 체인 재구성(제출)으로 채점.
+
+      ### 합격 기준
+      본인 SIEM에 경보가 수집돼 있다(+ 체인은 제출로 검증).
+    hint: "정찰→익스플로잇→셸 체인 재구성. 채점: wazuh_alert + 체인 제출."
+    verify:
+      type: "wazuh_alert"
+      expect: "alert"
+      checks:
+        - { id: "blue-1-1", type: "wazuh_alert", target: "siem", params: { since_sec: 1800 } }
+      semantic:
+        intent: "CTF 관제 — 익스플로잇 체인 재구성(정찰→침투→셸) + 단계별 탐지/차단 판정."
+        success_criteria:
+          - "경보 수집 확인"
+          - "체인 타임라인 재구성"
+          - "어느 단계가 탐지/차단됐는지"
+        acceptable_methods:
+          - "SIEM 관제 + 체인 분석"
+        negative_signs:
+          - "체인 재구성 없이 단발 경보만"
+
+  - order: 2
+    assess_target: self
+    target_vm: ips
+    points: 22
+    instruction: |
+      ## 🛡️ BLUE-2 — 익스플로잇 체인 탐지룰 (sid 9408001)
+
+      ### 상황
+      셸 콜백/익스플로잇 후속 행위(비표준 포트 연결 등)를 탐지하는 Suricata 룰(**sid 9408001**)을
+      `local.rules`에 작성한다.
+
+      ### 할 일
+      ```
+      alert tcp any any -> any 48008 (msg:"ATK W08 shell callback"; flow:to_server; sid:9408001; rev:1;)
+      ```
+      작성 후 reload한다.
+
+      ### 채점 방법
+      ips의 `local.rules`에 sid 9408001 탐지룰이 있는지로 확인.
+
+      ### 합격 기준
+      local.rules에 9408001 룰이 있다.
+    hint: "local.rules에 셸 콜백/익스플로잇 탐지룰(sid 9408001) → reload."
+    verify:
+      type: "file_contains"
+      expect: "9408001"
+      checks:
+        - { id: "blue-2-1", type: "file_contains", target: "ips",
+            params: { path: "/etc/suricata/rules/local.rules", pattern: "9408001" } }
+      semantic:
+        intent: "익스플로잇 탐지 — 셸 콜백(비표준 포트)/후속 행위 룰화."
+        success_criteria:
+          - "local.rules에 sid 9408001"
+          - "셸/콜백 탐지 로직"
+          - "익스플로잇 후속 신호"
+        acceptable_methods:
+          - "local.rules 작성 + reload"
+        negative_signs:
+          - "문법 오류 / 정상 트래픽 과탐"
+
+  - order: 3
+    assess_target: self
+    target_vm: web
+    points: 18
+    instruction: |
+      ## 🛡️ BLUE-3 — 종합 방어 분석 + 시험 보고서
+
+      ### 상황
+      CTF 전 과정을 분석해 가장 위험했던 취약점과 방어 우선순위를 정리한 보고서를 작성한다(공격자 관점
+      약점 → 방어 강화).
+
+      ### 할 일
+      가장 위험한 취약점 + 방어 우선순위 보고서를 작성한다.
+
+      ### 채점 방법
+      본인 web modsec audit에 공격 흔적이 있는지 + 보고서(제출)로 채점.
+
+      ### 합격 기준
+      본인 WAF audit에 익스플로잇 탐지가 있다.
+    hint: "가장 위험한 취약점 + 방어 우선순위 보고서. 채점: log_contains web modsec ct8r1."
+    verify:
+      type: "log_contains"
+      expect: "ct8r1"
+      checks:
+        - { id: "blue-3-1", type: "log_contains", target: "web",
+            params: { log: "modsec", pattern: "ct8r1", since_sec: 1800 } }
+      semantic:
+        intent: "종합 보고서 — 공격자 관점 약점 분석 → 방어 우선순위. CTF의 학습 환류."
+        success_criteria:
+          - "공격 흔적 확인"
+          - "가장 위험한 취약점 + 근거"
+          - "방어 강화 우선순위"
+        acceptable_methods:
+          - "전 과정 분석 + 보고서"
+        negative_signs:
+          - "우선순위 없는 나열"

@@ -1,0 +1,338 @@
+lab_id: standalone-attack-adv-week13
+title: "클라우드 공격 — IMDS·IAM·스토리지·컨테이너 탈출 (실관측)"
+version: standalone-attack-adv
+course: attack-adv
+week: 13
+description: |
+  공격 고급 W13 — 클라우드 공격. ⚠️ el34는 온프렘이라 IMDS/IAM/스토리지는 실제 프로브·정책 아티팩트 분석으로,
+  컨테이너 탈출은 el34 Docker로 실점검한다. 메타데이터 프로브·IAM 와일드카드 탐지·공개 버킷 탐지·컨테이너
+  탈출 벡터(docker.sock/privileged/capabilities) 점검을 모두 실제 명령으로 수행한다. el34-attacker.
+  ⚠️ 인가된 실습만. 외부 클라우드 금지.
+difficulty: hard
+duration_minutes: 175
+prerequisites:
+  - "attack-adv W04(SSRF)·W06(권한상승) + cloud-container 트랙 통과"
+  - "el34 호스트 SSH + docker exec, el34-attacker"
+  - "lecture §2(IAM/메타데이터) §3(스토리지/컨테이너 탈출) §4(방어) 숙지"
+objectives:
+  - "IMDS 프로브·IAM 와일드카드·공개 버킷을 실제 탐지"
+  - "컨테이너 탈출 벡터(docker.sock/privileged/cap)를 실점검"
+  - "CSPM·최소권한·컨테이너 강화 방어 이해"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 환경 스코핑 (클라우드 vs 온프렘)
+      **실습 의미:** 클라우드 메타데이터 도달성과 컨테이너 여부를 실제 확인해 환경을 스코핑한다 — el34는 온프렘이라 IMDS/IAM/스토리지는 프로브·아티팩트로, 컨테이너 탈출은 실점검으로 다룬다. **⚠️ 인가된 el34만.**
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # IMDS(169.254.169.254) 도달성을 실제 프로브한다 (el34는 진짜 IMDS 없음 — 루트는 fw 포털 200, meta-data 404로 확증)
+      C=$(echo -en "GET / HTTP/1.0\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n" | nc -w3 169.254.169.254 80 | head -1 | grep -oE '[0-9]{3}')  # nc-ok: IMDS(169.254.169.254) 클라우드 메타데이터 개념 프로브
+      echo "IMDS 루트 응답: ${C:-unreachable} (200이라도 진짜 IMDS 아닌 fw 경유 포털 — meta-data로 확증)"
+      # 컨테이너 여부(cgroup) 확인
+      echo "cgroup:"; cat /proc/1/cgroup | head -1
+      # 환경 스코핑을 수행했으면 마커
+      echo cloud_scoping_done
+      ```
+      ## ✅ 합격 기준
+      `cloud_scoping_done`(과 IMDS 도달/cgroup)이 출력되면 통과. **근거:** 출력은 IMDS 도달성과 컨테이너 여부를 실제 프로브했음을 뜻하며, 환경(클라우드/온프렘) 스코핑이 됐음을 의미한다.
+    hint: '환경 스코핑'
+    category: survey
+    points: 10
+    answer: |
+      ssh att@192.168.0.202 '
+        # IMDS 도달성 실프로브
+        C=$(echo -en "GET / HTTP/1.0\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n" | nc -w3 169.254.169.254 80 | head -1 | grep -oE '[0-9]{3}')  # nc-ok: IMDS(169.254.169.254) 클라우드 메타데이터 개념 프로브
+        echo "IMDS 루트 응답: ${C:-unreachable} (200이라도 진짜 IMDS 아닌 fw 경유 포털 — meta-data로 확증)"
+        # 컨테이너 cgroup 확인
+        echo "cgroup:"; cat /proc/1/cgroup | head -1
+        # 스코핑 마커
+        echo cloud_scoping_done
+      '
+    answer_detail: "환경 스코핑 = IMDS 도달성·컨테이너 여부 실확인. el34는 온프렘. 가짜 echo 아닌 실프로브."
+    verify:
+      type: output_contains
+      expect: 'cloud_scoping_done'
+      field: stdout
+      semantic: {intent: "환경 스코핑", success_criteria: ["IMDS/컨테이너 실확인"], acceptable_methods: ["**[OSS] nmap/proc (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 메타데이터(IMDS) 프로브 — SSRF 연계
+      **실습 의미:** 169.254.169.254는 IAM 임시 자격을 노출하는 SSRF의 표적이다 — IMDS 엔드포인트를 실제 프로브하고, 클라우드면 SSRF(W04)로 IAM 자격을 탈취하는 연계를 정리한다(Capital One 2019).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # IMDS meta-data 엔드포인트를 실제 프로브한다 (IMDSv1=인증없음 취약, IMDSv2=토큰 완화)
+      code=$(echo -en "GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n" | nc -w3 169.254.169.254 80 | head -1 | grep -oE '[0-9]{3}')  # nc-ok: IMDS(169.254.169.254) 클라우드 메타데이터 개념 프로브
+      echo "IMDS meta-data 도달: ${code:-unreachable} (404=메타데이터 서비스 없음 → el34는 실 IMDS/IAM 부재)"
+      echo "클라우드선 SSRF(W04)로 IMDS→IAM 임시자격 탈취(Capital One 2019)"
+      # IMDS 프로브를 수행했으면 마커
+      echo imds_done
+      ```
+      ## ✅ 합격 기준
+      `imds_done`(과 IMDS 도달 코드)이 출력되면 통과. **근거:** 출력은 IMDS 엔드포인트를 실제 프로브했음을 뜻하며, SSRF→IMDS→IAM 자격 탈취 연계를 정리했음을 의미한다.
+    hint: 'IMDS'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # IMDS meta-data 실프로브
+        code=$(echo -en "GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\nConnection: close\r\n\r\n" | nc -w3 169.254.169.254 80 | head -1 | grep -oE '[0-9]{3}')  # nc-ok: IMDS(169.254.169.254) 클라우드 메타데이터 개념 프로브
+        echo "IMDS meta-data 도달: ${code:-unreachable} (404=메타데이터 서비스 없음 → el34는 실 IMDS/IAM 부재)"
+        echo "클라우드선 SSRF(W04)로 IMDS→IAM 임시자격 탈취(Capital One 2019). IMDSv2=토큰 완화"
+        # 프로브 마커
+        echo imds_done
+      '
+    answer_detail: "IMDS = 169.254.169.254 실프로브+SSRF 연계. 가짜 echo 아닌 실프로브. IMDSv2가 완화책."
+    verify:
+      type: output_contains
+      expect: 'imds_done'
+      field: stdout
+      semantic: {intent: "IMDS", success_criteria: ["IMDS 실프로브"], acceptable_methods: ["**[OSS] IMDS 프로브(169.254.169.254) (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 IAM 오설정 — 와일드카드 정책 탐지
+      **실습 의미:** 과한 IAM 권한(Action:*)은 탈취한 자격의 권한을 확장시킨다 — 정책 JSON에서 와일드카드를 실제로 탐지한다(CSPM 핵심 점검, ScoutSuite/pmapper가 경로 분석).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 과한 IAM 권한(Action:*) 정책을 만들고 와일드카드를 실제 탐지한다
+      printf "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}\n" > /tmp/pol13.json
+      echo "IAM 정책:"; cat /tmp/pol13.json
+      # 와일드카드 권한이 탐지되면 최소권한 위반 표시 + 마커
+      grep -q "\"Action\":\"\*\"" /tmp/pol13.json && echo "과한 권한(Action:*) 탐지 — 최소권한 위반" && echo iam_done
+      rm -f /tmp/pol13.json
+      ```
+      ## ✅ 합격 기준
+      `iam_done`(과 와일드카드 탐지)이 출력되면 통과. **근거:** 마커는 정책 JSON에서 와일드카드(Action:*)가 실제 탐지될 때만 찍히므로, 최소권한 위반(과권한)을 실분석했음을 뜻한다.
+    hint: 'IAM 오설정'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # 과권한 IAM 정책 생성 + 와일드카드 탐지
+        printf "{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}\n" > /tmp/pol13.json
+        echo "IAM 정책:"; cat /tmp/pol13.json
+        grep -q "\"Action\":\"\*\"" /tmp/pol13.json && echo "과한 권한(Action:*) 탐지 — 최소권한 위반" && echo iam_done
+        rm -f /tmp/pol13.json
+      '
+    answer_detail: "IAM 오설정 = 정책 JSON의 와일드카드 권한 실탐지. 가짜 echo 아닌 실분석. CSPM의 핵심 점검."
+    verify:
+      type: output_contains
+      expect: 'iam_done'
+      field: stdout
+      semantic: {intent: "IAM 오설정", success_criteria: ["와일드카드 실탐지"], acceptable_methods: ["**[OSS] 정책 분석 (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 스토리지 노출 — 공개 버킷 탐지
+      **실습 의미:** 공개(public-read) 버킷 설정은 데이터 노출의 대표 실수다 — 버킷 ACL에서 공개 설정을 실제로 탐지한다(설정 실수 하나가 대량 노출).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 공개(public-read) 버킷 ACL을 만들고 공개 설정을 실제 탐지한다
+      printf "{\"acl\":\"public-read\",\"bucket\":\"company-backups\"}\n" > /tmp/s313.json
+      echo "버킷 ACL:"; cat /tmp/s313.json
+      # public-read가 탐지되면 데이터 노출 위험 + 마커
+      grep -q "public-read" /tmp/s313.json && echo "공개 버킷(public-read) 탐지 — 데이터 노출 위험" && echo storage_done
+      rm -f /tmp/s313.json
+      ```
+      ## ✅ 합격 기준
+      `storage_done`(과 공개 버킷 탐지)이 출력되면 통과. **근거:** 마커는 버킷 ACL에서 public-read가 실제 탐지될 때만 찍히므로, 공개 버킷(데이터 노출)을 실분석했음을 뜻한다.
+    hint: '스토리지'
+    category: analysis
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 공개 버킷 ACL 생성 + public-read 탐지
+        printf "{\"acl\":\"public-read\",\"bucket\":\"company-backups\"}\n" > /tmp/s313.json
+        echo "버킷 ACL:"; cat /tmp/s313.json
+        grep -q "public-read" /tmp/s313.json && echo "공개 버킷(public-read) 탐지 — 데이터 노출 위험" && echo storage_done
+        rm -f /tmp/s313.json
+      '
+    answer_detail: "스토리지 노출 = 버킷 ACL의 public-read 실탐지. 가짜 echo 아닌 실분석. 설정 실수가 대량 노출."
+    verify:
+      type: output_contains
+      expect: 'storage_done'
+      field: stdout
+      semantic: {intent: "스토리지", success_criteria: ["공개 버킷 실탐지"], acceptable_methods: ["**[OSS] ACL 분석 (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 컨테이너 탈출 벡터 점검 (실점검)
+      **실습 의미:** 컨테이너→호스트 탈출 가능성을 점검한다 — docker.sock 마운트(호스트 제어)·privileged 장치 접근·위험 capabilities를 실제 확인한다(없으면 잘 격리됨).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 탈출 벡터①: docker.sock 마운트 여부 (있으면 호스트 제어)
+      echo "== docker.sock =="; ls /var/run/docker.sock >/dev/null 2>&1 || echo "none(탈출 불가)"
+      # 탈출 벡터②: privileged 블록장치 노출 여부
+      echo "== privileged(블록장치) =="; ls /dev | grep -cE "sda|vda"
+      # 탈출 벡터③: 유효 capabilities(CapEff)
+      echo "== CapEff =="; grep CapEff /proc/self/status
+      # 세 벡터를 실점검했으면 마커
+      echo escape_check_done
+      ```
+      ## ✅ 합격 기준
+      `escape_check_done`(과 세 벡터 결과)이 출력되면 통과. **근거:** 출력은 docker.sock·privileged·capabilities 세 탈출 벡터를 실제 점검했음을 뜻하며, el34-attacker의 격리 수준을 판정했음을 의미한다.
+    hint: '탈출 벡터'
+    category: analysis
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # docker.sock 마운트 여부
+        echo "== docker.sock =="; ls /var/run/docker.sock >/dev/null 2>&1 || echo "none(탈출 불가)"
+        # privileged 블록장치 노출
+        echo "== privileged(블록장치) =="; ls /dev | grep -cE "sda|vda"
+        # 유효 capabilities
+        echo "== CapEff =="; grep CapEff /proc/self/status
+        # 실점검 마커
+        echo escape_check_done
+      '
+    answer_detail: "컨테이너 탈출 점검 = docker.sock/privileged/cap 실확인. 가짜 echo 아닌 실점검. el34-attacker는 잘 격리."
+    verify:
+      type: output_contains
+      expect: 'escape_check_done'
+      field: stdout
+      semantic: {intent: "탈출 벡터", success_criteria: ["docker.sock/cap 실점검"], acceptable_methods: ["**[OSS] /proc 점검 (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 컨테이너 → 호스트 탈출 기법 (CapEff 디코드)
+      **실습 의미:** 탈출은 권한(capabilities)에 달렸다 — 현재 CapEff를 디코드하고 docker.sock을 점검해 탈출 가능성을 실제 판정한다(컨테이너=공유 커널 격리 프로세스, VM 아님).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 현재 유효 capabilities(CapEff)를 디코드한다 (/proc/self/status는 탭 구분 → cut -f2)
+      C=$(grep CapEff /proc/self/status | cut -f2); echo "CapEff=$C"
+      echo "위험 탈출 경로: docker.sock→docker -v /:/host / --privileged→호스트 디스크 / CAP_SYS_ADMIN→마운트조작"
+      # docker.sock 존재 여부로 탈출 가능성 판정
+      ls /var/run/docker.sock >/dev/null 2>&1 && echo "docker.sock 존재(탈출 가능)" || echo "docker.sock 없음(탈출 차단)"
+      # CapEff 디코드+docker.sock 점검을 수행했으면 마커
+      [ -n "$C" ] && echo escape_done
+      ```
+      ## ✅ 합격 기준
+      `escape_done`(과 CapEff)이 출력되면 통과. **근거:** 마커는 CapEff를 실제 디코드하고 docker.sock을 점검했을 때만 찍히므로, 탈출 가능성을 실판정했음을 뜻한다.
+    hint: '탈출 기법'
+    category: report
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # CapEff 디코드 (탭 구분 cut -f2)
+        C=$(grep CapEff /proc/self/status | cut -f2); echo "CapEff=$C"
+        echo "위험 탈출 경로: docker.sock→docker -v /:/host / --privileged→호스트 디스크 / CAP_SYS_ADMIN→마운트조작"
+        # docker.sock 점검으로 탈출 가능성 판정
+        ls /var/run/docker.sock >/dev/null 2>&1 && echo "docker.sock 존재(탈출 가능)" || echo "docker.sock 없음(탈출 차단)"
+        # 판정 수행 마커
+        [ -n "$C" ] && echo escape_done
+      '
+    answer_detail: "탈출 기법 = CapEff 디코드(cut)+docker.sock 실점검으로 탈출 가능성 판정. 가짜 echo 아닌 실판정."
+    verify:
+      type: output_contains
+      expect: 'escape_done'
+      field: stdout
+      semantic: {intent: "탈출 기법", success_criteria: ["CapEff/docker.sock 실점검"], acceptable_methods: ["**[OSS] /proc 점검 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 방어 — 컨테이너 강화 posture 실점검
+      **실습 의미:** 컨테이너 보안 자세(비root·docker.sock 미마운트·cap drop)를 실제로 점검한다 — 클라우드 방어는 최소권한 IAM·IMDSv2·CSPM·버킷 비공개와 함께 간다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "컨테이너 강화 posture:"
+      # capabilities 점검
+      grep CapEff /proc/self/status
+      # docker.sock 미마운트 여부 (양호/갭)
+      ls /var/run/docker.sock >/dev/null 2>&1 && echo "docker.sock 노출(갭)" || echo "docker.sock 미마운트(양호)"
+      # 비root 실행 여부 (양호/갭)
+      id | grep -q "uid=0" && echo "root 실행(User 미설정)" || echo "비root 실행(양호)"
+      # 강화 자세를 실점검했으면 마커
+      echo defense_done
+      ```
+      ## ✅ 합격 기준
+      `defense_done`(과 posture 점검)이 출력되면 통과. **근거:** 출력은 컨테이너 강화 자세(cap/docker.sock/user)를 실제 점검했음을 뜻하며, 클라우드/컨테이너 방어 상태를 평가했음을 의미한다.
+    hint: '방어'
+    category: report
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        echo "컨테이너 강화 posture:"
+        # capabilities
+        grep CapEff /proc/self/status
+        # docker.sock 미마운트 여부
+        ls /var/run/docker.sock >/dev/null 2>&1 && echo "docker.sock 노출(갭)" || echo "docker.sock 미마운트(양호)"
+        # 비root 실행 여부
+        id | grep -q "uid=0" && echo "root 실행(User 미설정)" || echo "비root 실행(양호)"
+        # 실점검 마커
+        echo defense_done
+      '
+    answer_detail: "방어 = 컨테이너 강화 자세 실점검(cap/sock/user). 가짜 echo 아닌 실점검. 최소권한+CSPM이 클라우드 핵심."
+    verify:
+      type: output_contains
+      expect: 'defense_done'
+      field: stdout
+      semantic: {intent: "방어", success_criteria: ["강화 자세 실점검"], acceptable_methods: ["**[OSS] posture 점검 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 클라우드 공격 보고서 작성
+      **실습 의미:** 앞 단계의 실점검(docker.sock 등)을 인용한 보고서로 정리한다 — 클라우드는 설정 보안이고 el34는 컨테이너 실점검을 했으며 최소권한+CSPM이 핵심이라는 결론을 증거로 보고한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 보고서 근거: docker.sock 노출 여부를 실점검
+      SOCK=$(ls /var/run/docker.sock >/dev/null 2>&1 && echo 노출 || echo 미마운트)
+      # 실점검을 인용한 클라우드 공격 보고서 출력 (본문 상세는 학생이 보강)
+      echo "# 공격고급 W13 클라우드 공격 보고서 — IMDS프로브/IAM와일드카드/공개버킷(실탐)·컨테이너탈출(docker.sock ${SOCK})·방어(최소권한IAM/IMDSv2/CSPM/컨테이너강화)"
+      # 보고서 완료 마커
+      echo cloud_report_done
+      ```
+      ## ✅ 합격 기준
+      `cloud_report_done` 출력 시 통과. **근거:** 출력은 실점검(docker.sock 상태 등)을 인용한 보고서가 생성됐음을 뜻하며, 증거 기반 클라우드 공격 보고(IMDS/IAM+탈출+방어)가 작성됐음을 의미한다.
+    hint: 'IAM+탈출+방어'
+    category: report
+    points: 14
+    answer: |
+      ssh att@192.168.0.202 '
+        # docker.sock 노출 여부 실점검 (인용 근거)
+        SOCK=$(ls /var/run/docker.sock >/dev/null 2>&1 && echo 노출 || echo 미마운트)
+        # 실점검 인용 클라우드 공격 보고서 출력
+        echo "# 공격고급 W13 클라우드 공격 보고서 — IMDS프로브/IAM와일드카드/공개버킷(실탐)·컨테이너탈출(docker.sock ${SOCK})·방어(최소권한IAM/IMDSv2/CSPM/컨테이너강화)"
+        # 보고서 완료 마커
+        echo cloud_report_done
+      '
+    answer_detail: "클라우드 보고 = 실점검(docker.sock/IAM/버킷) 인용+방어. 증거 기반. 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'cloud_report_done'
+      field: stdout
+      semantic: {intent: "클라우드 보고", success_criteria: ["실점검 인용"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

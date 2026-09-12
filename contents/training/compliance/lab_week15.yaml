@@ -1,0 +1,490 @@
+lab_id: standalone-compliance-week15
+title: "기말: 종합 컴플라이언스 감사 — 전 영역 점검→준수율→시정 로드맵"
+version: standalone-compliance
+course: compliance
+week: 15
+description: |
+  기말(수료) 종합 컴플라이언스 감사 — 14주 동안 영역별로 하나씩 익힌 통제를 단 하나의 표적(el34) 위에
+  올려, 정보노출(W01) → 접근통제(W04) → 암호화(W05) → 로깅(W06) → 구성평가 SCA(W09) → 무결성 FIM(W10)
+  → 취약점(W07) → 개인정보(W12) 의 여덟 영역을 한 바퀴 점검한다. 각 영역에서 기준(CIS/PCI-DSS/ISMS-P/
+  개인정보보호법) ↔ el34 현재 상태를 대조해 준수(compliant)/갭(gap)을 증적과 함께 판정하고, 그 판정을
+  모아 준수율(compliance score) 산정 → 갭 도출 → 위험 기반 시정 로드맵까지 갖춘 종합 감사 보고서 한 편으로
+  종합한다. 모든 명령은 el34 호스트(ssh ccc@{{TARGET_IP}})에서 docker exec -it <컨테이너> bash 로 접속해 실행하며(설정·SCA 는
+  el34-web, 로깅·FIM 적재는 el34-siem, 전송 암호화·취약점 스캔·PII 점검은 el34-attacker), 신규 도구 설치는
+  없다. 인가된 표적(el34)만 점검하며, 점검만 하고 설정은 변경하지 않는다.
+difficulty: hard
+duration_minutes: 200
+prerequisites:
+  - "W01–W14 통과"
+  - "el34 호스트 SSH + docker exec"
+  - "전 주차 점검·평가·보고 역량"
+objectives:
+  - "정보노출~개인정보 여덟 영역 종합 감사를 단 하나의 표적(el34)에 처음부터 끝까지 한 바퀴 수행한다"
+  - "각 영역을 어느 주차(W01·W04·W05·W06·W07·W09·W10·W12)·어느 프레임워크 조항에 대응시키고 기준 대비 준수/갭을 증적과 함께 판정한다"
+  - "여덟 영역의 판정을 모아 준수율을 산정하고 갭을 위험 기반 우선순위로 정렬해 시정 로드맵을 작성한다"
+  - "준수율 + 갭 목록 + 시정 로드맵 + 결론(강점·최우선 시정)을 종합 컴플라이언스 감사 보고서 한 편으로 종합한다"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 점검 — 대상 도달성 (종합 감사의 전제)
+      종합 감사의 첫 단계는 표적에 접근이 되는지 확인하는 것이다. 접근이 안 되면 이후 모든 음성 결과가
+      무의미하다. 이번 기말의 감사 대상은 el34 전반 — 설정·SCA 를 보는 `el34-web`(dmz Apache+ModSec),
+      로깅·FIM 적재를 보는 `el34-siem`(Wazuh), 전송 암호화·취약점 스캔·PII 점검을 던지는 `el34-attacker`
+      세 컨테이너다. 여기서는 그 중심인 web 컨테이너에 `docker exec` 로 진입해 hostname 이 응답하는지로
+      대상이 살아있고 점검 가능한 상태인지 확인한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) 종합 감사 중심 대상 el34-web 도달성 확인 — 호스트명 출력 후 target_ok
+      hostname; echo target_ok
+      ```
+      ## ✅ 합격 기준
+      `target_ok` 출력 시 통과. **근거:** target_ok 가 나오면 종합 감사 착수 가능(대상 접근 성공) —
+      응답이 없으면 호스트 SSH·컨테이너 상태(`docker ps`)부터 점검한다.
+    hint: '대상'
+    category: survey
+    points: 8
+    answer: |
+      # 1) 종합 감사 중심 대상 el34-web 도달성 확인 — 호스트명 출력 후 target_ok
+      ssh ccc@10.20.32.80 "hostname; echo target_ok"
+    answer_detail: "종합 감사 대상 = el34 전반(설정·SCA 는 el34-web, 로깅·FIM 은 el34-siem, 전송·스캔·PII 는 el34-attacker). hostname 응답 + target_ok 출력으로 도달성 확인 — 여덟 영역 점검 착수의 전제 단계."
+    expected_output: |
+      web
+      target_ok
+    verify:
+      type: output_contains
+      expect: 'target_ok'
+      field: stdout
+      semantic:
+        intent: "대상 점검"
+        success_criteria: ["접근"]
+        acceptable_methods: ["**[OSS] docker exec (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 ① 정보노출 — ServerTokens (W01: 프레임워크·갭 분석)
+      종합 감사의 첫 영역은 정보 최소화다. `ServerTokens` 는 Apache 가 응답 `Server:` 헤더와 에러
+      페이지에 자신의 정보를 얼마나 노출할지 정하는 설정으로, `OS` 면 `Apache/2.4.52 (Ubuntu)` 처럼
+      제품 버전과 OS 가 그대로 드러나 공격자에게 표적에 맞는 CVE 를 고를 단서를 준다. **CIS Apache 2.4
+      Benchmark 는 제품명만 노출하는 `Prod`** 를 요구한다(W01 에서 처음 만난 갭이며, W09 SCA 정책
+      CIS 8.1 에도 같은 항목으로 정의돼 있다 — 수동→자동→종합으로 추적되는 갭). 이 명령은 설정값을 읽어
+      기준(Prod) 대비 준수/갭을 셸 한 줄로 자동 판정한다(`grep -qi Prod && compliant || gap`).
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) ServerTokens 실제값(current:)을 읽어 CIS 기준 Prod와 대조 — Prod면 compliant, 아니면 gap=ServerTokens
+      V=$(grep -rhiE "^[[:space:]]*ServerTokens" /etc/apache2/ | head -1); echo "current:$V"; echo "$V" | grep -qi Prod && echo compliant || echo "gap=ServerTokens"
+      ```
+      - `V=$(grep ...)`(실제 설정값)→`echo "current:$V"`(증적)→`grep -qi Prod && echo compliant || echo "gap=..."`(기준 대비 자동 판정).
+      ## ✅ 합격 기준
+      `gap=` 출력 시 통과. **근거:** gap=ServerTokens 가 나오면 현재값 OS 가 CIS 기준 Prod 에 미달한 갭 —
+      낮은 위험(정찰 단서)이라 시정 로드맵 후순위(④)로 보고한다(설정을 못 읽으면 경로·권한 점검).
+    hint: 'ServerTokens'
+    category: manipulation
+    points: 10
+    answer: |
+      # 1) ServerTokens 실제값(current:)을 읽어 CIS 기준 Prod와 대조 — Prod면 compliant, 아니면 gap=ServerTokens
+      ssh ccc@10.20.32.80 'V=$(grep -rhiE "^[[:space:]]*ServerTokens" /etc/apache2/ | head -1); echo "current:$V"; echo "$V" | grep -qi Prod && echo compliant || echo "gap=ServerTokens"'
+    answer_detail: "ServerTokens OS = 제품+OS 노출 → CIS Apache 2.4(8.1) 의 Prod 요구 미달 = 갭(W01, 정보노출). 공격자 정찰 단서라 낮은 위험이나 시정 로드맵 후순위(④)로 보고. W09 SCA 정책에도 같은 항목이 있어 수동·자동 점검이 같은 갭을 가리킨다. 증적 = current: 뒤의 실제 설정값."
+    expected_output: |
+      current:ServerTokens OS
+      gap=ServerTokens
+    verify:
+      type: output_contains
+      expect: 'gap='
+      field: stdout
+      semantic:
+        intent: "정보노출 점검"
+        success_criteria: ["갭"]
+        acceptable_methods: ["**[OSS] 설정 (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 ② 접근통제 — 암호 만료 PASS_MAX_DAYS (W04: 접근통제)
+      접근통제는 "누가 어떻게 접근하고 그 자격이 안전하게 관리되는가"를 보며, 기말에서는 **암호 만료
+      주기**를 대표 항목으로 점검한다. `PASS_MAX_DAYS` 는 `/etc/login.defs` 에 정의된 암호 강제 만료
+      주기(일)로, 만료가 없으면 한 번 유출된 암호가 무기한 악용된다. **PCI-DSS 8.3.9 / CIS 는 ≤90일**을
+      권고하며, 값이 `99999` 면 사실상 무기한이다. 이 명령은 설정값에서 숫자만 추출(`tr -dc 0-9`)해 90 과
+      비교하고 90 초과면 갭으로 판정한다. 같은 접근통제 영역에서 `PermitRootLogin no`(원격 root 직접
+      로그인 차단)는 **준수**라, 한 영역 안에 준수와 갭이 섞인 혼합 상태를 보여준다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) PASS_MAX_DAYS 숫자만 뽑아 max_days= 로 출력 후 90 초과면 gap=no_expiry, 이하면 compliant
+      V=$(grep "^PASS_MAX_DAYS" /etc/login.defs | tr -dc "0-9"); echo "max_days=$V"; [ "$V" -gt 90 ] >/dev/null 2>&1 && echo "gap=no_expiry" || echo compliant
+      # 2) 해석 — root 로그인은 차단(준수), 암호 만료는 무기한(갭) = 영역 내 혼합
+      # → root 로그인은 차단(준수), 암호 만료는 무기한(갭)
+      ```
+      ## ✅ 합격 기준
+      `gap=` 출력 시 통과. **근거:** gap=no_expiry 가 나오면 max_days=99999(사실상 무기한)가 PCI-DSS
+      8.3.9(≤90일) 미달 — 계정 보호 직결이라 시정 우선순위 높음(②). (90 이하로 나오면 표적·설정 재확인.)
+    hint: 'PASS_MAX_DAYS'
+    category: manipulation
+    points: 10
+    answer: |
+      # 1) PASS_MAX_DAYS 숫자만 뽑아 max_days= 로 출력 후 90 초과면 gap=no_expiry, 이하면 compliant
+      ssh ccc@10.20.32.80 'V=$(grep "^PASS_MAX_DAYS" /etc/login.defs | tr -dc "0-9"); echo "max_days=$V"; [ "$V" -gt 90 ] >/dev/null 2>&1 && echo "gap=no_expiry" || echo compliant'
+      # 2) 해석 — root 로그인은 차단(준수), 암호 만료는 무기한(갭) = 영역 내 혼합
+      # → root 로그인은 차단(준수), 암호 만료는 무기한(갭)
+    answer_detail: "PASS_MAX_DAYS 99999 = 암호 사실상 무기한 → PCI-DSS 8.3.9/CIS(≤90일) 미달 = 갭(W04, 접근통제). 유출 시 무기한 악용되어 계정 보호 직결, 시정 우선순위 높음(②). 같은 영역의 PermitRootLogin no(원격 root 차단)는 준수 — 영역 내 혼합 상태. 증적 = max_days= 출력."
+    expected_output: |
+      max_days=99999
+      gap=no_expiry
+      → root 로그인은 차단(준수), 암호 만료는 무기한(갭)
+    verify:
+      type: output_contains
+      expect: 'gap='
+      field: stdout
+      semantic:
+        intent: "접근통제 점검"
+        success_criteria: ["만료 갭"]
+        acceptable_methods: ["**[OSS] login.defs (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 ③ 암호화 — TLS (W05: 전송 암호화, PCI-DSS 4)
+      전송 구간 암호화는 도청·변조 방어의 기본이며 **PCI-DSS 요구사항 4 는 TLS1.2 이상**을 의무화한다
+      (TLS1.0/1.1 은 폐기 대상). 이 점검은 표적의 **외부 진입점**을 보는 것이라 web 컨테이너 내부가
+      아니라 점검자 컨테이너(`el34-attacker`)에서 fw 게이트웨이(`10.20.30.1:443`)로 핸드셰이크를 맺어
+      협상된 프로토콜을 본다. `openssl s_client -connect <ip:443> -servername <vhost>` 가 명령줄에서
+      TLS 핸드셰이크를 직접 맺어 `Protocol:`(버전)을 보여주는 점검 도구다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) el34-attacker에서 게이트웨이 443에 TLS 핸드셰이크를 맺어 협상된 Protocol/Cipher 확인
+      echo | openssl s_client -connect neobank.el34.lab:443 -servername neobank.el34.lab | grep -iE 'Protocol|Cipher' | head -2
+      # 2) 해석 — TLSv1.3 = PCI-DSS 4 준수(단, 자체서명 인증서는 별도 갭)
+      # → TLSv1.3 = PCI 4 준수(자체서명 인증서는 별도 갭)
+      ```
+      ## ✅ 합격 기준
+      `TLSv1` 출력 시 통과. **근거:** TLSv1.2/1.3 협상이 나오면 PCI-DSS 4(강한 전송 암호화) 준수 — 다만
+      인증서가 자체서명이라 운영 환경이면 신뢰된 CA 인증서로 교체할 중간 순위(③) 주의 사항이다.
+    hint: 'TLSv1.2+'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) el34-attacker에서 게이트웨이 443에 TLS 핸드셰이크를 맺어 협상된 Protocol/Cipher 확인
+      ssh att@192.168.0.202 "echo | openssl s_client -connect neobank.el34.lab:443 -servername neobank.el34.lab | grep -iE 'Protocol|Cipher' | head -2"
+      # 2) 해석 — TLSv1.3 = PCI-DSS 4 준수(단, 자체서명 인증서는 별도 갭)
+      # → TLSv1.3 = PCI 4 준수(자체서명 인증서는 별도 갭)
+    answer_detail: "TLSv1.3 협상 = PCI-DSS 4(강한 전송 암호화) 준수(W05, 암호화). 단 자체서명 인증서는 신뢰 체인 결함이라 운영 환경이면 갭으로 시정 로드맵 ③. 증적 = Protocol/Cipher 출력."
+    expected_output: |
+      New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
+      → TLSv1.3 = PCI 4 준수(자체서명 인증서는 별도 갭)
+    verify:
+      type: output_contains
+      expect: 'TLSv1'
+      field: stdout
+      semantic:
+        intent: "암호화 점검"
+        success_criteria: ["TLS1.2+"]
+        acceptable_methods: ["**[OSS] openssl (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 ④ 로깅 — Wazuh 중앙수집 (W06: 감사 추적, PCI-DSS 10)
+      로그 없는 보안은 침해 후 추적·법적 대응·재발 방지가 모두 무너진다. **PCI-DSS 요구사항 10 은 모든
+      접근에 감사 추적(audit trail)** 을, 그리고 그 로그의 **중앙 수집**을 요구한다. 중앙 수집은 공격자가
+      침입한 호스트의 로컬 로그를 지워도 중앙에는 사본이 남게 해 변조·삭제를 방어하며 통합 모니터링의
+      전제다. el34 의 SIEM 인 Wazuh(`el34-siem`)는 IPS·web 의 로그를 한 곳(`/var/ossec/logs/alerts/
+      alerts.json`)에 모은다. 이 명령은 그 파일의 최근 한 줄을 읽어 이벤트가 실제로 적재되는지 확인한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) SIEM alerts.json 최근 1줄 앞부분 + siem_ok — 분산 로그가 Wazuh에 중앙 적재되는지 확인
+      tail -1 /var/ossec/logs/alerts/alerts.json | head -c 40; echo; echo siem_ok
+      # 2) 해석 — 중앙 수집 = PCI-DSS 10 준수
+      # → 중앙 수집 = PCI 10 준수
+      ```
+      ## ✅ 합격 기준
+      `siem_ok` 출력 시 통과. **근거:** alerts.json 선두 + siem_ok 가 나오면 분산 로그가 Wazuh 에 중앙
+      수집되어 PCI-DSS 10 충족(준수) — 완전하려면 무결성·보존 1년+·NTP 동기화까지 보장돼야 한다.
+    hint: 'Wazuh'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) SIEM alerts.json 최근 1줄 앞부분 + siem_ok — 분산 로그가 Wazuh에 중앙 적재되는지 확인
+      ssh ccc@10.20.32.100 'tail -1 /var/ossec/logs/alerts/alerts.json | head -c 40; echo; echo siem_ok'
+      # 2) 해석 — 중앙 수집 = PCI-DSS 10 준수
+      # → 중앙 수집 = PCI 10 준수
+    answer_detail: "Wazuh(el34-siem) alerts.json 적재 = 분산 로그 중앙 수집 → PCI-DSS 10(감사 추적·중앙 수집) 준수(W06, 로깅). 변조 방지·통합 모니터링의 전제. 증적 = siem_ok + alerts.json 선두."
+    expected_output: |
+      {"timestamp":"2026-06-26T14:49:42.772+00
+      siem_ok
+      → 중앙 수집 = PCI 10 준수
+    verify:
+      type: output_contains
+      expect: 'siem_ok'
+      field: stdout
+      semantic:
+        intent: "로깅 점검"
+        success_criteria: ["중앙 수집"]
+        acceptable_methods: ["**[OSS] Wazuh (권장)**"]
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 ⑤ 구성평가 — SCA 자동 점검 (W09: SCA/CIS)
+      수백 항목을 손으로 점검하면 느리고 누락된다. **SCA(Security Configuration Assessment)** 는 CIS 같은
+      보안 설정 기준을 Wazuh 에이전트가 **항목별로 자동·정기 점검**해 pass/fail 점수와 알림을 내는
+      모듈이다 — W08 의 수동 기준선 감사를 자동·지속 체계로 확장한 것이다. 이 명령은 에이전트 설정
+      파일(`/var/ossec/etc/ossec.conf`)의 `<sca>` 블록을 읽어 SCA 모듈이 활성·정기 실행되는지 확인한다.
+      el34 는 `enabled yes` + `interval 12h` 로 설정돼 CIS 자동 구성평가가 12시간 주기로 돈다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) ossec.conf <sca> 블록 추출 — enabled yes + interval 12h(CIS 자동 점검 가동) 확인
+      grep -A2 '<sca>' /var/ossec/etc/ossec.conf | head -3
+      # 2) 해석 — SCA enabled = CIS 자동 점검 가동(준수)
+      # → SCA enabled = CIS 자동 점검 가동(준수)
+      ```
+      ## ✅ 합격 기준
+      `sca` 출력 시 통과. **근거:** `<sca>` 블록(enabled yes)이 나오면 SCA 모듈이 활성·정기 실행 중(준수) —
+      그 SCA 정책에 미션 2 ServerTokens 갭(CIS 8.1)이 있어 수동(미션 2)·자동(이 미션)이 같은 갭을 가리킨다.
+    hint: 'SCA enabled'
+    category: manipulation
+    points: 10
+    answer: |
+      # 1) ossec.conf <sca> 블록 추출 — enabled yes + interval 12h(CIS 자동 점검 가동) 확인
+      ssh ccc@10.20.32.80 "grep -A2 '<sca>' /var/ossec/etc/ossec.conf | head -3"
+      # 2) 해석 — SCA enabled = CIS 자동 점검 가동(준수)
+      # → SCA enabled = CIS 자동 점검 가동(준수)
+    answer_detail: "ossec.conf <sca> enabled yes(+interval 12h) = CIS 기준 자동 구성평가 가동 = 준수(W09, 구성평가). W08 수동 기준선 감사를 자동·지속으로 확장. SCA 정책에 미션 2 ServerTokens 갭(CIS 8.1)이 있어 수동·자동이 같은 갭을 가리킨다. 증적 = sca 토큰 출력."
+    expected_output: |
+      <sca>
+          <enabled>yes</enabled>
+          <scan_on_start>yes</scan_on_start>
+      → SCA enabled = CIS 자동 점검 가동(준수)
+    verify:
+      type: output_contains
+      expect: 'sca'
+      field: stdout
+      semantic:
+        intent: "구성평가 점검"
+        success_criteria: ["SCA 가동"]
+        acceptable_methods: ["**[OSS] ossec.conf (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 ⑥ 무결성 — FIM syscheck (W10: 변경관리·FIM)
+      중요 파일이 허가 없이 바뀌면 침해의 신호다. **FIM(File Integrity Monitoring)** 은 중요 파일의 모든
+      변경(추가·수정·삭제)을 감지해 알림을 내는 통제로, Wazuh 에서는 **syscheck** 모듈이 `/etc`·
+      `/usr/bin`·`/etc/apache2` 등 핵심 디렉토리를 실시간(realtime+whodata)으로 감시한다. 무단 변경(예:
+      웹셸 업로드, 설정 조작)이 나면 즉시 알림이 떠, 변경관리 기록과 결합하면 "기록 없는 변경 = 조사
+      대상"을 가려낸다. 이 명령은 SIEM(`el34-siem`)의 `alerts.json` 최근 구간에서 syscheck 알림 수를 세어
+      FIM 이 실제로 변경을 탐지·기록 중인지 확인한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) alerts.json 끝 8000줄에서 syscheck(FIM) 알림 수를 세어 fim_alerts= 로 출력
+      N=$(tail -8000 /var/ossec/logs/alerts/alerts.json | grep -c syscheck); echo "fim_alerts=$N"
+      # 2) 해석 — FIM 알림 다수 = 무결성 모니터링 가동(준수)
+      # → FIM 알림 다수 = 무결성 모니터링 가동(준수)
+      ```
+      ## ✅ 합격 기준
+      `fim_alerts=` 출력 시 통과. **근거:** fim_alerts=<다수>가 나오면 FIM 무결성 모니터링이 실제 동작 중
+      (준수) — 완전하려면 "알림 있음"을 넘어 변경관리 기록과 대조해 승인·무단 변경을 구분해야 한다.
+    hint: 'syscheck'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) alerts.json 끝 8000줄에서 syscheck(FIM) 알림 수를 세어 fim_alerts= 로 출력
+      ssh ccc@10.20.32.100 'N=$(tail -8000 /var/ossec/logs/alerts/alerts.json | grep -c syscheck); echo "fim_alerts=$N"'
+      # 2) 해석 — FIM 알림 다수 = 무결성 모니터링 가동(준수)
+      # → FIM 알림 다수 = 무결성 모니터링 가동(준수)
+    answer_detail: "alerts.json 의 syscheck(FIM) 알림 다수 = 무결성 모니터링 가동 = 준수(W10, 무결성). 핵심 디렉토리 실시간 감시로 무단 변경을 탐지·기록. 변경관리 기록과 대조해 승인·무단 변경을 구분해야 의미가 완성. 증적 = fim_alerts= 수."
+    expected_output: |
+      fim_alerts=32
+      → FIM 알림 다수 = 무결성 모니터링 가동(준수)
+    verify:
+      type: output_contains
+      expect: 'fim_alerts='
+      field: stdout
+      semantic:
+        intent: "무결성 점검"
+        success_criteria: ["FIM 가동"]
+        acceptable_methods: ["**[OSS] alerts.json (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 ⑦ 취약점 — nuclei 스캔 (W07: 취약점 관리, PCI-DSS 11.3)
+      취약점은 매일 새로 생긴다. 한 번이 아니라 **정기 스캔**으로 식별·재검증하는 순환(식별→평가→조치
+      →재검증)이 컴플라이언스의 요구이며, **PCI-DSS 11.3 은 분기별·변경 후 스캔**을 의무화한다.
+      `nuclei` 는 템플릿(`.yaml`) 기반 취약점 스캐너로, 여기서는 보안 헤더 누락 템플릿을 표적에 던진다.
+      **보안 헤더**(`X-Frame-Options`·`Content-Security-Policy` 등)는 브라우저에 보안 동작을 지시하는 응답
+      헤더로, 누락 시 클릭재킹·XSS 방어가 약해진다. 명령은 발견을 임시 파일에 모아(`tee`) 줄 수를 세어
+      `findings=<n>` 으로 보고한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) nuclei 보안헤더 누락 템플릿을 juice에 던져 발견을 tee로 모으고 findings= 수 출력 후 임시파일 삭제
+      nuclei -u http://juice.el34.lab -t /root/nuclei-templates/http/misconfiguration/http-missing-security-headers.yaml -silent -nc | tee /tmp/cp15.txt | head -3; echo findings=$(wc -l < /tmp/cp15.txt); rm -f /tmp/cp15.txt
+      # 2) 해석 — 보안 헤더 누락 등 발견(갭). 정기 스캔의 한 회차(PCI-DSS 11.3)
+      # → 보안 헤더 누락 등 발견(갭)
+      ```
+      ## ✅ 합격 기준
+      `findings=` 출력 시 통과. **근거:** findings=<수>가 나오면 정기 스캔 한 회차로 보안 헤더 누락 등을
+      식별한 것(갭) — 패치 우선순위의 근거이며 브라우저 방어 약화라 시정 로드맵 후순위(④)로 본다.
+    hint: 'nuclei'
+    category: manipulation
+    points: 10
+    answer: |
+      # 1) nuclei 보안헤더 누락 템플릿을 juice에 던져 발견을 tee로 모으고 findings= 수 출력 후 임시파일 삭제
+      ssh att@192.168.0.202 'nuclei -u http://juice.el34.lab -t /root/nuclei-templates/http/misconfiguration/http-missing-security-headers.yaml -silent -nc | tee /tmp/cp15.txt | head -3; echo findings=$(wc -l < /tmp/cp15.txt); rm -f /tmp/cp15.txt'
+      # 2) 해석 — 보안 헤더 누락 등 발견(갭). 정기 스캔의 한 회차(PCI-DSS 11.3)
+      # → 보안 헤더 누락 등 발견(갭)
+    answer_detail: "nuclei 스캔 = 정기 취약점 식별(W07, 취약점 관리, PCI-DSS 11.3). 보안 헤더 누락 등을 발견(갭). 취약점 관리 순환의 '식별' 단계로 추세 관리·패치 우선순위 근거. 브라우저 방어 약화라 시정 로드맵 후순위(④). 증적 = findings= 수."
+    expected_output: |
+      [http-missing-security-headers:cross-origin-embedder-policy] [http] [info] http://juice.el34.lab
+      [http-missing-security-headers:cross-origin-opener-policy] [http] [info] http://juice.el34.lab
+      [http-missing-security-headers:cross-origin-resource-policy] [http] [info] http://juice.el34.lab
+      findings=8
+      → 보안 헤더 누락 등 발견(갭)
+    verify:
+      type: output_contains
+      expect: 'findings='
+      field: stdout
+      semantic:
+        intent: "취약점 점검"
+        success_criteria: ["스캔"]
+        acceptable_methods: ["**[OSS] nuclei (권장)**"]
+    target_vm: web
+
+  - order: 9
+    instruction: |
+      ## 🎯 ⑧ 개인정보 — Feedbacks PII 노출 (W12: 데이터 보호)
+      종합 감사의 마지막이자 가장 무거운 영역이다. **PII(Personally Identifiable Information)** 는
+      이메일·식별자·연락처처럼 개인을 식별할 수 있는 정보로, 개인정보보호법·GDPR 은 PII 를 최소 수집·목적
+      제한·안전성 확보하도록 의무화하며 무인증 노출은 명백한 위반이다. 이 명령은 juiceshop 의
+      `/api/Feedbacks` API 를 무인증으로 호출(`el34-attacker` → fw 게이트웨이)해, 응답에 이메일
+      조각(`@도메인`)·UserId 같은 PII 가 노출되는지 점검한다. 부분 마스킹(`***in@도메인`)이 있어도
+      UserId+도메인을 결합하면 재식별될 수 있어 부분 마스킹만으로는 불충분하다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) /api/Feedbacks 무인증 호출 → 이메일 조각(@도메인) 1개 + pii_check — 무인증 PII 노출 확인
+      echo -en "GET /api/Feedbacks HTTP/1.0\r\nHost: juice.el34.lab\r\nConnection: close\r\n\r\n" | nc -w3 192.168.0.161 80 | grep -oE '@[a-zA-Z0-9.-]+' | head -1; echo pii_check  # nc-ok: 컴플라이언스 PII 노출 점검(공개 API 응답 JSON 검사)
+      # 2) 해석 — 무인증 이메일/UserId 노출 = 개인정보 보호 갭(최우선 시정)
+      # → 무인증 이메일/UserId 노출 = 개인정보 보호 갭
+      ```
+      ## ✅ 합격 기준
+      `pii_check` 출력 시 통과. **근거:** @도메인 조각 + pii_check 가 나오면 /api/Feedbacks 무인증 200 으로
+      PII(이메일·UserId)를 노출하는 갭 — 즉시 유출·과징금 직결이라 시정 로드맵 최우선(①)이다(시정 = API
+      인증 + 응답 최소화 + 비식별).
+    hint: '이메일 노출'
+    category: manipulation
+    points: 10
+    answer: |
+      # 1) /api/Feedbacks 무인증 호출 → 이메일 조각(@도메인) 1개 + pii_check — 무인증 PII 노출 확인
+      ssh att@192.168.0.202 "echo -en 'GET /api/Feedbacks HTTP/1.0\r\nHost: juice.el34.lab\r\nConnection: close\r\n\r\n' | nc -w3 192.168.0.161 80 | grep -oE '@[a-zA-Z0-9.-]+' | head -1; echo pii_check"  # nc-ok: 컴플라이언스 PII 노출 점검(공개 API 응답 JSON 검사)
+      # 2) 해석 — 무인증 이메일/UserId 노출 = 개인정보 보호 갭(최우선 시정)
+      # → 무인증 이메일/UserId 노출 = 개인정보 보호 갭
+    answer_detail: "Feedbacks 무인증 200 PII(이메일·UserId) 노출 = 개인정보 보호 갭(W12, 데이터 보호, 개인정보보호법 위반). 즉시 유출·과징금 직결이라 시정 로드맵 최우선(①), 시정 = API 인증+응답 최소화+비식별. 부분 마스킹도 UserId+도메인 결합 재식별 가능. 증적 = pii_check + @도메인 조각."
+    expected_output: |
+      @juice-sh.op
+      pii_check
+      → 무인증 이메일/UserId 노출 = 개인정보 보호 갭
+    verify:
+      type: output_contains
+      expect: 'pii_check'
+      field: stdout
+      semantic:
+        intent: "개인정보 점검"
+        success_criteria: ["노출 갭"]
+        acceptable_methods: ["**[OSS] API (권장)**"]
+    target_vm: web
+
+  - order: 10
+    instruction: |
+      ## 🎯 종합 감사 보고서 (준수율 + 갭 + 시정 로드맵 — 수료의 마무리)
+      감사의 산출물은 보고서다. 미션 1–9 의 여덟 영역 판정을 한 문서로 종합해야 종합 감사가 완성된다.
+      갭만 나열하지 말고 **준수도 함께** 제시해(준수: TLSv1.3·Wazuh 중앙수집·SCA·FIM·root 로그인 차단 /
+      갭: ServerTokens·암호 만료·자체서명 인증서·보안 헤더·PII 노출) 의뢰인이 현재 보안 수준의 전체
+      그림(준수율)을 보게 한다. 준수율은 전체 점검 항목 중 준수 비율을 한 숫자로 요약하고, 갭은 **위험
+      기반 우선순위**로 정렬한다 — ①PII 무인증 노출(개인정보 즉시 유출·과징금) → ②암호 만료(유출 자격
+      무기한 악용) → ③자체서명 인증서(전송 신뢰) → ④ServerTokens Prod + 보안 헤더(정보노출·브라우저
+      방어). 각 항목은 "기준 → 현재 → 판정 → 증적 → 권고"로 적어 재현 가능하게 한다.
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) heredoc(<<'EOF' ... EOF)으로 종합 감사 보고서 출력 — 준수율→갭 목록→위험 기반 시정 로드맵→결론
+      cat > ~/compliance_w15_note1.md <<'EOF'
+      # 컴플라이언스 W15 종합 감사 보고서
+      ## 1. 준수율: 준수(암호화 TLS, 로깅 Wazuh, SCA, FIM, root 로그인 차단, 파일권한) / 갭(ServerTokens, 암호 만료, 자체서명 인증서, 보안헤더, PII 노출)
+      ##   → 8개 핵심 영역 중 준수 다수, 갭 5건
+      ## 2. 갭 목록:
+      ##   - [High] PII 무인증 노출(Feedbacks) — 개인정보보호법
+      ##   - [High] 암호 만료 없음(PASS_MAX_DAYS) — PCI 8.3.9
+      ##   - [Medium] 자체서명 인증서 — PCI 4
+      ##   - [Medium] ServerTokens OS / 보안 헤더 누락 — CIS
+      ## 3. 시정 로드맵: ①PII 접근통제(즉시) ②암호 만료 90일 ③CA 인증서 ④ServerTokens Prod+헤더
+      ## 결론: 탐지/암호화/로깅 기반은 견고. 개인정보 노출·암호 만료가 최우선 시정. 위험 기반 로드맵으로 단계 개선
+      EOF
+      cat ~/compliance_w15_note1.md
+      ```
+      ## ✅ 합격 기준
+      `시정` 출력 시 통과. **근거:** 준수율(준수/전체) + 갭 목록 + 위험 기반 시정 로드맵(우선순위)과
+      결론(강점·최우선 시정)이 모두 나오면 통과 — 우선순위에는 근거(위험도)가 붙어야 한다(선언이 아닌 종합).
+    hint: '준수율+갭+로드맵'
+    category: report
+    points: 12
+    answer: |
+      cat > ~/compliance_w15_note2.md <<'EOF'
+      # 컴플라이언스 W15 종합 감사 보고서
+      ## 1. 준수율: 준수(암호화 TLS, 로깅 Wazuh, SCA, FIM, root 로그인 차단, 파일권한) / 갭(ServerTokens, 암호 만료, 자체서명 인증서, 보안헤더, PII 노출)
+      ##   → 8개 핵심 영역 중 준수 다수, 갭 5건
+      ## 2. 갭 목록:
+      ##   - [High] PII 무인증 노출(Feedbacks) — 개인정보보호법
+      ##   - [High] 암호 만료 없음(PASS_MAX_DAYS) — PCI 8.3.9
+      ##   - [Medium] 자체서명 인증서 — PCI 4
+      ##   - [Medium] ServerTokens OS / 보안 헤더 누락 — CIS
+      ## 3. 시정 로드맵: ①PII 접근통제(즉시) ②암호 만료 90일 ③CA 인증서 ④ServerTokens Prod+헤더
+      ## 결론: 탐지/암호화/로깅 기반은 견고. 개인정보 노출·암호 만료가 최우선 시정. 위험 기반 로드맵으로 단계 개선
+      EOF
+      cat ~/compliance_w15_note2.md
+    answer_detail: "종합 컴플라이언스 감사 보고서 = 준수율(준수: TLSv1.3·Wazuh·SCA·FIM·root 차단 / 갭 5건) + 갭 목록(PII·암호만료·자체서명 인증서·ServerTokens·보안 헤더) + 위험 기반 시정 로드맵(①PII →②암호만료 →③인증서 →④ServerTokens/헤더) + 결론(강점·최우선 시정). 미션 1–9 여덟 영역(W01·W04·W05·W06·W09·W10·W07·W12)을 한 문서로 통합한 한 학기 수료 산출물 — 경영진·인증 심사 제출용·차기 감사 비교 기준선."
+    expected_output: |
+      # 컴플라이언스 W15 종합 감사 보고서
+      ## 1. 준수율: 준수(암호화 TLS, 로깅 Wazuh, SCA, FIM, root 로그인 차단, 파일권한) / 갭(ServerTokens, 암호 만료, 자체서명 인증서, 보안헤더, PII 노출)
+      ##   → 8개 핵심 영역 중 준수 다수, 갭 5건
+      ## 2. 갭 목록:
+      ##   - [High] PII 무인증 노출(Feedbacks) — 개인정보보호법
+      ##   - [High] 암호 만료 없음(PASS_MAX_DAYS) — PCI 8.3.9
+      ##   - [Medium] 자체서명 인증서 — PCI 4
+      ##   - [Medium] ServerTokens OS / 보안 헤더 누락 — CIS
+      ## 3. 시정 로드맵: ①PII 접근통제(즉시) ②암호 만료 90일 ③CA 인증서 ④ServerTokens Prod+헤더
+      ## 결론: 탐지/암호화/로깅 기반은 견고. 개인정보 노출·암호 만료가 최우선 시정. 위험 기반 로드맵으로 단계 개선
+    verify:
+      type: output_contains
+      expect: '시정'
+      field: stdout
+      semantic:
+        intent: "종합 감사 보고"
+        success_criteria: ["준수율/갭/로드맵"]
+        acceptable_methods: ["**[관리적] 보고서 (권장)**"]
+    target_vm: web

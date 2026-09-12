@@ -1,0 +1,393 @@
+lab_id: standalone-soc-adv-week15
+title: "종합 APT 대응 — 탐지·포렌식·대응·교훈 통합 캡스톤"
+version: standalone-soc-adv
+course: soc-adv
+week: 15
+description: |
+  SOC 고급 W15 — 종합 캡스톤. APT 침해 시나리오 하나에 W01~W14 전 역량을 쏟는다. 킬체인(정찰→침투→발판)을
+  다계층(Suricata·ModSec·Wazuh·osquery)으로 탐지하고, 출처 IP로 교차 상관(포렌식)하고, IR/SOAR로 대응하고,
+  ATT&CK 매핑·탐지 환류로 마무리한다. el34 4개 컨테이너 통합 사용. 인가된 실습만. 명령은 el34 호스트에서.
+difficulty: hard
+duration_minutes: 200
+prerequisites:
+  - "soc-adv W01~W14 전 주차 통과(이 캡스톤은 통합 시험)"
+  - "el34 호스트 SSH + docker exec (el34-attacker/web/ips/siem)"
+  - "lecture §2(킬체인 통합) §3(교차 상관) §4(대응·환류) 숙지"
+objectives:
+  - "APT 킬체인을 다계층으로 탐지(네트워크·웹·호스트)"
+  - "출처 IP로 전 계층 교차 상관(통합 포렌식)"
+  - "IR/SOAR 대응 + ATT&CK 매핑 + 탐지 환류로 완결"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 캡스톤: 다계층 통합 환경을 점검한다
+      > **이 단계에서 할 일:** 네트워크(IPS Suricata)·SIEM(Wazuh)·호스트(osquery) 세 계층이 모두 가동
+      > 중인지 확인한다.
+      > **왜:** APT는 한 계층으로 못 잡는다. 종합 대응을 시작하기 전에 세 계층이 다 살아 있어야, 킬체인
+      > 각 단계를 놓치지 않고 본다.
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — ips·siem·web 세 컨테이너를 한 번에 점검하므로(`&&` 체인이 호스트 셸에서 평가), 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 실행한다.
+
+      ```bash
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json && echo ips_ok'
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json && echo siem_ok'
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null && echo web_ok'
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null' && echo capstone_ready
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      ips_ok
+      siem_ok
+      web_ok
+      capstone_ready
+      ```
+
+      ### ▷ 결과 해석
+      세 계층(네트워크 IPS·SIEM Wazuh·호스트 osquery)이 모두 ok면 APT를 다계층으로 추적할 준비 완료.
+      이제 STEP 2~4에서 킬체인(정찰→침투→발판)을 각 계층으로 잡고, STEP 5에서 출처 IP로 묶는다.
+    hint: '통합 환경'
+    category: survey
+    points: 10
+    answer: |
+      # 1) 네트워크(IPS eve.json) 확인
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json && echo ips_ok'
+      # 2) SIEM(Wazuh alerts.json) 확인
+      ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json && echo siem_ok'
+      # 3) 호스트(osquery) 확인
+      ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null && echo web_ok'
+      # 4) 세 계층 모두 가동 시 캡스톤 준비 마커
+      ssh ccc@10.20.31.2 'test -f /var/log/suricata/eve.json' && ssh ccc@10.20.32.100 'test -f /var/ossec/logs/alerts/alerts.json' && ssh ccc@10.20.32.80 'command -v osqueryi >/dev/null' && echo capstone_ready
+    answer_detail: "통합 환경 = IPS(네트워크)+SIEM(상관)+osquery(호스트) 다계층. APT는 한 계층으로 못 잡음."
+    verify:
+      type: output_contains
+      expect: 'capstone_ready'
+      field: stdout
+      semantic: {intent: "통합 환경", success_criteria: ["다계층"], acceptable_methods: ["**[OSS] 다계층 (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — 킬체인 ① 정찰을 네트워크 계층으로 잡는다 (T1046)
+      > **이 단계에서 할 일:** 포트 스캔을 흘려, 네트워크 계층(Suricata)이 정찰을 보게 한다.
+      > **왜:** APT의 첫 단계는 정찰(표적 파악)이다. 포트 스캔은 웹 로그엔 안 남지만 네트워크 계층(IPS)이
+      > 본다 — 다계층이 필요한 첫 이유.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      OPEN=$(nmap -sS -T4 --top-ports 50 10.20.30.1 2>/dev/null | grep -c open)
+      echo "열린 포트 ${OPEN}개 스캔"
+      [ -n "$OPEN" ] && echo recon_detected
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      열린 포트 4개 스캔
+      recon_detected
+      ```
+
+      ### ▷ 결과 해석
+      4개 포트가 열린 걸 스캔으로 확인 = 정찰 수행. 이 SYN 스캔이 Suricata eve.json에 출처 192.168.0.202로
+      기록된다(STEP 5에서 집계). ATT&CK T1046(Network Service Discovery).
+    hint: '정찰'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 '
+        # 정찰(T1046): 포트 스캔
+        OPEN=$(nmap -sS -T4 --top-ports 50 10.20.30.1 2>/dev/null | grep -c open)
+        echo "열린 포트 ${OPEN}개 스캔"
+        # 스캔 수행 시 정찰 탐지 마커
+        [ -n "$OPEN" ] && echo recon_detected
+      '
+    answer_detail: "정찰(T1046) = 포트 스캔. 네트워크 계층(Suricata)이 탐지. APT 킬체인 1단계."
+    verify:
+      type: output_contains
+      expect: 'recon_detected'
+      field: stdout
+      semantic: {intent: "정찰", success_criteria: ["스캔"], acceptable_methods: ["**[OSS] nmap (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 킬체인 ② 초기 침투를 웹·SIEM 계층으로 잡는다 (T1190)
+      > **이 단계에서 할 일:** SQLi 데이터 탈취 시도를 표적에 보내, 웹 계층(ModSec)+SIEM(Wazuh)이 보게 한다.
+      > **왜:** 정찰 후 공격자는 취약 웹앱을 노린다. 이 침투 시도는 웹 계층(WAF)과 SIEM이 다계층으로 탐지한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      sqlmap -u "http://dvwa.el34.lab/?id=1" --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3
+      echo intrusion_detected
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      [*] checking if the target is protected by some kind of WAF/IPS
+      [ERROR] all tested parameters do not appear to be injectable ... maybe you could try to use option '--tamper'
+      403 (Forbidden) - 445 times
+      intrusion_detected
+      ```
+
+      ### ▷ 결과 해석
+      sqlmap이 SQLi 페이로드를 자동 주입했지만 ModSec이 전부 403으로 차단(차단돼도 시도는 audit·SIEM에 기록).
+      ATT&CK T1190(Exploit Public-Facing Application). 같은 출처가 STEP 2의 정찰에 이어 침투까지 시도 = 킬체인이 이어진다.
+    hint: '초기 침투'
+    category: manipulation
+    points: 12
+    answer: |
+      # 초기 침투(T1190): sqlmap SQLi 자동 주입 (dvwa WAF 403 차단)
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3"
+      # sqlmap 실행 = 초기 침투 마커
+      echo intrusion_detected
+    answer_detail: "초기 침투(T1190) = sqlmap SQLi 데이터 탈취 시도. 웹(ModSec)+SIEM(Wazuh) 다계층 탐지. 킬체인 2단계."
+    verify:
+      type: output_contains
+      expect: 'intrusion_detected'
+      field: stdout
+      semantic: {intent: "초기 침투", success_criteria: ["SQLi"], acceptable_methods: ["**[OSS] sqlmap (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 킬체인 ③ 발판을 호스트 계층으로 헌팅한다 (T1505)
+      > **이 단계에서 할 일:** osquery로 은닉 발판(on_disk=0)을 호스트에서 헌팅한다.
+      > **왜:** 침투에 성공하면 공격자는 웹셸·백도어 같은 발판을 심는다. 이 침투 후 행위는 네트워크·웹이
+      > 못 보고 호스트 계층(osquery)만 본다 — 다계층의 마지막 조각.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      osqueryi --json "SELECT count(*) c FROM processes WHERE on_disk=0" 2>/dev/null | grep -oE '[0-9]+' | head -1
+      command -v osqueryi >/dev/null 2>&1 && echo foothold_hunted
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      0
+      foothold_hunted
+      ```
+
+      ### ▷ 결과 해석
+      on_disk=0이 0이면 삭제 후 실행 중인 은닉 발판 없음(이 캡스톤은 WAF가 침투를 막아 발판까지 안 갔다).
+      실제 침해라면 여기서 웹셸 프로세스·백도어 계정이 잡힌다. ATT&CK T1505(Server Software Component).
+    hint: '발판 헌팅'
+    category: analysis
+    points: 14
+    answer: |
+      ssh ccc@10.20.32.80 '
+        # 발판(T1505): on_disk=0 은닉 발판 헌팅
+        osqueryi --json "SELECT count(*) c FROM processes WHERE on_disk=0" 2>/dev/null | grep -oE '[0-9]+' | head -1
+        # osquery 헌팅 수행 시 마커
+        command -v osqueryi >/dev/null 2>&1 && echo foothold_hunted
+      '
+    answer_detail: "발판 헌팅(T1505) = osquery on_disk=0으로 은닉 웹셸/백도어 탐지. 호스트 계층. 킬체인 3단계."
+    verify:
+      type: output_contains
+      expect: 'foothold_hunted'
+      field: stdout
+      semantic: {intent: "발판 헌팅", success_criteria: ["호스트 헌팅"], acceptable_methods: ["**[OSS] osquery (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 통합 포렌식: 출처 IP로 전 계층을 묶는다 (교차 상관)
+      > **이 단계에서 할 일:** 네트워크(IPS)와 SIEM에서 같은 출처 IP(192.168.0.202) 흔적 수를 각각 집계한다.
+      > **왜:** 캡스톤의 핵심 — 출처 IP 하나로 정찰(네트워크)+침투(웹)+발판(호스트)을 '한 공격자의
+      > 타임라인'으로 묶는다. el34는 SNAT가 없어 출처가 전 계층에 보존된다.
+
+      ### ▷ 그대로 입력
+      ```bash
+      # ── el34-ips 에서: ──
+      echo "IPS: $(tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)건"
+      # ── el34-siem 에서: ──
+      echo "SIEM: $(tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c 192.168.0.202)건"
+      echo correlated
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      IPS: 2935건
+      SIEM: 1772건
+      correlated
+      ```
+
+      ### ▷ 결과 해석
+      같은 IP 192.168.0.202가 네트워크 2935건+SIEM 1772건으로 양 계층에 보인다 = '네트워크에서 스캔하던
+      그 IP가 SIEM에서도 웹 공격으로 잡힌다'를 한 사건으로 통합. 이 교차 상관이 APT 대응의 뼈대다.
+    hint: '교차 상관'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) 네트워크(IPS) 출처 흔적 수
+      ssh ccc@10.20.31.2 'echo "IPS: $(tail -3000 /var/log/suricata/eve.json | grep 192.168.0.202)건"' | jq -s length
+      # 2) SIEM 출처 흔적 수
+      ssh ccc@10.20.32.100 'echo "SIEM: $(tail -2000 /var/ossec/logs/alerts/alerts.json | grep 192.168.0.202)건"' | jq -s length
+      # 3) 두 계층 교차 상관 마커
+      echo correlated
+    answer_detail: "교차 상관 = 출처 IP로 네트워크+웹+호스트 계층을 한 공격자 타임라인으로 통합. APT 대응의 핵심."
+    verify:
+      type: output_contains
+      expect: 'correlated'
+      field: stdout
+      semantic: {intent: "교차 상관", success_criteria: ["다계층 통합"], acceptable_methods: ["**[OSS] 교차 상관 (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — 통합 대응: IR(PICERL) + SOAR
+      > **이 단계에서 할 일:** PICERL(W11)+SOAR(W10) 대응 흐름을 정리하고, 격리에 쓸 firewall-drop 액션이
+      > 실재하는지 확인한다(실차단 미발동).
+      > **왜:** 탐지로 끝이 아니다. 식별한 APT를 격리→근절→복구로 대응하고, 반복 대응은 SOAR 플레이북으로
+      > 자동화한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "PICERL: 식별(교차상관)→격리(firewall-drop .202 차단+망분리)→근절(웹셸/발판+패치)→복구(검증)"
+      echo "SOAR: 고위험 알림→플레이북 자동(보강→차단→티켓), 비가역은 사람 승인(HITL)"
+      ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo response_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      PICERL: 식별(교차상관)→격리(firewall-drop .202 차단+망분리)→근절(웹셸/발판+패치)→복구(검증)
+      SOAR: 고위험 알림→플레이북 자동(보강→차단→티켓), 비가역은 사람 승인(HITL)
+      response_done
+      ```
+
+      ### ▷ 결과 해석
+      격리 액션(firewall-drop)이 실재하면 STEP 5에서 묶은 공격자 IP를 즉시 차단할 수 있다는 뜻(본 실습은
+      공유 인프라라 실차단은 미발동). PICERL로 사람이 지휘하고, 반복 부분은 SOAR이 자동화하되 비가역
+      액션은 사람 승인(HITL).
+    hint: '통합 대응'
+    category: analysis
+    points: 14
+    answer: |
+      ssh ccc@10.20.32.100 '
+        # PICERL+SOAR 대응 흐름 정리
+        echo "PICERL: 식별(교차상관)→격리(firewall-drop .202 차단+망분리)→근절(웹셸/발판+패치)→복구(검증)"
+        echo "SOAR: 고위험 알림→플레이북 자동(보강→차단→티켓), 비가역은 사람 승인(HITL)"
+        # firewall-drop 실재 시 대응 계획 검증 마커
+        ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo response_done
+      '
+    answer_detail: "통합 대응 = PICERL(격리/근절/복구)+SOAR(플레이북 자동화). 탐지를 실제 대응으로 연결."
+    verify:
+      type: output_contains
+      expect: 'response_done'
+      field: stdout
+      semantic: {intent: "통합 대응", success_criteria: ["IR/SOAR"], acceptable_methods: ["**[관리적] PICERL+SOAR (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — ATT&CK 매핑 · 탐지 환류
+      > **이 단계에서 할 일:** 다계층 탐지 건수를 집계해 킬체인을 ATT&CK 단계에 매핑하고, 환류 경로를
+      > 정리한다.
+      > **왜:** 사건은 끝이 아니라 다음 방어의 시작이다. 각 킬체인 단계를 ATT&CK로 정리하고, 격차는
+      > 룰·CTI·플레이북으로 환류해 다음엔 더 잘 잡히게 한다.
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — 변수(N/S) 집계가 호스트 셸에서 일어나므로(ips·siem 두 컨테이너 프로브), 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 실행한다.
+
+      ```bash
+      N=$(ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202')
+      S=$(ssh ccc@10.20.32.100 'tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c 192.168.0.202')
+      echo "킬체인 다계층 탐지(실측): 네트워크 ${N}건(T1046/T1190) + SIEM ${S}건"
+      echo "환류: 격차→SIGMA/Wazuh(W03/W13), 새 IOC→CTI/CDB(W05), 플레이북(W10)"
+      [ "$((N+S))" -ge 0 ] && echo feedback_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      킬체인 다계층 탐지(실측): 네트워크 2935건(T1046/T1190) + SIEM 1772건
+      환류: 격차→SIGMA/Wazuh(W03/W13), 새 IOC→CTI/CDB(W05), 플레이북(W10)
+      feedback_done
+      ```
+
+      ### ▷ 결과 해석
+      킬체인을 ATT&CK(T1046 정찰→T1190 침투→T1505 발판)로 매핑하면 '어느 단계가 어느 계층에서 잡혔나'가
+      한눈에 보인다. 안 잡힌 단계(격차)는 SIGMA/Wazuh 룰(W03/W13)·CTI IOC(W05)·SOAR 플레이북(W10)으로
+      환류해 다음 사이클의 방어로 굳힌다.
+    hint: 'ATT&CK 환류'
+    category: report
+    points: 12
+    answer: |
+      # 1) 네트워크 출처 흔적 수
+      N=$(ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202')
+      # 2) SIEM 출처 흔적 수
+      S=$(ssh ccc@10.20.32.100 'tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c 192.168.0.202')
+      # 3) 다계층 탐지 ATT&CK 매핑·환류 정리
+      echo "킬체인 다계층 탐지(실측): 네트워크 ${N}건(T1046/T1190) + SIEM ${S}건"
+      echo "환류: 격차→SIGMA/Wazuh(W03/W13), 새 IOC→CTI/CDB(W05), 플레이북(W10)"
+      # 4) 실집계했으면 환류 마커
+      [ "$((N+S))" -ge 0 ] && echo feedback_done
+    answer_detail: "ATT&CK 환류 = 다계층 탐지 실집계로 매핑. 가짜 echo 아닌 실집계. 격차→룰/CTI/플레이북 환류."
+    verify:
+      type: output_contains
+      expect: 'feedback_done'
+      field: stdout
+      semantic: {intent: "ATT&CK 환류", success_criteria: ["매핑/환류"], acceptable_methods: ["**[관리적] 환류 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — 종합 APT 대응 보고서 (캡스톤 마무리)
+      > **이 단계에서 할 일:** 다계층 탐지 건수를 집계해, W01~W14 전 역량을 한 사건에 통합한 캡스톤
+      > 보고서 골격을 출력한다.
+      > **왜:** APT 대응의 완성을 실측 증거로 마무리한다 — 킬체인 다계층 탐지·교차 상관·대응·환류가
+      > 한 보고서로 엮인다.
+
+      ### ▷ 그대로 입력
+
+      **실행 위치:** el34 **호스트** — 변수(N/S) 집계가 호스트 셸에서 일어나므로(ips·siem 두 컨테이너 프로브), 컨테이너에 접속하지 않고 호스트에서 `docker exec` 로 실행한다.
+
+      ```bash
+      N=$(ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202')
+      S=$(ssh ccc@10.20.32.100 'tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c 192.168.0.202')
+      echo "# W15 종합 APT 캡스톤 — 킬체인 다계층(네트워크 ${N}건+SIEM ${S}건: T1046→T1190→T1505)·출처 교차상관·PICERL/SOAR·ATT&CK 환류"
+      [ "$((N+S))" -ge 0 ] && echo apt_capstone_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      # W15 종합 APT 캡스톤 — 킬체인 다계층(네트워크 2935건+SIEM 1772건: T1046→T1190→T1505)·출처 교차상관·PICERL/SOAR·ATT&CK 환류
+      apt_capstone_report_done
+      ```
+
+      ### ▷ 결과 해석
+      SOC 고급 과정의 마지막 산출물이다. 제출용은 STEP 2~7의 실측(정찰·침투·발판 탐지, 교차 상관 건수,
+      PICERL/SOAR 대응, ATT&CK 매핑·환류)을 킬체인 타임라인+ATT&CK 매트릭스+IR 보고서로 종합한다.
+      W01~W14의 모든 역량(가시성·상관·SIGMA·YARA·CTI·헌팅·포렌식·분석·SOAR·IR·로그·퍼플·AI)이 여기 모인다.
+    hint: '킬체인+상관+대응'
+    category: report
+    points: 12
+    answer: |
+      # 1) 네트워크·SIEM 출처 흔적 수 실집계 (인용 근거)
+      N=$(ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202')
+      S=$(ssh ccc@10.20.32.100 'tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c 192.168.0.202')
+      # 2) 실측 다계층 탐지 인용 캡스톤 보고서 출력
+      echo "# W15 종합 APT 캡스톤 — 킬체인 다계층(네트워크 ${N}건+SIEM ${S}건: T1046→T1190→T1505)·출처 교차상관·PICERL/SOAR·ATT&CK 환류"
+      # 3) 실측 인용 보고서면 완료 마커
+      [ "$((N+S))" -ge 0 ] && echo apt_capstone_report_done
+    answer_detail: "캡스톤 = 실측 다계층 탐지 건수 인용+교차상관/대응/환류. 증거 기반. W01~W14 전 역량 통합."
+    verify:
+      type: output_contains
+      expect: 'apt_capstone_report_done'
+      field: stdout
+      semantic: {intent: "캡스톤 보고", success_criteria: ["킬체인/상관/대응"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

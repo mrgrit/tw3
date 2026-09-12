@@ -1,0 +1,450 @@
+lab_id: standalone-attack-week09
+title: "scapy 패킷 크래프팅·비정상 스캔 vs 패킷 분석·네트워크 탐지룰"
+version: standalone-attack
+course: attack
+week: 9
+description: |
+  완성 도구(nmap)를 넘어 scapy로 TCP 패킷을 한 필드씩 직접 조립한다. SYN 을 보내 응답 플래그
+  (SYN-ACK 0x12=open / RST 0x14=closed)로 포트 상태를 판정하고, 표준이 아닌 비정상 스캔
+  (FIN/XMAS/NULL)으로 일부 stateless 필터·스택을 우회하려 시도한다. 이어 방어자 시선으로
+  돌아서서, 대규모 스캔(100+ 포트)이 Suricata 의 임계 기반 탐지에 걸리는 것과, 정상 트래픽에
+  결코 없는 NULL 패킷(flags:0)을 시그니처 룰로 잡는 것을 직접 확인한다. 마지막으로 은밀(소량·
+  저속) ↔ 탐지(대량·고속)의 trade-off 를 정리한다. 공격은 외부 공격자 VM 192.168.0.202(att/1, scapy 2.4.4,
+  raw socket 은 sudo 로 사용), 방어는 el34-ips 의 Suricata. 작성한 IDS 룰은 sid(9409xxx)로 self-clean 해
+  베이스 룰을 보존한다. 공격은 `ssh att@192.168.0.202`(비번 1)로 접속해 대상 192.168.0.161에 수행하고,
+  IDS 흔적 확인은 IPS 장비 `ssh ccc@10.20.31.2`(비번 1)에서 한다.
+difficulty: hard
+duration_minutes: 180
+prerequisites:
+  - "W01–W08 통과"
+  - "공격 VM ssh att@192.168.0.202 + IPS 장비 ssh ccc@10.20.31.2 (비번 1)"
+  - "lecture §2(scapy) §3(비정상 스캔) §4(탐지) 숙지"
+objectives:
+  - "패킷 크래프팅의 개념을 이해하고 scapy 로 IP()/TCP() 패킷을 한 필드씩 조립·전송한다"
+  - "scapy SYN 스캔으로 응답 플래그(0x12=open)를 읽어 open 포트를 식별한다"
+  - "비정상 스캔(FIN/XMAS/NULL)을 수행하고 그 우회 원리와 탐지 취약성을 설명한다"
+  - "임계 기반 탐지를 이해하고 대규모 스캔(100+ 포트)이 Suricata 에 잡히는 것을 증거로 보인다"
+  - "NULL 스캔(flags:0)을 잡는 시그니처 룰(sid 9409001)을 작성·검증·트리거·삭제한다"
+  - "은밀(소량·저속) vs 탐지(대량·고속)의 trade-off 를 정리하고 보고서로 종합한다"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표
+      패킷 크래프팅 도구 scapy 가 외부 공격자 VM 192.168.0.202에서 동작하는지 점검한다. 모든 패킷 작업의
+      출발점이다.
+
+      ## 개념 한 줄
+      **scapy** = 파이썬으로 패킷을 한 필드씩 조립·전송·분석하는 라이브러리. 패킷을 보내려면
+      OS 의 **raw socket**(낮은 계층 패킷을 직접 다루는 root 권한)이 필요한데, 공격 VM 192.168.0.202에서 sudo 로 실행한다. (hping3 도 있으나 본 실습은 필드별 조립을 배우려 scapy 를
+      쓴다.)
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 패킷 크래프팅 도구 scapy 동작 확인(버전) — raw socket은 root라 가능
+      python3 -c "import scapy; print('scapy', scapy.__version__)"
+      ```
+
+      ## ✅ 합격 기준
+      `scapy` 출력 시 통과. **근거:** scapy <버전>(2.4 계열)이 출력되면 크래프팅 준비 완료 —
+      import 오류가 나면 라이브러리·권한 문제이므로 먼저 해결한다.
+    hint: 'python3 import scapy'
+    category: survey
+    points: 10
+    answer: |
+      # 1) 패킷 크래프팅 도구 scapy 동작 확인(버전) — raw socket은 root라 가능
+      ssh att@192.168.0.202 'python3 -c "import scapy; print('\''scapy'\'', scapy.__version__)"'
+    answer_detail: "scapy = 패킷을 한 필드씩 직접 조립하는 라이브러리. raw socket(낮은 계층 패킷 전송)에 root 권한이 필요하며 외부 공격자 VM 192.168.0.202에서 sudo 로 실행한다. 버전 문자열이 stdout 에 출력되면 가용으로 판정. 패킷 크래프팅은 scapy 로 한다(hping3 도 설치됨)."
+    expected_output: |
+      scapy 2.4.4
+    verify:
+      type: output_contains
+      expect: 'scapy'
+      field: stdout
+      semantic:
+        intent: "scapy 점검"
+        success_criteria: ["scapy 버전"]
+        acceptable_methods: ["**[OSS] import scapy (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표
+      scapy 로 SYN 패킷을 직접 조립해 여러 포트에 보내고, 응답으로 열린 포트를 식별한다(도구가
+      자동화하던 일을 패킷 한 필드씩 수동으로).
+
+      ## 개념 한 줄
+      포트 스캔의 본질은 **SYN 을 보내고 무엇이 돌아오는지 보는 것**이다 — 열린 포트는
+      SYN-ACK(flags **0x12**)을, 닫힌 포트는 RST(0x14)을 답한다. `sr()`(send-receive)은 패킷을
+      보내고 응답을 받아 (응답온것 ans, 안온것 u) 으로 돌려준다. SYN 만 보내고 마지막 ACK 은
+      안 보내 연결을 끝까지 안 맺는 "반열림 스캔"이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) scapy로 SYN(flags='S') 패킷을 여러 포트에 조립·전송 → SYN-ACK(0x12) 응답 포트=open
+      sudo python3 -c "from scapy.all import *; ans,u=sr(IP(dst='192.168.0.161')/TCP(dport=[22,80,443,8001,8002,3306,5432],flags='S'),timeout=4,verbose=0); print('open:', sorted(p[1].sport for p in ans if p[1][TCP].flags==0x12))"
+      ```
+      `open: [...]` 에 나온 포트가 SYN-ACK(flags 0x12)로 응답한 열린 포트다 — RST(0x14)=closed, 무응답=filtered.
+      nmap 이 자동화하던 반열림 스캔을 패킷 한 필드씩 손으로 조립한 것이라, 다음 미션의 비정상 플래그 조합도 자유롭게 만든다.
+      - scapy 의 `/` 는 계층을 포갬: `IP(dst=...)/TCP(dport=[...],flags='S')` = SYN 패킷. `sr` 응답 중 flags 0x12(SYN-ACK)인 것의 출발 포트(sport)가 열린 포트.
+
+      ## ✅ 합격 기준
+      `open:` 출력 시 통과. **근거:** open: [...] 에 열린 포트가 나타나면 통과 — SYN-ACK(0x12)=open,
+      RST(0x14)=closed, 무응답=filtered 로 해석한다.
+    hint: 'scapy sr SYN → SYN-ACK(0x12)=open'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) scapy로 SYN(flags='S') 패킷을 여러 포트에 조립·전송 → SYN-ACK(0x12) 응답 포트=open
+      ssh att@192.168.0.202 'sudo python3 -c "from scapy.all import *; ans,u=sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=[22,80,443,8001,8002,3306,5432],flags='\''S'\''),timeout=4,verbose=0); print('\''open:'\'', sorted(p[1].sport for p in ans if p[1][TCP].flags==0x12))"'
+    answer_detail: "scapy 로 SYN 을 직접 조립(IP/TCP flags='S')해 보내고, 응답 플래그로 포트 상태를 판정한다 — SYN-ACK(0x12)=open, RST(0x14)=closed, 무응답=filtered. stdout 의 'open:' 목록으로 채점한다. nmap 이 자동화하는 반열림 스캔을 패킷 한 필드씩 수동으로 한 것이며, 그래서 다음 미션의 비정상 플래그 조합도 자유롭게 만들 수 있다."
+    expected_output: |
+      open: [22, 80, 443, 8001, 8002]
+    verify:
+      type: output_contains
+      expect: 'open:'
+      field: stdout
+      semantic:
+        intent: "scapy SYN 크래프팅 + open 식별"
+        success_criteria: ["open 포트 식별"]
+        acceptable_methods: ["**[OSS] scapy sr SYN (권장)**"]
+    target_vm: ips
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표
+      표준 SYN 으로 막히는 곳을 우회하려는 시도로, 비정상 플래그 조합(FIN·XMAS·NULL) 패킷을
+      scapy 로 직접 만들어 보낸다.
+
+      ## 개념 한 줄
+      **비정상 스캔** = TCP 규약상 정상 연결엔 나오지 않는 플래그 조합을 보내, stateless 필터·
+      오래된 스택의 처리 차이를 노리는 정찰. **FIN(`flags='F'`)** =FIN 만, **XMAS(`flags='FPU'`)**
+      =FIN+PSH+URG 를 다 켬(불 켜진 트리 모양), **NULL(`flags=0`)** =플래그를 하나도 안 켬(정상엔
+      결코 없는 모양).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 비정상 플래그 3종(FIN=F/XMAS=FPU/NULL=0) 패킷을 차례로 전송 — 일부 필터/스택 우회 시도
+      sudo python3 -c "from scapy.all import *; sr(IP(dst='192.168.0.161')/TCP(dport=80,flags='F'),timeout=2,verbose=0); sr(IP(dst='192.168.0.161')/TCP(dport=80,flags='FPU'),timeout=2,verbose=0); sr(IP(dst='192.168.0.161')/TCP(dport=80,flags=0),timeout=2,verbose=0); print('FIN/XMAS/NULL sent')"
+      ```
+      `FIN/XMAS/NULL sent` 이 나오면 세 비정상 패킷(F·FPU·0)이 와이어로 나간 것이다 — 표준 밖 플래그로 일부
+      stateless 필터·스택을 우회하려는 시도지만, 정상 트래픽엔 없는 모양이라 오히려 §6 에서 시그니처에 확실히 잡힌다.
+      - 플래그 문자열만 `F`→`FPU`→`0` 으로 바꿔 세 비정상 패킷을 차례로 전송(nmap 의 -sF/-sX/-sN 대응, scapy 는 임의 조합까지).
+
+      ## ✅ 합격 기준
+      `sent` 출력 시 통과. **근거:** FIN/XMAS/NULL sent 가 나오면 세 비정상 패킷이 와이어로 나간 것 —
+      학습 초점은 "표준 밖 플래그를 직접 조립했다"와 이 비정상 모양이 §5 에서 시그니처에 확실히 잡힌다는 점.
+    hint: 'flags=F / FPU / 0'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 비정상 플래그 3종(FIN=F/XMAS=FPU/NULL=0) 패킷을 차례로 전송 — 일부 필터/스택 우회 시도
+      ssh att@192.168.0.202 'sudo python3 -c "from scapy.all import *; sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=80,flags='\''F'\''),timeout=2,verbose=0); sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=80,flags='\''FPU'\''),timeout=2,verbose=0); sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=80,flags=0),timeout=2,verbose=0); print('\''FIN/XMAS/NULL sent'\'')"'
+    answer_detail: "비정상 스캔 = 표준 SYN 대신 FIN(F)/XMAS(FPU)/NULL(0) 플래그로 보내 일부 stateless 필터·오래된 스택의 처리 차이를 노리는 정찰. scapy 라 플래그 문자열만 바꿔 임의 조합을 조립한다(nmap 의 -sF/-sX/-sN 대응). 'sent' 출력으로 전송 성공을 채점한다. 우회를 노리지만 정상에 없는 모양이라 오히려 시그니처 탐지에 취약하다는 trade-off 가 핵심."
+    expected_output: |
+      FIN/XMAS/NULL sent
+    verify:
+      type: output_contains
+      expect: 'sent'
+      field: stdout
+      semantic:
+        intent: "비정상 플래그 스캔"
+        success_criteria: ["FIN/XMAS/NULL 전송"]
+        acceptable_methods: ["**[OSS] scapy 비정상 플래그 (권장)**"]
+    target_vm: ips
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표
+      같은 SYN 스캔이라도 규모가 임계를 넘으면 탐지된다는 것을 증거로 확인한다 — 대규모(100+
+      포트) 스캔을 보내고 Suricata 의 scan 경보를 집계한다.
+
+      ## 개념 한 줄
+      **임계 기반 IDS 탐지** = 개별 패킷의 모양이 아니라 "짧은 시간에 같은 출처가 N개 넘는
+      포트를 건드렸나"라는 빈도·규모로 스캔을 판정. 그래서 소량(미션 2 의 6~7개)은 임계 미달로
+      빠져나가고, **대량(100+ 포트)** 이라야 탐지된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** 대량 스캔 발사는 `외부 공격자 VM 192.168.0.202`, 탐지 집계는 `el34-ips`.
+
+      ```bash
+      # ── 외부 공격자 VM 192.168.0.202 에서: 대규모 스캔 발사 ──
+      # 1) 대규모 SYN 스캔(포트 1~200 범위) — 임계 초과 유발(scapy 튜플=범위)
+      sudo python3 -c "from scapy.all import *; sr(IP(dst='192.168.0.161')/TCP(dport=(1,200),flags='S'),timeout=6,verbose=0); print('mass scan sent')"
+      # ── el34-ips 에서: scan 경보가 eve에 뜰 때까지 조건 폴링 후 집계 ──
+      # 2) scan 경보 대기 — 고정 sleep 대신 출처 192.168.0.202의 scan 시그니처가 나타날 때까지 조건 폴링
+      timeout 15 bash -c 'until tail -3000 /var/log/suricata/eve.json | grep 192.168.0.202 | grep -qi scan; do :; done'
+      # 3) eve.json에서 출처 192.168.0.202의 scan 시그니처 집계(SNAT 없어 출처 보존)
+      tail -3000 /var/log/suricata/eve.json | jq -rc 'select(.event_type=="alert" and .src_ip=="192.168.0.202" and (.alert.signature|test("scan";"i")))|.alert.signature' | sort | uniq -c | tail -2
+      ```
+      대량 SYN(1~200 포트)이 Suricata 의 스캔 임계를 초과해 eve.json 에 'scan' 시그니처로 남는다 — 소량(미션 2 의
+      6~7개)은 임계 미달로 은밀하게 빠져나간다. 규모가 탐지 여부를 가른다(공격자는 소량·저속으로 회피, 방어자는 임계 튜닝).
+
+      ## ✅ 합격 기준
+      `scan` 출력 시 통과. **근거:** 집계 결과에 scan 을 포함한 시그니처가 나타나면 통과 — 소규모는
+      은밀, 대규모는 탐지. 규모가 탐지 여부를 가른다.
+    hint: 'scapy dport=(1,200) 대량 → eve scan'
+    category: detect
+    points: 14
+    answer: |
+      # 1) 대규모 SYN 스캔(포트 1~200 범위) — 임계 초과 유발(scapy 튜플=범위)
+      ssh att@192.168.0.202 'sudo python3 -c "from scapy.all import *; sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=(1,200),flags='\''S'\''),timeout=6,verbose=0); print('\''mass scan sent'\'')"'
+      # 2) scan 경보가 eve에 뜰 때까지 조건 폴링 후 집계(고정 sleep 대신 실제 경보를 기다림)
+      ssh ccc@10.20.31.2 'timeout 15 bash -c "until tail -3000 /var/log/suricata/eve.json | grep 192.168.0.202 | grep -qi scan; do :; done"; tail -3000 /var/log/suricata/eve.json | jq -rc "select(.event_type==\"alert\" and .src_ip==\"192.168.0.202\" and (.alert.signature|test(\"scan\";\"i\")))|.alert.signature" | sort | uniq -c | tail -2'
+    answer_detail: "임계 기반 탐지는 빈도·규모로 잡는다 — 소량 스캔(미션 2 의 6~7개)은 임계 미달로 통과하지만 대량(1~200, 100+ 포트)은 Suricata 의 스캔 임계를 초과해 eve.json 에 'scan' 시그니처로 남는다. 출처 IP 192.168.0.202(SNAT 없어 보존) 필터로 집계한 결과에 scan 이 보이면 탐지. 공격자는 느림·소량으로 회피, 방어자는 임계 튜닝(미탐↔오탐 균형)으로 대응한다."
+    expected_output: |
+      mass scan sent
+            7 EL34 Possible nmap SYN scan
+    verify:
+      type: output_contains
+      expect: 'scan'
+      field: stdout
+      semantic:
+        intent: "대규모 스캔의 Suricata 탐지"
+        success_criteria: ["scan 시그니처 탐지", "임계 개념"]
+        acceptable_methods: ["**[OSS] 대량 scapy 스캔 → eve (권장)**"]
+    target_vm: ips
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표
+      정찰의 절반은 "받은 것"을 읽는 일이다. 응답 패킷 하나를 받아 TCP 플래그를 필드 단위로
+      해석하는 패킷 분석의 기본을 익힌다.
+
+      ## 개념 한 줄
+      **`sr1()`(send-receive-1)** = 첫 응답 패킷 하나만 돌려주는 함수. 그 응답의 TCP 플래그를
+      읽으면 포트 상태를 안다 — **SA**(SYN-ACK)=open, **RA**(RST-ACK)=closed, **무응답**
+      =filtered. (미션 2 는 같은 플래그를 숫자 0x12 로 걸렀고, 여기선 글자 SA 로 읽는다 — 같은
+      정보의 다른 표현.)
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) sr1로 포트 80에 SYN 하나 보내고 응답 패킷의 TCP 플래그를 직접 해석
+      sudo python3 -c "from scapy.all import *; a=sr1(IP(dst='192.168.0.161')/TCP(dport=80,flags='S'),timeout=3,verbose=0); print('port 80 응답 flags:', str(a[TCP].flags) if a else 'no-resp')"
+      ```
+      출력된 `flags:` 값이 곧 포트 상태다 — **SA**(SYN-ACK)=open, **RA**(RST-ACK)=closed, **no-resp**=filtered.
+      미션 2 가 같은 플래그를 숫자(0x12)로 걸렀다면 여기선 글자(SA)로 읽는다 — 와이어의 응답을 필드 단위로 해독하는 정찰·디버깅의 토대.
+
+      ## ✅ 합격 기준
+      `flags` 출력 시 통과. **근거:** flags: SA(또는 RA/no-resp)가 출력되면 통과 — 응답의 플래그 한
+      필드가 곧 포트 상태의 정보임을 읽어 낸다.
+    hint: 'sr1 응답 flags 해석'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) sr1로 포트 80에 SYN 하나 보내고 응답 패킷의 TCP 플래그를 직접 해석
+      ssh att@192.168.0.202 'sudo python3 -c "from scapy.all import *; a=sr1(IP(dst='\''192.168.0.161'\'')/TCP(dport=80,flags='\''S'\''),timeout=3,verbose=0); print('\''port 80 응답 flags:'\'', str(a[TCP].flags) if a else '\''no-resp'\'')"'
+    answer_detail: "응답 플래그 해석 = 패킷 분석의 핵심. sr1 로 받은 응답의 TCP 플래그를 직접 꺼내 SA(0x12)=open, RA(0x14)=closed, 무응답=filtered 로 판정한다. stdout 의 'flags' 출력으로 채점. 미션 2 가 숫자(0x12)로 걸렀다면 여기선 같은 플래그를 글자(SA)로 읽는다 — 와이어의 응답을 필드 단위로 해독하는 정찰·디버깅의 토대."
+    expected_output: |
+      port 80 응답 flags: SA
+    verify:
+      type: output_contains
+      expect: 'flags'
+      field: stdout
+      semantic:
+        intent: "응답 플래그 패킷 분석"
+        success_criteria: ["플래그 해석(SA/RA)"]
+        acceptable_methods: ["**[OSS] scapy sr1 응답 분석 (권장)**"]
+    target_vm: ips
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표
+      방어자 시선으로 돌아서서, 임계로는 못 잡는 소량 비정상 패킷(NULL 스캔)을 시그니처 룰로
+      잡는다. 룰을 작성→문법검증→reload→트리거→확인→삭제하는 수명주기 전체를 수행한다.
+
+      ## 개념 한 줄
+      **시그니처 탐지** = 정상 트래픽엔 결코 없는 패턴(NULL=flags 전부 0)이 단 하나만 보여도
+      즉시 경보(임계와 달리 횟수로 못 숨김). 룰은 Suricata 의 `local.rules` 에 한 줄씩 적고
+      고유 번호 **sid**(이번 주 네임스페이스 `9409xxx`)로 식별하며, 끝나면 그 sid 만 삭제해
+      베이스 룰을 보존한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** 룰 작성·검증·reload·확인·정리는 `el34-ips`, NULL 패킷 트리거만 `외부 공격자 VM 192.168.0.202`.
+
+      ```bash
+      # ── el34-ips 에서: 룰 추가 + 문법검증 + reload ──
+      # 1) NULL 스캔(flags:0) 탐지룰 추가 — 정상엔 없는 모양이라 단발도 잡힘(sid 9409001)
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert tcp any any -> any any (msg:\"W9 NULL scan detected\"; flags:0; sid:9409001; rev:1;)
+      EOF"
+      # 2) 적용 전 룰 문법 검증(-T) — "successfully loaded" 확인
+      sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -2
+      # 3) 무중단 reload — suricatasc는 reload 완료 후 반환(동기)하므로 별도 대기 불필요
+      sudo suricatasc -c reload-rules >/dev/null
+      # ── 외부 공격자 VM 192.168.0.202 에서: NULL 패킷 트리거(여러 포트) ──
+      sudo python3 -c "from scapy.all import *; [sr(IP(dst='192.168.0.161')/TCP(dport=p,flags=0),timeout=1,verbose=0) for p in (80,443,22,8001)]; print('null sent')"
+      # ── el34-ips 에서: eve 확인(best-effort) + self-clean ──
+      # 4) 최대 5초 조건 폴링으로 9409001 매치를 기다렸다 매치 줄 표시(단발이라 없을 수도 = best-effort)
+      timeout 5 bash -c 'until sudo grep -q 9409001 /var/log/suricata/eve.json; do :; done'; sudo grep 9409001 /var/log/suricata/eve.json | tail -1
+      # 5) self-clean — 룰 삭제 + reload + 잔재 확인(base 보존, 카운트 아닌 매치 유무)
+      sudo sed -i "/sid:9409001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null; sudo grep 9409001 /etc/suricata/rules/local.rules && echo "룰 잔재!" || echo "rule_removed clean"
+      ```
+      - 룰 핵심: `flags:0`(NULL 패킷 조건), `sid:9409001`(내 네임스페이스). `suricata -T`(문법 검증, "successfully loaded"), `suricatasc -c reload-rules`(무중단·동기), 끝나면 sed 삭제→reload(base 보존).
+
+      ## ✅ 합격 기준
+      `successfully` 출력 시 통과. **근거:** suricata -T 가 룰을 successfully loaded 하면 룰 문법이
+      유효한 것 — 트리거 후 eve 매치는 베스트에포트, 마지막 sed 정리로 9409001 잔재가 0 이 된다.
+    hint: 'flags:0 룰(9409001) → suricata -T → NULL 스캔 → 삭제'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1) NULL 스캔(flags:0) 탐지룰 추가 — 정상엔 없는 모양이라 단발도 잡힘(sid 9409001)
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert tcp any any -> any any (msg:\"W9 NULL scan detected\"; flags:0; sid:9409001; rev:1;)
+      EOF"'
+      # 2) 적용 전 룰 문법 검증(-T) — "successfully loaded" 확인
+      ssh ccc@10.20.31.2 'sudo suricata -T -S /etc/suricata/rules/local.rules 2>&1 | tail -2'
+      # 3) 무중단 reload(동기 반환) 후 NULL 패킷 트리거(여러 포트)
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules >/dev/null'
+      ssh att@192.168.0.202 'sudo python3 -c "from scapy.all import *; [sr(IP(dst='\''192.168.0.161'\'')/TCP(dport=p,flags=0),timeout=1,verbose=0) for p in (80,443,22,8001)]; print('\''null sent'\'')"'
+      # 4) 최대 5초 조건 폴링으로 9409001 매치 대기 후 매치 줄 표시(단발이라 없을 수도 = best-effort)
+      ssh ccc@10.20.31.2 'timeout 5 bash -c "until sudo grep -q 9409001 /var/log/suricata/eve.json; do :; done"; sudo grep 9409001 /var/log/suricata/eve.json | tail -1'
+      # 5) self-clean — 룰 삭제 + reload + 잔재 확인(base 보존, 카운트 아닌 매치 유무)
+      ssh ccc@10.20.31.2 'sudo sed -i "/sid:9409001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null; sudo grep 9409001 /etc/suricata/rules/local.rules && echo "룰 잔재!" || echo "rule_removed clean"'
+    answer_detail: "비정상 스캔은 시그니처로 잡는다 — NULL 스캔(flags:0)은 정상 트래픽엔 없어 명확한 탐지 대상. Suricata flags:0 룰(9409001) 작성→문법검증(suricata -T, successfully loaded)→reload→NULL 트리거→eve 확인. 끝나면 sed 삭제로 base 보존. 임계로는 단발을 못 잡지만 시그니처는 정상에 없는 모양 하나만으로 잡는다는 게 핵심."
+    expected_output: |
+      26/6/2026 -- 14:45:15 - <Notice> - Configuration provided was successfully loaded. Exiting.
+      null sent
+      {"timestamp":"...","src_ip":"192.168.0.202",...,"alert":{"signature":"W9 NULL scan detected","signature_id":9409001,...}}
+      rule_removed clean
+    verify:
+      type: output_contains
+      expect: 'successfully'
+      field: stdout
+      semantic:
+        intent: "비정상 플래그 탐지룰"
+        success_criteria: ["룰 문법 검증", "삭제 보존"]
+        acceptable_methods: ["**[OSS] flags:0 룰 (권장)**"]
+    target_vm: ips
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표 — 은밀 vs 탐지 trade-off
+      공격자의 스캔 선택은 늘 "은밀(안 들킴)"과 "효율(빠르고 정보 많음)"의 저울질이다. 앞 미션의
+      관찰을 그 trade-off 로 정리한다.
+
+      ## 개념 한 줄
+      소량·저속 스캔은 임계 미달로 은밀하나 느리고, 대량·고속은 빠르나 임계 초과로 탐지된다.
+      비정상 플래그(NULL/XMAS)는 일부 필터를 우회하지만 정상에 없는 모양이라 시그니처에 잡힌다.
+
+      ## 💻 실행 방법 — 편집기로 trade-off 정리 작성
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w09_tradeoff.md` 를 열고, 앞 미션의
+      관찰을 은밀↔탐지 저울로 아래처럼 정리·저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # W09 스캔 trade-off — 은밀 vs 탐지
+      ## 1. 소량·저속 SYN : 임계 미달 → 은밀(but 느림, 정보 적음)
+      ## 2. 대량·고속 SYN : 빠르고 정보 많으나 Suricata scan 임계 초과 → 탐지
+      ## 3. 비정상 플래그(NULL/XMAS) : 일부 stateless 필터 우회하나 정상엔 없는 모양 → 시그니처에 확실히 잡힘
+      ## 결론 : 공격자는 속도↔은밀을 저울질, 방어자는 임계 튜닝(미탐↔오탐) + 비정상 플래그 시그니처 룰
+      ```
+      작성 후 `cat ~/w09_tradeoff.md` 로 확인한다 — 정리는 echo 로 찍는 게 아니라 저울질을 스스로 판단해 쓰는 문서다.
+
+      ## ✅ 합격 기준
+      `은밀` 출력 시 통과. **근거:** 소량 은밀(느림) vs 대량 탐지(빠름)의 trade-off 와 비정상 플래그의
+      시그니처 취약성이 정리되면 통과.
+    hint: '소량 은밀 vs 대량 탐지'
+    category: analysis
+    points: 12
+    answer: |
+      # (편집기로 작성한 스캔 trade-off 정리 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w09_tradeoff.md <<'"'"'EOF'"'"'
+      # W09 스캔 trade-off — 은밀 vs 탐지
+      ## 1. 소량·저속 SYN : 임계 미달 → 은밀(but 느림, 정보 적음)
+      ## 2. 대량·고속 SYN : 빠르고 정보 많으나 Suricata scan 임계 초과 → 탐지
+      ## 3. 비정상 플래그(NULL/XMAS) : 일부 stateless 필터 우회하나 정상엔 없는 모양 → 시그니처에 확실히 잡힘
+      ## 결론 : 공격자는 속도↔은밀을 저울질, 방어자는 임계 튜닝(미탐↔오탐) + 비정상 플래그 시그니처 룰
+      EOF
+      cat ~/w09_tradeoff.md'
+    answer_detail: "편집기로 ~/w09_tradeoff.md 를 작성해 스캔의 은밀-탐지 trade-off 를 정리한다 — 소량/느림은 은밀하나 비효율, 대량은 빠르나 임계 초과로 탐지. 비정상 플래그(NULL/XMAS)는 우회 시도지만 정상에 없는 모양이라 시그니처로 잡힌다. 공격자는 속도↔은밀을 저울질하고 방어자는 임계 튜닝(미탐↔오탐) + 비정상 플래그 룰로 대응한다. 정리는 echo 로 찍는 게 아니라 저울질을 스스로 판단해 쓰는 문서다. 채점은 저장 파일 출력에 '은밀'이 보이는지로 판정한다."
+    expected_output: |
+      # W09 스캔 trade-off — 은밀 vs 탐지
+      ## 1. 소량·저속 SYN : 임계 미달 → 은밀(but 느림, 정보 적음)
+      ## 2. 대량·고속 SYN : 빠르고 정보 많으나 Suricata scan 임계 초과 → 탐지
+      ## 3. 비정상 플래그(NULL/XMAS) : 일부 stateless 필터 우회하나 정상엔 없는 모양 → 시그니처에 확실히 잡힘
+      ## 결론 : 공격자는 속도↔은밀을 저울질, 방어자는 임계 튜닝(미탐↔오탐) + 비정상 플래그 시그니처 룰
+    verify:
+      type: output_contains
+      expect: '은밀'
+      field: stdout
+      semantic:
+        intent: "은밀 vs 탐지 trade-off"
+        success_criteria: ["속도/은밀 trade-off"]
+        acceptable_methods: ["**[설명] trade-off (권장)**"]
+    target_vm: ips
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표 — scapy 공격 보고서
+      미션 1~7(크래프팅·비정상 스캔·대량 스캔 탐지·탐지룰·trade-off)을 한 보고서로 종합한다.
+
+      ## 개념 한 줄
+      패킷 수준 제어(scapy)의 유연성과 그 탐지 가능성을 함께 정리하는 것이 네트워크 계층 공격
+      보고의 핵심이다.
+
+      ## 💻 실행 방법 — 편집기로 scapy 보고서 작성
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w09_report.md` 를 열고, 미션 1~7 을
+      아래 골격에 채워 저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # 공격 W09 — scapy 패킷 크래프팅 보고서
+      ## 1. SYN 크래프팅 : sr(TCP flags=S) → SYN-ACK(0x12)=open 식별
+      ## 2. 비정상 스캔 : FIN(F)/XMAS(FPU)/NULL(0) — 필터 우회 시도
+      ## 3. 탐지 : 대량 SYN(200포트)→Suricata scan(임계), NULL 스캔→flags:0 시그니처 룰(9409001)
+      ## 4. trade-off : 소량 은밀 vs 대량 탐지. 비정상 플래그는 시그니처로 잡힘
+      ## 결론 : 패킷 직접 조립(scapy)으로 유연한 스캔, 단 비정상/대량은 탐지된다
+      ```
+      작성 후 `cat ~/w09_report.md` 로 확인한다 — 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이다.
+
+      ## ✅ 합격 기준
+      `scapy` 출력 시 통과. **근거:** 보고서에 scapy 크래프팅 + 비정상 스캔 + 탐지(임계/시그니처)가
+      모두 포함되면 통과.
+    hint: '크래프팅+비정상+탐지'
+    category: report
+    points: 10
+    answer: |
+      # (편집기로 작성한 scapy 보고서 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w09_report.md <<'"'"'EOF'"'"'
+      # 공격 W09 — scapy 패킷 크래프팅 보고서
+      ## 1. SYN 크래프팅 : sr(TCP flags=S) → SYN-ACK(0x12)=open 식별
+      ## 2. 비정상 스캔 : FIN(F)/XMAS(FPU)/NULL(0) — 필터 우회 시도
+      ## 3. 탐지 : 대량 SYN(200포트)→Suricata scan(임계), NULL 스캔→flags:0 시그니처 룰(9409001)
+      ## 4. trade-off : 소량 은밀 vs 대량 탐지. 비정상 플래그는 시그니처로 잡힘
+      ## 결론 : 패킷 직접 조립(scapy)으로 유연한 스캔, 단 비정상/대량은 탐지된다
+      EOF
+      cat ~/w09_report.md'
+    answer_detail: "편집기로 ~/w09_report.md 를 작성해 scapy 패킷 수준 제어를 종합한다 — 크래프팅(SYN→open 식별)/비정상 스캔(FIN/XMAS/NULL)의 유연성 vs 탐지(임계 기반 scan + 시그니처 flags:0)를 대응시킨다. 네트워크 계층 공격의 기초이며, 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이라야 한다. 채점은 저장 파일 출력에 'scapy' 가 보이면 통과."
+    expected_output: |
+      # 공격 W09 — scapy 패킷 크래프팅 보고서
+      ## 1. SYN 크래프팅 : sr(TCP flags=S) → SYN-ACK(0x12)=open 식별
+      ## 2. 비정상 스캔 : FIN(F)/XMAS(FPU)/NULL(0) — 필터 우회 시도
+      ## 3. 탐지 : 대량 SYN(200포트)→Suricata scan(임계), NULL 스캔→flags:0 시그니처 룰(9409001)
+      ## 4. trade-off : 소량 은밀 vs 대량 탐지. 비정상 플래그는 시그니처로 잡힘
+      ## 결론 : 패킷 직접 조립(scapy)으로 유연한 스캔, 단 비정상/대량은 탐지된다
+    verify:
+      type: output_contains
+      expect: 'scapy'
+      field: stdout
+      semantic:
+        intent: "scapy 종합 보고"
+        success_criteria: ["크래프팅/비정상/탐지"]
+        acceptable_methods: ["**[관리적] scapy 보고서 (권장)**"]
+    target_vm: ips

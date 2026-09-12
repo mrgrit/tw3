@@ -1,0 +1,273 @@
+lab_id: iot-security-week02
+title: "W02 — IoT 네트워크 프로토콜: MQTT 설정·평문 캡처 분석·TLS·ACL 강화"
+version: ai
+course: iot-security
+week: 2
+description: |
+  경량 IoT 프로토콜(MQTT) 보안을 **실제 아티팩트로** 분석한다. 실습은 (1) 취약한 Mosquitto 브로커 설정 파일을
+  만들어 `grep` 으로 인증·TLS·ACL 부재를 찾고, (2) 평문 MQTT 패킷 캡처(바이너리)를 `strings`·`xxd` 로 분석해
+  **평문으로 흐르는 사용자명·비밀번호·명령**을 눈으로 확인(감청)하며, (3) 강화된 설정과 대비한다. MQTT 는 TLS 없이
+  쓰면 CONNECT 패킷에 자격이 평문으로 담겨, 캡처만 있으면 `strings` 로 그대로 읽힌다.
+
+  모든 명령은 사람이 한 줄씩 직접 입력한다. el34 호스트(`ssh ccc@{{TARGET_IP}}`, 비밀번호 `1`)에서 실행하며,
+  분석 아티팩트(설정 파일·패킷 캡처)는 이 실습이 `/tmp` 에 직접 만든다. ⚠️ 실제로는 `tcpdump -r capture.pcap` 나
+  브로커 로그에 같은 분석을 적용한다.
+difficulty: medium
+duration_minutes: 120
+audience: IoT 보안 입문 (2주차)
+prerequisites:
+  - "el34 호스트 접속: `ssh ccc@{{TARGET_IP}}` (비밀번호 `1`)"
+  - "GPU Ollama 도달 — http://211.170.162.139:10934 (gemma3:4b), 종합용"
+  - "도구: grep·strings·xxd·python3 (el34 에 존재)"
+  - "W02 강의안 정독 — §0.5(MQTT·인증/암호/ACL·최소 권한)"
+objectives:
+  - "GPU 응답 확인 (GEN_OK)"
+  - "브로커 설정 파일에서 인증·TLS·ACL 부재 grep (PROTOCOL_WEAK)"
+  - "평문 MQTT 캡처에서 자격·명령을 strings 로 감청 (INTERCEPT_POSSIBLE)"
+  - "강화 설정과 대비 (PROTOCOL_SECURED)"
+  - "종합 소견 (Assessment)"
+pass_threshold: 0.6
+
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 MISSION
+      종합용 GPU(gemma3) 응답 확인.
+      ## 💻 실행 명령
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+        | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+      ```
+      ## 📋 확인 사항 — 마지막 줄 `GEN_OK`
+      ## 🔍 결과 해석 — 정상 `GEN_OK` / 비정상 `GEN_EMPTY`·연결오류
+    hint: "curl /api/generate → response 있으면 GEN_OK."
+    category: survey
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Reply with the word ready.","stream":false,"options":{"num_predict":10}}' \
+        | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('GEN_OK' if r.strip() else 'GEN_EMPTY')"
+    answer_detail: "GPU 응답 확인."
+    verify:
+      type: output_contains
+      expect: GEN_OK
+      field: stdout
+
+  - order: 2
+    instruction: |
+      ## 🎯 MISSION
+      취약한 **Mosquitto 브로커 설정 파일**을 만들어, 실제 `grep` 으로 인증·TLS·ACL 부재를 찾아낸다.
+
+      ## 💻 실행 명령
+      ```bash
+      CONF=/tmp/mosquitto_STU42.conf
+      # 1) 흔한 취약 설정 파일을 만든다(익명 허용·평문 1883·ACL 없음).
+      cat > "$CONF" <<'EOF'
+      listener 1883
+      allow_anonymous true
+      # password_file (설정 안 함 → 인증 없음)
+      # (TLS 인증서 미설정 → TLS 없음, 평문)
+      # (접근제어 목록 미설정 → 모든 클라이언트가 모든 토픽)
+      EOF
+
+      # 2) 실제 grep 으로 취약 3종을 점검한다.
+      echo "[익명 허용]"; grep -E "allow_anonymous\s+true" "$CONF"
+      echo "[TLS 여부]";  grep -Eq "certfile|cafile" "$CONF" && echo "TLS 설정됨" || echo "TLS 없음(평문 1883)"
+      echo "[ACL 여부]";  grep -Eq "acl_file" "$CONF" && echo "ACL 있음" || echo "ACL 없음"
+
+      # 3) 판정: 익명 허용 + TLS 없음 + ACL 없음 3종이면 PROTOCOL_WEAK.
+      A=$(grep -Ec "allow_anonymous\s+true" "$CONF")
+      grep -Eq "certfile|cafile" "$CONF"; T=$?    # 0=있음
+      grep -Eq "acl_file" "$CONF"; L=$?           # 0=있음
+      { [ "$A" -ge 1 ] && [ "$T" -ne 0 ] && [ "$L" -ne 0 ]; } && echo PROTOCOL_WEAK || echo SECURE
+      ```
+      ## 📋 확인 사항
+      - 명령 2: `allow_anonymous true` 매치, `TLS 없음(평문 1883)`, `ACL 없음`
+      - 명령 3: 마지막 줄 `PROTOCOL_WEAK`
+
+      ## 💡 왜 이걸 하는가?
+      > ⚠️ **보안 함의** — MQTT 브로커의 흔한 기본/부주의 설정(`allow_anonymous true` + 평문 1883 + ACL 없음)은
+      > "누구나 붙어 모든 토픽을 구독·발행"하게 만든다. 설정 파일 `grep` 만으로 이 3중 취약을 진단할 수 있다.
+
+      ## 🔍 결과 해석 — 정상 `PROTOCOL_WEAK`
+    hint: "취약 mosquitto.conf 생성 → grep 로 allow_anonymous true·certfile 없음·acl_file 없음 확인 → PROTOCOL_WEAK."
+    category: recon
+    answer: |
+      CONF=/tmp/mosquitto_STU42.conf
+      # 1) 흔한 취약 설정 파일을 만든다(익명 허용·평문 1883·ACL 없음).
+      cat > "$CONF" <<'EOF'
+      listener 1883
+      allow_anonymous true
+      # password_file (설정 안 함 → 인증 없음)
+      # (TLS 인증서 미설정 → TLS 없음, 평문)
+      # (접근제어 목록 미설정 → 모든 클라이언트가 모든 토픽)
+      EOF
+      
+      # 2) 실제 grep 으로 취약 3종을 점검한다.
+      echo "[익명 허용]"; grep -E "allow_anonymous\s+true" "$CONF"
+      echo "[TLS 여부]";  grep -Eq "certfile|cafile" "$CONF" && echo "TLS 설정됨" || echo "TLS 없음(평문 1883)"
+      echo "[ACL 여부]";  grep -Eq "acl_file" "$CONF" && echo "ACL 있음" || echo "ACL 없음"
+      
+      # 3) 판정: 익명 허용 + TLS 없음 + ACL 없음 3종이면 PROTOCOL_WEAK.
+      A=$(grep -Ec "allow_anonymous\s+true" "$CONF")
+      grep -Eq "certfile|cafile" "$CONF"; T=$?    # 0=있음
+      grep -Eq "acl_file" "$CONF"; L=$?           # 0=있음
+      { [ "$A" -ge 1 ] && [ "$T" -ne 0 ] && [ "$L" -ne 0 ]; } && echo PROTOCOL_WEAK || echo SECURE
+    answer_detail: "브로커 설정 파일 grep 으로 익명·평문·ACL 부재 3중 취약 확인."
+    verify:
+      type: output_contains
+      expect: PROTOCOL_WEAK
+      field: stdout
+      semantic:
+        intent: "브로커 설정 파일에서 인증·TLS·ACL 부재를 grep 으로 진단."
+        success_criteria:
+          - "allow_anonymous true·TLS 없음·ACL 없음 확인"
+          - "PROTOCOL_WEAK 출력"
+
+  - order: 3
+    instruction: |
+      ## 🎯 MISSION
+      **평문 MQTT 패킷 캡처**(바이너리 아티팩트)를 만들어, `strings`·`xxd` 로 평문으로 흐르는 **사용자명·비밀번호·
+      명령**을 직접 읽어낸다(감청). TLS 가 없으면 캡처만으로 자격이 노출된다.
+
+      ## 💻 실행 명령
+      ```bash
+      PCAP=/tmp/mqtt_plain_STU42.bin
+      # 1) 평문 MQTT CONNECT(자격 포함)+PUBLISH(문 열기 명령) 패킷의 캡처 바이트를 printf 로 재구성한다.
+      #    실제 MQTT 바이트: 10=CONNECT, 0004 MQTT=프로토콜명, C2=user+pass 플래그, 이어서 길이접두 문자열들.
+      printf '\x10\x2e\x00\x04MQTT\x04\xc2\x00\x3c\x00\x0dcam-sensor-01\x00\x09iot_admin\x00\x0eS3nsorP@ss2024' > "$PCAP"
+      # PUBLISH(30) topic=home/door/cmd payload=open 을 이어붙인다.
+      printf '\x30\x13\x00\x0dhome/door/cmdopen' >> "$PCAP"
+      echo "캡처 생성: $PCAP ($(wc -c < "$PCAP") bytes)"
+
+      # 2) strings 로 평문 자격·토픽·명령을 그대로 읽는다(감청).
+      strings "$PCAP"
+
+      # 3) 판정: 캡처에서 username/password/명령이 평문으로 잡히면 감청 성립.
+      strings "$PCAP" | grep -qE "iot_admin|S3nsorP@ss2024" && echo INTERCEPT_POSSIBLE || echo ENCRYPTED
+      ```
+      ## 📋 확인 사항
+      - 명령 2: `MQTT`, `cam-sensor-01`, `iot_admin`, `S3nsorP@ss2024`, `home/door/cmd`, `open` 이 평문으로 보임
+      - 명령 3: 마지막 줄 `INTERCEPT_POSSIBLE`
+
+      ## 💡 왜 이걸 하는가?
+      > ⚠️ **보안 함의** — TLS 없는 MQTT 는 CONNECT 패킷에 **사용자명·비밀번호가 평문**으로 담긴다. 같은 네트워크에서
+      > 캡처(tcpdump)만 뜨면 `strings` 한 줄로 자격이 털리고, 명령 토픽(`home/door/cmd open`)도 그대로 읽혀 재전송·
+      > 위조된다. 평문 프로토콜의 근본 위험이다.
+
+      ## 🔍 결과 해석 — 정상 `INTERCEPT_POSSIBLE` + 평문 자격/명령 노출
+    hint: "평문 MQTT 캡처 생성 → strings 로 iot_admin/S3nsorP@ss2024/home/door/cmd 노출 확인 → INTERCEPT_POSSIBLE."
+    category: exploit
+    answer: |
+      PCAP=/tmp/mqtt_plain_STU42.bin
+      # 1) 평문 MQTT CONNECT(자격 포함)+PUBLISH(문 열기 명령) 패킷의 캡처 바이트를 printf 로 재구성한다.
+      #    실제 MQTT 바이트: 10=CONNECT, 0004 MQTT=프로토콜명, C2=user+pass 플래그, 이어서 길이접두 문자열들.
+      printf '\x10\x2e\x00\x04MQTT\x04\xc2\x00\x3c\x00\x0dcam-sensor-01\x00\x09iot_admin\x00\x0eS3nsorP@ss2024' > "$PCAP"
+      # PUBLISH(30) topic=home/door/cmd payload=open 을 이어붙인다.
+      printf '\x30\x13\x00\x0dhome/door/cmdopen' >> "$PCAP"
+      echo "캡처 생성: $PCAP ($(wc -c < "$PCAP") bytes)"
+      
+      # 2) strings 로 평문 자격·토픽·명령을 그대로 읽는다(감청).
+      strings "$PCAP"
+      
+      # 3) 판정: 캡처에서 username/password/명령이 평문으로 잡히면 감청 성립.
+      strings "$PCAP" | grep -qE "iot_admin|S3nsorP@ss2024" && echo INTERCEPT_POSSIBLE || echo ENCRYPTED
+    answer_detail: |
+      평문 MQTT 캡처를 strings 로 분석 → 사용자명(iot_admin)·비밀번호(S3nsorP@ss2024)·명령 토픽이 그대로 노출.
+      TLS 없으면 캡처만으로 자격 탈취+명령 위조. 실제로는 tcpdump -r pcap 에 동일 적용.
+    verify:
+      type: output_contains
+      expect: INTERCEPT_POSSIBLE
+      field: stdout
+      semantic:
+        intent: "평문 MQTT 캡처에서 strings 로 자격·명령 감청."
+        success_criteria:
+          - "캡처에서 username/password 평문 노출 확인"
+          - "명령 토픽(home/door/cmd) 노출"
+          - "INTERCEPT_POSSIBLE 출력"
+
+  - order: 4
+    instruction: |
+      ## 🎯 MISSION
+      **강화된 설정 파일**을 만들어, 같은 grep 으로 TLS·인증·ACL 이 켜졌음을 확인한다(취약본과 대비).
+
+      ## 💻 실행 명령
+      ```bash
+      HCONF=/tmp/mosquitto_hardened_STU42.conf
+      cat > "$HCONF" <<'EOF'
+      listener 8883
+      allow_anonymous false
+      password_file /etc/mosquitto/passwd
+      cafile /etc/mosquitto/ca.crt
+      certfile /etc/mosquitto/server.crt
+      keyfile /etc/mosquitto/server.key
+      acl_file /etc/mosquitto/acl
+      EOF
+
+      # 같은 점검을 강화본에 적용 — 이번엔 3종이 모두 '있음'이어야 한다.
+      echo -n "익명 차단: "; grep -Eq "allow_anonymous\s+false" "$HCONF" && echo OK || echo NO
+      echo -n "TLS: "; grep -Eq "certfile" "$HCONF" && echo OK || echo NO
+      echo -n "ACL: "; grep -Eq "acl_file" "$HCONF" && echo OK || echo NO
+      grep -Eq "allow_anonymous\s+false" "$HCONF" && grep -Eq "certfile" "$HCONF" && grep -Eq "acl_file" "$HCONF" && echo PROTOCOL_SECURED || echo STILL_WEAK
+      ```
+      ## 📋 확인 사항
+      - 익명 차단 `OK`, TLS `OK`(8883), ACL `OK`
+      - 마지막 줄 `PROTOCOL_SECURED`
+
+      ## 💡 왜 이걸 하는가?
+      TLS(감청 차단)+인증(익명 차단)+ACL(장치별 최소 권한 토픽)의 3종을 켜면, 캡처를 떠도 암호화돼 못 읽고 무단
+      클라이언트는 붙지 못한다. 경량이라도 이 3종은 필수다.
+
+      ## 🔍 결과 해석 — 정상 `PROTOCOL_SECURED`
+    hint: "강화 mosquitto.conf(allow_anonymous false·certfile·acl_file) 생성 → grep 3종 OK → PROTOCOL_SECURED."
+    category: defense
+    answer: |
+      HCONF=/tmp/mosquitto_hardened_STU42.conf
+      cat > "$HCONF" <<'EOF'
+      listener 8883
+      allow_anonymous false
+      password_file /etc/mosquitto/passwd
+      cafile /etc/mosquitto/ca.crt
+      certfile /etc/mosquitto/server.crt
+      keyfile /etc/mosquitto/server.key
+      acl_file /etc/mosquitto/acl
+      EOF
+      
+      # 같은 점검을 강화본에 적용 — 이번엔 3종이 모두 '있음'이어야 한다.
+      echo -n "익명 차단: "; grep -Eq "allow_anonymous\s+false" "$HCONF" && echo OK || echo NO
+      echo -n "TLS: "; grep -Eq "certfile" "$HCONF" && echo OK || echo NO
+      echo -n "ACL: "; grep -Eq "acl_file" "$HCONF" && echo OK || echo NO
+      grep -Eq "allow_anonymous\s+false" "$HCONF" && grep -Eq "certfile" "$HCONF" && grep -Eq "acl_file" "$HCONF" && echo PROTOCOL_SECURED || echo STILL_WEAK
+    answer_detail: "강화 설정(익명 차단·TLS·ACL)을 grep 로 확인. 취약본과 대비."
+    verify:
+      type: output_contains
+      expect: PROTOCOL_SECURED
+      field: stdout
+
+  - order: 5
+    instruction: |
+      ## 🎯 MISSION
+      W02 발견(취약 설정·평문 감청·강화 대비)을 소견으로 정리한다. (임시 파일 정리: `rm -f /tmp/mosquitto_*STU42.conf /tmp/mqtt_plain_STU42.bin`)
+      ## 💻 실행 명령
+      ```bash
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a concise note for Week 2 of an IoT security course on MQTT protocol security. Facts: a broker config with allow_anonymous true, no TLS, and no ACL was diagnosed as weak by grep (PROTOCOL_WEAK); a plaintext MQTT packet capture revealed the username, password, and a door-open command in cleartext via strings, so eavesdropping and command forgery are possible (INTERCEPT_POSSIBLE); a hardened config with TLS, authentication, and an ACL file fixed it (PROTOCOL_SECURED). Explain that lightweight IoT protocols often ship insecure and that without TLS the credentials travel in cleartext, so defense enables TLS, authentication, and per-device least-privilege ACLs. Begin with exactly the single word Assessment on its own first line.","stream":false,"options":{"num_predict":330}}' \
+        | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+      ```
+      ## 📋 확인 사항 — 첫머리에 `Assessment`
+      ## 🔍 결과 해석 — 정상 첫 줄 `Assessment` / 비정상 `[형식 미준수 — 재실행]`
+
+      ---
+      **다음 주(W03) 예고** — 하드웨어 인터페이스(UART/JTAG/SPI)·펌웨어 추출.
+    hint: "curl 로 gemma3 에 발견 넣어 요약, 첫 줄 Assessment 강제. 임시 파일 정리."
+    category: report
+    answer: |
+      curl -s http://211.170.162.139:10934/api/generate \
+        -d '{"model":"gemma3:4b","prompt":"Write a concise note for Week 2 of an IoT security course on MQTT protocol security. Facts: a broker config with allow_anonymous true, no TLS, and no ACL was diagnosed as weak by grep (PROTOCOL_WEAK); a plaintext MQTT packet capture revealed the username, password, and a door-open command in cleartext via strings, so eavesdropping and command forgery are possible (INTERCEPT_POSSIBLE); a hardened config with TLS, authentication, and an ACL file fixed it (PROTOCOL_SECURED). Explain that lightweight IoT protocols often ship insecure and that without TLS the credentials travel in cleartext, so defense enables TLS, authentication, and per-device least-privilege ACLs. Begin with exactly the single word Assessment on its own first line.","stream":false,"options":{"num_predict":330}}' \
+        | python3 -c "import sys,json; r=json.load(sys.stdin).get('response',''); print(r); print('' if 'Assessment' in r else '[형식 미준수 — 재실행]')"
+    answer_detail: "W02 MQTT 종합(Assessment): 취약 설정·평문 캡처 감청·TLS/인증/ACL 강화."
+    verify:
+      type: output_contains
+      expect: Assessment
+      field: stdout

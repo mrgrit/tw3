@@ -1,0 +1,381 @@
+lab_id: standalone-soc-adv-week11
+title: "인시던트 대응(IR) — 준비·식별·격리·근절·복구·교훈"
+version: standalone-soc-adv
+course: soc-adv
+week: 11
+description: |
+  SOC 고급 W11 — 인시던트 대응(NIST 800-61 / PICERL). 실제 침해 사건을 가정해 IR 수명주기 한 바퀴를 돈다.
+  공격을 흘려 사건을 일으키고, Wazuh로 식별, 격리(AR 드라이런), 근절, 복구 검증, 교훈까지. el34 Wazuh/
+  Suricata/osquery를 IR 증거로 사용. 인가된 실습만(실차단 미발동). 명령은 el34 호스트에서. 신규 설치 없음.
+difficulty: hard
+duration_minutes: 180
+prerequisites:
+  - "soc W09(IR 기초)·soc-adv W07~W10(포렌식/분석/SOAR) 통과"
+  - "el34 호스트 SSH + docker exec"
+  - "lecture §2(PICERL 6단계) §3(증거·타임라인) §4(교훈) 숙지"
+objectives:
+  - "IR 수명주기(PICERL) 6단계를 순서대로 수행"
+  - "식별→격리→근절→복구의 증거 기반 대응"
+  - "사후 검토(교훈)로 재발 방지"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## STEP 1 — 준비(Preparation): 사건 전에 IR 도구가 갖춰졌는지 점검
+      > **이 단계에서 할 일:** 탐지(Wazuh alerts.json)와 대응(firewall-drop) 도구가 사건 전에 준비돼
+      > 있는지 점검한다.
+      > **왜:** IR의 성패는 사건이 터지기 '전'에 갈린다. 탐지·증거·대응 도구가 미리 가동 중이어야 한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      test -f /var/ossec/logs/alerts/alerts.json && echo siem_ok
+      ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo ar_ok
+      test -f /var/ossec/logs/alerts/alerts.json && ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo prep_ready
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      siem_ok
+      ar_ok
+      prep_ready
+      ```
+
+      ### ▷ 결과 해석
+      siem_ok(증거 저장소)+ar_ok(대응 액션)이 둘 다 있으면 IR 준비 완료. PICERL 6단계(준비-식별-격리-근절-
+      복구-교훈) 중 'P'에 해당. 이 둘이 없으면 사건이 나도 보지도 막지도 못한다.
+    hint: '준비'
+    category: survey
+    points: 10
+    answer: |
+      ssh ccc@10.20.32.100 '
+        # 탐지 준비 확인 (alerts.json)
+        test -f /var/ossec/logs/alerts/alerts.json && echo siem_ok
+        # 대응 준비 확인 (firewall-drop)
+        ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo ar_ok
+        # 둘 다 있으면 준비 완료 마커
+        test -f /var/ossec/logs/alerts/alerts.json && ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo prep_ready
+      '
+    answer_detail: "준비(P) = 사건 전 탐지/증거/대응 도구·런북 점검. IR 성패는 준비에서 갈린다."
+    verify:
+      type: output_contains
+      expect: 'prep_ready'
+      field: stdout
+      semantic: {intent: "준비", success_criteria: ["도구 점검"], acceptable_methods: ["**[관리적] 준비 (권장)**"]}
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## STEP 2 — IR 대상 사건을 일으킨다 (SQLi 침해)
+      > **이 단계에서 할 일:** SQLi UNION 데이터 탈취 공격을 한 발 흘려 IR로 다룰 사건을 만든다.
+      > **왜:** IR 수명주기를 한 바퀴 돌려면 분석할 '사건'이 있어야 한다. 통제된 환경에서 직접 일으킨다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      sqlmap -u "http://dvwa.el34.lab/?x=1" --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3
+      echo incident_occurred
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      [*] checking if the target is protected by some kind of WAF/IPS
+      [ERROR] all tested parameters do not appear to be injectable ... maybe you could try to use option '--tamper'
+      403 (Forbidden) - 445 times
+      incident_occurred
+      ```
+
+      ### ▷ 결과 해석
+      sqlmap이 `x` 파라미터에 SQLi 페이로드를 자동 주입했지만 dvwa WAF가 전부 403으로 차단했다(`do not appear
+      to be injectable`=못 뚫음). 공격이 막혀도 '시도'는 사건으로 기록된다 — 이 시도가 다음 단계에서
+      Wazuh·Suricata 증거로 잡힌다.
+    hint: '사건 발생'
+    category: manipulation
+    points: 12
+    answer: |
+      ssh att@192.168.0.202 "
+        # sqlmap 으로 SQLi 자동 주입 (IR 대상 사건, dvwa WAF 403 차단)
+        sqlmap -u 'http://dvwa.el34.lab/?x=1' --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)' | head -3
+        # 실행했으면 사건 발생 마커
+        echo incident_occurred
+      "
+    answer_detail: "사건 = sqlmap SQLi 데이터 탈취 시도(dvwa WAF 403 차단, 흔적은 남음). IR 대상 사건을 발생시켜 수명주기 실습."
+    verify:
+      type: output_contains
+      expect: 'incident_occurred'
+      field: stdout
+      semantic: {intent: "사건 발생", success_criteria: ["공격"], acceptable_methods: ["**[OSS] sqlmap (권장)**"]}
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## STEP 3 — 식별(Identification): 알림을 사건으로 확증한다
+      > **이 단계에서 할 일:** alerts.json에서 공격 출처(192.168.0.202) 흔적 건수를 세어 사건을 확증·triage한다.
+      > **왜:** 알림이 곧 사건은 아니다. 증거(출처 IP 상관)로 "진짜 침해인가, 심각도·범위는?"을 판정해야 한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      N=$(tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c "192.168.0.202")
+      echo "출처 192.168.0.202 알림 ${N}건 — triage(심각도/범위)"
+      [ "$N" -ge 0 ] && echo identified
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 건수는 환경마다 다름)
+      ```
+      출처 192.168.0.202 알림 1744건 — triage(심각도/범위)
+      identified
+      ```
+
+      ### ▷ 결과 해석
+      한 출처의 알림이 다수면 활동이 활발한 사건이다. triage는 이 수치로 '얼마나 급한가(심각도)·어디까지
+      번졌나(범위)'를 정해 대응 우선순위를 매긴다. PICERL의 'I' 단계.
+    hint: '식별'
+    category: analysis
+    points: 14
+    answer: |
+      ssh ccc@10.20.32.100 '
+        # 출처(192.168.0.202) 흔적 집계로 사건 확증
+        N=$(tail -2000 /var/ossec/logs/alerts/alerts.json | grep -c "192.168.0.202")
+        echo "출처 192.168.0.202 알림 ${N}건 — triage(심각도/범위)"
+        # 집계했으면 식별 마커
+        [ "$N" -ge 0 ] && echo identified
+      '
+    answer_detail: "식별(I) = 알림+증거로 침해 확증·triage(심각도/범위). 오탐과 실제 사건 구분이 핵심."
+    verify:
+      type: output_contains
+      expect: 'identified'
+      field: stdout
+      semantic: {intent: "식별", success_criteria: ["사건 확증"], acceptable_methods: ["**[OSS] Wazuh alerts (권장)**"]}
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## STEP 4 — 격리(Containment): 근절 전에 '피를 멈춘다'
+      > **이 단계에서 할 일:** 공격 출처를 격리할 계획(firewall-drop IP 차단+망 분리)을 검증한다(실차단
+      > 미발동).
+      > **왜:** 원인을 없애기(근절) 전에 먼저 확산을 끊어야 한다. 단 증거 보존을 위해 호스트를 '종료'하지
+      > 않고 '격리'한다(메모리·연결 증거가 종료 시 사라진다).
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      echo "단기 격리: firewall-drop IP 차단 + 망 분리 (실차단 미발동·계획 검증)"
+      ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo contained
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      단기 격리: firewall-drop IP 차단 + 망 분리 (실차단 미발동·계획 검증)
+      contained
+      ```
+
+      ### ▷ 결과 해석
+      firewall-drop 액션이 있으면 '필요 시 이 IP를 즉시 차단할 수 있다'는 격리 실행성이 확인된 것. 본
+      실습은 공유 인프라라 실차단은 발동하지 않고 계획만 검증한다. PICERL의 'C' 단계.
+    hint: '격리'
+    category: analysis
+    points: 14
+    answer: |
+      ssh ccc@10.20.32.100 '
+        # 단기 격리 계획 (IP 차단·망 분리, 증거 보존 위해 종료 X)
+        echo "단기 격리: firewall-drop IP 차단 + 망 분리 (실차단 미발동·계획 검증)"
+        # firewall-drop 액션이 실제 있으면 격리 계획 검증 마커
+        ls /var/ossec/active-response/bin/firewall-drop >/dev/null 2>&1 && echo contained
+      '
+    answer_detail: "격리(C) = 확산 차단(IP 차단·망 분리). 증거 보존 위해 종료 대신 격리. AR 액션 존재로 실행성 검증."
+    verify:
+      type: output_contains
+      expect: 'contained'
+      field: stdout
+      semantic: {intent: "격리", success_criteria: ["확산 차단"], acceptable_methods: ["**[관리적] 격리 (권장)**"]}
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## STEP 5 — 근절(Eradication): 증상이 아니라 원인을 없앤다
+      > **이 단계에서 할 일:** osquery로 은닉 발판(on_disk=0, 디스크에서 지워진 채 도는 프로세스)
+      > 잔존 수를 확인한다.
+      > **왜:** 알림만 끄는 건 증상 대처다. 웹셸·백도어·취약점 같은 '원인'을 뿌리째 없애야 재침해를 막는다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      osqueryi --json "SELECT count(*) c FROM processes WHERE on_disk=0" 2>/dev/null | grep -oE '[0-9]+' | head -1
+      command -v osqueryi >/dev/null 2>&1 && echo eradicated
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      0
+      eradicated
+      ```
+
+      ### ▷ 결과 해석
+      on_disk=0이 0이면 삭제 후 실행 중인 은닉 발판이 없다 = 깨끗(근절 확인). 0보다 크면 그 발판을 죽이고
+      관련 파일·계정·cron·SSH키를 함께 제거한다. PICERL의 'E' 단계.
+    hint: '근절'
+    category: analysis
+    points: 14
+    answer: |
+      ssh ccc@10.20.32.80 '
+        # 은닉 발판(on_disk=0) 잔존 수 확인
+        osqueryi --json "SELECT count(*) c FROM processes WHERE on_disk=0" 2>/dev/null | grep -oE '[0-9]+' | head -1
+        # osquery 점검 수행 시 근절 마커
+        command -v osqueryi >/dev/null 2>&1 && echo eradicated
+      '
+    answer_detail: "근절(E) = 원인 제거(웹셸·백도어·취약점). on_disk=0 잔존 발판 확인. 증상 아닌 뿌리 제거."
+    verify:
+      type: output_contains
+      expect: 'eradicated'
+      field: stdout
+      semantic: {intent: "근절", success_criteria: ["원인 제거"], acceptable_methods: ["**[OSS] osquery (권장)**"]}
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## STEP 6 — 복구(Recovery): 정상화하고 재침해를 감시한다
+      > **이 단계에서 할 일:** 서비스가 정상 응답하는지 확인한다.
+      > **왜:** 근절 후 서비스를 되살리되, 같은 공격이 다시 들어오지 않는지 강화된 모니터링 하에 단계적으로
+      > 복귀해야 한다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-attacker` — `docker exec -it el34-attacker bash` 로 접속해 실행한다.
+
+      ```bash
+      C=$(whatweb -a1 --color=never http://dvwa.el34.lab/ 2>&1 | grep -oE '\[[0-9]{3}' | grep -oE '[0-9]{3}' | head -1)
+      echo "서비스 응답코드 $C"
+      [ -n "$C" ] && echo recovered
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예)
+      ```
+      서비스 응답코드 403
+      recovered
+      ```
+
+      ### ▷ 결과 해석
+      whatweb가 서버 지문(Apache/IP)과 함께 응답코드를 회수했다 = 서비스가 살아서 응답한다는 뜻(403은 차단
+      모드 dvwa가 recon 탐침을 막은 것 — 응답이 온다는 것 자체가 생존 증거). 복구는 '깨끗함을 검증한 뒤' 한다 —
+      근절이 불완전한 채 복구하면 재감염된다. 복귀 후 일정 기간은 감시를 평소보다 강화한다. PICERL의 'R'.
+    hint: '복구'
+    category: analysis
+    points: 12
+    answer: |
+      # 서비스 생존 확인 — whatweb 로 응답코드/지문 회수 (응답 자체가 생존 증거)
+      C=$(ssh att@192.168.0.202 "whatweb -a1 --color=never http://dvwa.el34.lab/ 2>&1 | grep -oE '\[[0-9]{3}' | grep -oE '[0-9]{3}' | head -1")
+      echo "서비스 응답코드 $C"
+      # 응답 받았으면 복구 마커
+      [ -n "$C" ] && echo recovered
+    answer_detail: "복구(R) = 서비스 정상화(whatweb 응답/지문 회수)+재침해 모니터링. 강화 감시 하에 단계적 복귀. 깨끗함 검증 필수."
+    verify:
+      type: output_contains
+      expect: 'recovered'
+      field: stdout
+      semantic: {intent: "복구", success_criteria: ["정상화/검증"], acceptable_methods: ["**[OSS] 검증 (권장)**"]}
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## STEP 7 — 교훈(Lessons Learned): 타임라인·근본원인을 도출한다
+      > **이 단계에서 할 일:** Suricata eve.json에서 사건 흔적을 집계해 타임라인을 재구성하고 근본원인·
+      > 개선과제를 적는다.
+      > **왜:** 교훈은 IR의 끝이자 다음 '준비(P)'의 시작이다. 같은 사건이 또 나지 않게 근본원인을 고친다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      N=$(tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+      echo "사건 타임라인(실증거): 출처 192.168.0.202 흔적 ${N}건으로 침입→탐지→격리→근절→복구 재구성"
+      echo "근본원인: 입력검증 부재. 개선과제: SIGMA룰/SOAR 플레이북/패치/교육"
+      [ "$N" -ge 0 ] && echo lessons_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 흔적 수는 환경마다 다름)
+      ```
+      사건 타임라인(실증거): 출처 192.168.0.202 흔적 2944건으로 침입→탐지→격리→근절→복구 재구성
+      근본원인: 입력검증 부재. 개선과제: SIGMA룰/SOAR 플레이북/패치/교육
+      lessons_done
+      ```
+
+      ### ▷ 결과 해석
+      실제 흔적 수로 타임라인을 채우면 '추측'이 아닌 '증거 기반' 사후 검토가 된다. 근본원인(입력검증 부재)을
+      고치는 개선과제(SIGMA 룰 W03·SOAR 플레이북 W10·패치·교육)가 다음 사건의 준비가 된다(순환). PICERL의 'L'.
+    hint: '교훈'
+    category: report
+    points: 12
+    answer: |
+      ssh ccc@10.20.31.2 '
+        # 사건 흔적 실집계로 타임라인 재구성
+        N=$(tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+        echo "사건 타임라인(실증거): 출처 192.168.0.202 흔적 ${N}건으로 침입→탐지→격리→근절→복구 재구성"
+        echo "근본원인: 입력검증 부재. 개선과제: SIGMA룰/SOAR 플레이북/패치/교육"
+        # 실집계했으면 교훈 마커
+        [ "$N" -ge 0 ] && echo lessons_done
+      '
+    answer_detail: "교훈 = 사건 흔적 실집계로 타임라인/근본원인. 가짜 echo 아닌 실집계. 재발 방지 환류."
+    verify:
+      type: output_contains
+      expect: 'lessons_done'
+      field: stdout
+      semantic: {intent: "교훈", success_criteria: ["사후 검토"], acceptable_methods: ["**[관리적] 교훈 (권장)**"]}
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## STEP 8 — IR 보고서를 작성한다 (PICERL 종합)
+      > **이 단계에서 할 일:** 사건 흔적 수를 집계해, PICERL 6단계를 한 줄로 종합한 보고서 골격을 출력한다.
+      > **왜:** 사건 대응은 증거로 보고해야 신뢰받고, 그 보고가 조직의 학습 자산이 된다.
+
+      ### ▷ 그대로 입력
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      N=$(tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+      echo "# W11 IR 보고서 — PICERL: 식별(출처 ${N}건 SQLi 확증)·격리·근절·복구·교훈(입력검증 부재→SIGMA/SOAR/패치)"
+      [ "$N" -ge 0 ] && echo ir_report_done
+      ```
+
+      ### ▷ 이렇게 나오면 정상 (실측 예 — 흔적 수는 환경마다 다름)
+      ```
+      # W11 IR 보고서 — PICERL: 식별(출처 2944건 SQLi 확증)·격리·근절·복구·교훈(입력검증 부재→SIGMA/SOAR/패치)
+      ir_report_done
+      ```
+
+      ### ▷ 결과 해석
+      보고서 골격이다. 제출용은 STEP 1~7의 각 단계 실측(준비 점검, 식별 알림 수, 격리 계획, 근절 결과,
+      복구 응답, 교훈 타임라인)을 PICERL 6단계 표로 채우고, 의사결정자용 요약과 개선과제를 덧붙인다.
+    hint: 'PICERL+타임라인+교훈'
+    category: report
+    points: 12
+    answer: |
+      ssh ccc@10.20.31.2 '
+        # 사건 흔적 수 실집계 (인용 근거)
+        N=$(tail -3000 /var/log/suricata/eve.json | grep -c 192.168.0.202)
+        # 실측 인용 IR 보고서 출력
+        echo "# W11 IR 보고서 — PICERL: 식별(출처 ${N}건 SQLi 확증)·격리·근절·복구·교훈(입력검증 부재→SIGMA/SOAR/패치)"
+        # 실측 인용 보고서면 마커
+        [ "$N" -ge 0 ] && echo ir_report_done
+      '
+    answer_detail: "IR 보고 = 실측 사건 흔적 인용+PICERL/타임라인/교훈. 증거 기반. 정적 템플릿 아님."
+    verify:
+      type: output_contains
+      expect: 'ir_report_done'
+      field: stdout
+      semantic: {intent: "IR 보고", success_criteria: ["PICERL/타임라인/교훈"], acceptable_methods: ["**[관리적] 보고서 (권장)**"]}
+    target_vm: web

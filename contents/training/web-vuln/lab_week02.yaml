@@ -1,0 +1,447 @@
+lab_id: standalone-web-vuln-week02
+title: "점검 도구 — 스캐너 공격 vs 스캐너 탐지·핑거프린팅 방어"
+version: standalone-web-vuln
+course: web-vuln
+week: 2
+description: |
+  W01 의 수동 HTTP 점검을 자동화하는 취약점 스캐너 실습이다. 취약점 스캐너 nikto(알려진 취약 파일·헤더·
+  버전 점검), 핑거프린팅 whatweb(기술 스택·버전 식별), 디렉터리 탐색 ffuf(워드리스트로 숨은 경로 추측)를
+  점검자(WSTG 평가자)의 손으로 직접 돌린다. 동시에 방어자 관점으로, 이 능동 스캔들이 왜 WAF(ModSecurity
+  913 룰군)에 시끄럽게 잡히는지 확인하고, 서버가 자기 정보를 덜 흘리는 핑거프린팅 축소(ServerTokens 등)
+  방어를 설계한다. 핵심 교훈은 두 가지다 — 자동 스캐너는 빠르지만 (1) 오탐(false positive)이 많아 사람이
+  반드시 검증해야 하고, (2) 능동 스캔은 시끄러워서 거의 항상 탐지된다. 공격은 외부 공격자 VM
+  192.168.0.202(att/1, 출처 IP 192.168.0.202)에서 공인 진입 192.168.0.161로 — `ssh att@192.168.0.202`
+  (비번 1)로 접속해 수행하고, 방어 확인은 `ssh ccc@{{TARGET_IP}}`(el34 호스트) 후 `docker exec -it el34-web bash`. 인가된 실습만.
+difficulty: medium
+duration_minutes: 150
+prerequisites:
+  - "W01 통과"
+  - "el34 호스트 SSH + docker exec"
+  - "lecture §2(스캐너) §3(탐지) §4(핑거프린팅) 숙지"
+objectives:
+  - "취약점 스캐너 nikto 를 -maxtime 으로 시간 제한해 돌리고 서버 정보·누락 헤더·흥미로운 경로를 읽어낸다"
+  - "whatweb 으로 기술 스택·버전을 핑거프린팅하고 버전 노출이 CVE 매핑 단서가 됨을 설명한다"
+  - "ffuf 로 워드리스트 기반 디렉터리 탐색을 수행하고 응답 코드(200/301/403)를 해석한다"
+  - "방어자 관점에서 능동 스캐너의 흔적이 WAF 913 룰군에 어떻게 남는지 확인한다(능동 vs 수동 탐지 차이)"
+  - "핑거프린팅 축소(ServerTokens/ServerSignature/X-Powered-By 제거) 방어를 설계한다"
+  - "오탐을 거른 검증된 발견과 방어 권고를 담은 스캐너 점검 보고서를 작성한다"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표
+      이번 주에 쓸 세 점검 도구가 `외부 공격자 VM 192.168.0.202` 컨테이너에 설치돼 실행 가능한지 확인한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      자동 점검의 전제는 "도구가 있는가"부터 확인하는 것이다. 세 도구는 역할이 다르다 —
+      **nikto**(취약점 스캐너: 알려진 취약 파일·헤더·버전 점검), **whatweb**(핑거프린팅:
+      기술 스택·버전 식별), **ffuf**(디렉터리 탐색: 워드리스트로 숨은 경로 추측).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) nikto(취약점 스캐너) 실행 경로 확인 — command -v 가 경로를 반환하면 설치·실행 가능
+      command -v nikto
+      # 2) whatweb(핑거프린팅) 실행 경로 확인
+      command -v whatweb
+      # 3) ffuf(디렉터리 탐색) 실행 경로 확인
+      command -v ffuf
+      ```
+
+      ## ✅ 합격 기준
+      `nikto` 출력 시 통과. **근거:** 세 도구의 실행 경로가 보이면(특히 nikto) 자동 점검을 시작할 수
+      있고, 한 도구라도 경로가 없으면 그 실습을 시작할 수 없으니 먼저 원인을 파악한다.
+    hint: 'command -v nikto whatweb ffuf'
+    category: survey
+    points: 10
+    answer: |
+      # 1) nikto(취약점 스캐너) 실행 경로 확인 — command -v 가 경로를 반환하면 설치·실행 가능
+      ssh att@192.168.0.202 'command -v nikto'
+      # 2) whatweb(핑거프린팅) 실행 경로 확인
+      ssh att@192.168.0.202 'command -v whatweb'
+      # 3) ffuf(디렉터리 탐색) 실행 경로 확인
+      ssh att@192.168.0.202 'command -v ffuf'
+    answer_detail: "세 자동 점검 도구를 확보하는 단계다. nikto=웹 취약점 스캐너, whatweb=기술 스택 핑거프린팅, ffuf=디렉터리 탐색 퍼저. command -v 가 각 도구의 실행 경로를 반환하면 설치·실행 가능으로 판정한다."
+    expected_output: |
+      /usr/bin/nikto
+      /usr/bin/whatweb
+      /usr/local/bin/ffuf
+    verify:
+      type: output_contains
+      expect: 'nikto'
+      field: stdout
+      semantic:
+        intent: "스캐너 도구 점검"
+        success_criteria: ["nikto/whatweb/ffuf"]
+        acceptable_methods: ["**[OSS] command -v (권장)**"]
+    target_vm: web
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표
+      취약점 스캐너 nikto 로 능동 스캔을 직접 돌려, 자동 도구가 무엇을·어떻게 보고하는지 체감한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      **nikto** 는 알려진 취약 파일·위험 설정·누락된 보안 헤더·오래된 버전을 자동 점검하는
+      웹 취약점 스캐너다. W01 에서 손으로 하던 헤더·메서드 점검을 한 번에 묶어 자동화한 것이다.
+      반드시 **`-maxtime` 으로 실행 시간을 제한**한다 — 기본은 수 분~수십 분이 걸려 공유
+      인프라를 오래 점유하기 때문이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 취약점 스캐너 nikto 를 대상(-h http://192.168.0.161)에 실행 — -maxtime 25s 로 시간 제한(공유 인프라 점유 방지)
+      # 2) 출력 머리 12줄만 확인 → 머리의 Nikto 배너로 스캔 실행을 입증
+      nikto -h http://192.168.0.161 -maxtime 25s 2>&1 | head -12
+      ```
+
+      ## 🔎 출력 읽는 법
+      각 발견 줄(보통 `+` 로 시작)에서 세 부류에 주목한다 — (1) Server 정보(버전 노출),
+      (2) 누락된 보안 헤더, (3) 흥미로운 경로. 단, nikto 결과는 오탐이 섞일 수 있으니
+      그대로 믿지 말고 사람이 재현·검증해야 한다.
+
+      ## ✅ 합격 기준
+      `Nikto` 출력 시 통과. **근거:** 출력 머리에 Nikto 배너가 보이면 능동 스캔이 실행된 것이고,
+      이 스캔 자체가 곧 미션 5 에서 방어자에게 탐지된다(매우 시끄러운 능동 스캔).
+    hint: 'nikto -h'
+    category: recon
+    points: 12
+    answer: |
+      # 1) 취약점 스캐너 nikto 를 대상(-h http://192.168.0.161)에 실행 — -maxtime 25s 로 시간 제한(공유 인프라 점유 방지)
+      # 2) 출력 머리 12줄만 확인 → 머리의 Nikto 배너로 스캔 실행을 입증
+      ssh att@192.168.0.202 'nikto -h http://192.168.0.161 -maxtime 25s 2>&1 | head -12'
+    answer_detail: "nikto 는 알려진 취약 파일·위험 설정·누락 보안 헤더·오래된 버전을 자동 점검하는 웹 취약점 스캐너다. -maxtime 으로 시간을 캡해 공유 인프라 점유를 막는다. 출력의 Nikto 배너로 스캔 실행을 판정한다. nikto 는 정직한 UA(Nikto/...)와 요청 폭주로 매우 시끄러워 WAF 913 에 잡힌다(미션 5)."
+    expected_output: |
+      - Nikto v2.1.5
+      ---------------------------------------------------------------------------
+      + ERROR: Host maximum execution time of 25 seconds reached
+      + Target IP:          192.168.0.161
+      + Target Hostname:    adminconsole.6v6.lab
+      + Target Port:        80
+      + Start Time:         2026-06-26 14:47:57 (GMT0)
+      ---------------------------------------------------------------------------
+      + Server: Apache/2.4.52 (Ubuntu)
+      + The anti-clickjacking X-Frame-Options header is not present.
+      + No CGI Directories found (use '-C all' to force check all possible dirs)
+      + ERROR: Host maximum execution time of 25 seconds reached
+    verify:
+      type: output_contains
+      expect: 'Nikto'
+      field: stdout
+      semantic:
+        intent: "nikto 스캔"
+        success_criteria: ["nikto 실행"]
+        acceptable_methods: ["**[OSS] nikto (권장)**"]
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표
+      whatweb 으로 dvwa vhost 가 무슨 소프트웨어로 만들어졌는지(웹 서버·언어·프레임워크·버전)
+      식별한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      **핑거프린팅**은 대상의 기술 스택을 알아내는 정찰이다. 대상이 무엇으로 만들어졌는지
+      알아야 그 소프트웨어의 알려진 취약점(**CVE**: 공개 취약점 식별 번호)을 찾을 수 있다.
+      그래서 **버전 노출**이 그 자체로 위험한 정보다. whatweb 은 nikto 와 달리 요청이 적어
+      **조용한 정찰**(수동에 가까움)이라 탐지가 어렵다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) whatweb 으로 dvwa vhost 핑거프린팅 — -H 로 Host 헤더 지정(같은 192.168.0.161 이라도 vhost별 다른 사이트, W01 복습)
+      # 2) 식별 결과 5줄 확인 → 대상 URL(192.168.0.161)과 Apache[버전]·PHP[버전] 등 기술 항목 노출
+      whatweb http://dvwa.el34.lab/ 2>&1 | head -5
+      ```
+
+      ## 🔎 출력 읽는 법
+      식별 항목이 `Apache[2.4.x]`, `PHP[...]` 처럼 쉼표로 나열된다. 대괄호 안의 **버전 숫자**가
+      핵심 단서다. 버전이 안 보이거나 일반화돼 있으면 핑거프린팅 축소 방어가 적용된 신호일 수 있다.
+
+      ## ✅ 합격 기준
+      `192.168.0.161` 출력 시 통과. **근거:** 출력에 대상 IP 와 식별된 기술 항목이 보이면 핑거프린팅
+      성공이고, 노출된 버전은 곧 CVE 매핑의 입구가 된다.
+    hint: 'whatweb'
+    category: recon
+    points: 12
+    answer: |
+      # 1) whatweb 으로 dvwa vhost 핑거프린팅 — -H 로 Host 헤더 지정(같은 192.168.0.161 이라도 vhost별 다른 사이트, W01 복습)
+      # 2) 식별 결과 5줄 확인 → 대상 URL(192.168.0.161)과 Apache[버전]·PHP[버전] 등 기술 항목 노출
+      ssh att@192.168.0.202 "whatweb http://dvwa.el34.lab/ 2>&1 | head -5"
+    answer_detail: "whatweb 은 응답 헤더·HTML 단서로 기술 스택(웹 서버/언어/프레임워크/CMS/버전)을 식별하는 핑거프린팅 도구다. 버전이 노출되면 그 버전의 CVE 를 찾아 익스플로잇을 준비할 수 있으므로 버전 노출이 곧 위험한 단서다. 요청이 적어 nikto 보다 조용한 정찰이다. 출력에 대상 IP 와 기술 항목이 보이면 식별 성공으로 판정한다."
+    expected_output: |
+      http://192.168.0.161/ [403 Forbidden] Apache[2.4.52], Country[RESERVED][ZZ], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], IP[192.168.0.161], Title[403 Forbidden]
+    verify:
+      type: output_contains
+      expect: '192.168.0.161'
+      field: stdout
+      semantic:
+        intent: "whatweb 핑거프린팅"
+        success_criteria: ["기술 스택 식별"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표
+      워드리스트로 dvwa vhost 의 숨은 경로(`/admin`, `/login` 등)를 ffuf 로 탐색한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      웹에는 링크로 드러나지 않는 숨은 경로(관리·설정·백업)가 흔히 가장 중요한 공격 표면이다.
+      **ffuf** 는 URL 의 `FUZZ` 표식 자리에 **워드리스트**(경로 후보 목록)의 단어를 하나씩
+      대입(퍼징)하며 응답 코드로 존재 여부를 가른다. 호텔 복도의 모든 문을 빠르게 두드려 보는
+      것과 같다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) 워드리스트(경로 후보) 파일 생성 — admin/login/config/robots.txt/index.php
+      printf "admin\nlogin\nconfig\nrobots.txt\nindex.php\n" > /tmp/wv2.txt
+      # 2) ffuf 로 FUZZ 자리에 워드리스트 대입 — -mc 200,301,403 인 경로만 표시, -s 는 진행막대 없이 결과만
+      ffuf -u http://dvwa.el34.lab/FUZZ -w /tmp/wv2.txt -mc 200,301,403 -s 2>&1 | head
+      # 3) 임시 워드리스트 정리
+      rm -f /tmp/wv2.txt
+      ```
+
+      ## 🔎 응답 코드 해석
+      - **200** 존재·접근 가능(가장 흥미로운 발견) / **301·302** 존재하나 리다이렉트 /
+        **403** 존재하지만 권한 없음("막아 둘 만큼 중요한 것이 있다"는 강한 신호) / **404** 없음.
+
+      ## ✅ 합격 기준
+      `login` 출력 시 통과. **근거:** 워드리스트의 단어 중 존재하는 경로가 응답 코드와 함께 보이면
+      디렉터리 탐색 성공이다(특히 login).
+    hint: 'ffuf FUZZ'
+    category: recon
+    points: 12
+    answer: |
+      # 1) 워드리스트(경로 후보) 파일 생성 — admin/login/config/robots.txt/index.php
+      ssh att@192.168.0.202 'printf "admin\nlogin\nconfig\nrobots.txt\nindex.php\n" > /tmp/wv2.txt'
+      # 2) ffuf 로 FUZZ 자리에 워드리스트 대입 — -mc 200,301,403 인 경로만 표시, -s 는 진행막대 없이 결과만
+      ssh att@192.168.0.202 'ffuf -u http://dvwa.el34.lab/FUZZ -w /tmp/wv2.txt -mc 200,301,403 -s 2>&1 | head'
+      # 3) 임시 워드리스트 정리
+      ssh att@192.168.0.202 'rm -f /tmp/wv2.txt'
+    answer_detail: "ffuf 는 워드리스트를 URL 의 FUZZ 자리에 대입하며 숨은 경로를 찾는 웹 퍼저다. 응답 코드로 존재 여부를 가른다 — 200 접근가능, 301 리다이렉트, 403 존재하나 권한없음(중요 신호), 404 없음. 워드리스트에 없는 경로는 못 찾으므로(미탐) 여러 목록을 조합한다. login 등 존재 경로가 코드와 함께 보이면 성공으로 판정한다."
+    expected_output: |
+      robots.txt
+      index.php
+      admin
+      login
+      config
+    verify:
+      type: output_contains
+      expect: 'login'
+      field: stdout
+      semantic:
+        intent: "ffuf 디렉토리 탐색"
+        success_criteria: ["경로 발견"]
+        acceptable_methods: ["**[OSS] ffuf (권장)**"]
+    target_vm: web
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표
+      방어자 관점으로 돌아서서, 미션 2 의 nikto 능동 스캔이 WAF(ModSecurity)에 어떻게
+      탐지됐는지 로그에서 확인한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      좋은 점검자는 자기 스캔이 어떻게 탐지되는지 안다. el34 의 web Apache 는 WAF(ModSecurity)를
+      얹고 있고, CRS 의 **913 룰군(scanner detection)**이 알려진 스캐너의 UA(`nikto`/`sqlmap`/
+      `nmap` 등)와 요청 패턴을 잡는다. 능동 스캔은 정직한 UA + 요청 폭주로 거의 항상 잡힌다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) web 의 ModSecurity audit 로그 최근 200줄에서 스캐너 UA(nikto)와 913 룰ID(913xxx)만 뽑아 개수 집계
+      sudo tail -200 /var/log/apache2/modsec_audit.log | grep -oiE "nikto|913[0-9]{3}" | sort | uniq -c
+      ```
+
+      ## 💡 참고 (el34 사실)
+      el34 의 ModSecurity audit 로그(JSON)는 요청·응답 중심이라 매치된 CRS 룰 ID(913xxx)는
+      vhost 별 `*_error.log` 에 더 또렷하다. 다만 audit 로그에도 스캐너의 **UA 문자열 `nikto`**
+      가 요청에 그대로 담기므로, 이 UA 흔적만으로도 "스캐너가 다녀갔다"를 확실히 입증할 수 있다.
+
+      ## ✅ 합격 기준
+      `nikto` 출력 시 통과. **근거:** 로그에 nikto(또는 913xxx) 흔적이 개수와 함께 잡히면 스캐너
+      탐지가 입증된다. 흔적이 없으면 미션 2 의 nikto 스캔을 먼저 수행했는지, 로그 범위(tail)를 점검한다.
+    hint: 'modsec nikto/913'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) web 의 ModSecurity audit 로그 최근 200줄에서 스캐너 UA(nikto)와 913 룰ID(913xxx)만 뽑아 개수 집계
+      ssh ccc@10.20.32.80 'sudo tail -200 /var/log/apache2/modsec_audit.log | grep -oiE "nikto|913[0-9]{3}" | sort | uniq -c'
+    answer_detail: "ModSecurity 의 913 룰군은 알려진 스캐너 UA(nikto/sqlmap/nmap 등)와 요청 패턴을 잡는 scanner detection 전용 룰이다. nikto 의 정직한 UA 와 요청 폭주가 audit 로그에 그대로 남는다. 매치된 룰 ID(913xxx)는 vhost 별 error.log 에 더 또렷하지만, audit 로그의 UA 문자열 nikto 만으로도 스캐너 탐지를 입증한다. 능동 스캔이 거의 항상 탐지된다는 교훈을 확인하는 단계다."
+    expected_output: |
+      400 913100
+          388 913120
+            1 913675
+          194 Nikto
+         1164 nikto
+    verify:
+      type: output_contains
+      expect: 'nikto'
+      field: stdout
+      semantic:
+        intent: "스캐너 WAF 탐지"
+        success_criteria: ["nikto/913 탐지"]
+        acceptable_methods: ["**[OSS] modsec 913 (권장)**"]
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표
+      방어를 설계하기 전에, 지금 서버가 응답 헤더로 무엇을 노출하고 있는지 직접 점검한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      핑거프린팅의 주요 노출원은 **응답 헤더**다. `Server` 헤더는 웹 서버 종류·버전을,
+      `X-Powered-By` 는 언어·프레임워크를 흘린다. 노출된 버전은 곧 CVE 매핑의 입구이므로,
+      "무엇을 숨길지"는 "무엇이 노출되는지"를 본 다음에 정한다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **공격 VM:** `ssh att@192.168.0.202`(비번 1) 로 접속해 실행한다.
+
+      ```bash
+      # 1) whatweb -a1(적극 모드)로 응답 헤더 기반 핑거프린팅 — 서버 배너(HTTPServer/Apache 버전)와 비표준 헤더 노출을 한 줄로 식별
+      whatweb -a1 http://dvwa.el34.lab/
+      ```
+
+      ## 💡 참고 (el34 사실)
+      el34 의 web 은 현재 `Server` 헤더가 버전·OS 정보까지 비교적 자세히 노출되도록 설정돼
+      있어(ServerTokens 미축소) whatweb 이 `HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)]`
+      처럼 버전·OS 를 그대로 읽어낸다. 버전이 그대로 보인다는 것은 곧 `ServerTokens Prod` 로
+      줄여야 할 개선 지점이라는 뜻이다(미션 7 방어로 연결).
+
+      ## ✅ 합격 기준
+      `Apache` 출력 시 통과. **근거:** whatweb 출력의 `Apache[2.4.52]`·`HTTPServer[...][Apache/2.4.52 (Ubuntu)]`
+      처럼 서버 종류·버전(또는 OS) 이 노출되면 축소가 필요한 개선 지점이 확인된 것이다.
+    hint: 'whatweb -a1 배너'
+    category: analysis
+    points: 12
+    answer: |
+      # 1) whatweb -a1(적극 모드)로 응답 헤더 기반 핑거프린팅 — 서버 배너(HTTPServer/Apache 버전)와 비표준 헤더 노출을 한 줄로 식별
+      ssh att@192.168.0.202 "whatweb -a1 http://dvwa.el34.lab/"
+    answer_detail: "whatweb -a1(적극 모드)은 응답 헤더·HTML 단서로 서버 배너를 식별한다 — dvwa 는 WAF 가 403 을 돌려줘도 Apache[2.4.52]·HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)] 처럼 웹 서버 종류·버전·OS 가 그대로 노출된다. 노출된 버전은 CVE 매핑을 쉽게 만들므로 ServerTokens Prod 로 줄여야 할 개선 지점이다. whatweb 출력에 Apache 버전 배너가 보이면 노출 점검 성공으로 판정한다."
+    expected_output: |
+      http://dvwa.el34.lab/ [403 Forbidden] Apache[2.4.52], Country[RESERVED][ZZ], HTTPServer[Ubuntu Linux][Apache/2.4.52 (Ubuntu)], IP[192.168.0.161], Title[403 Forbidden]
+    verify:
+      type: output_contains
+      expect: 'Apache'
+      field: stdout
+      semantic:
+        intent: "핑거프린팅 정보 점검"
+        success_criteria: ["Server/기술 노출"]
+        acceptable_methods: ["**[OSS] whatweb (권장)**"]
+    target_vm: web
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표
+      앞 미션의 발견을 방어 권고로 정리한다 — 정보 숨김(핑거프린팅 축소)과 스캐너 탐지의 두 축.
+
+      ## 📖 개념 (왜 이걸 하나)
+      점검은 발견에서 끝나지 않고 방어 권고로 이어진다. 방어는 두 축이다 — (1) **정보 숨김**:
+      정상 동작에 불필요한 정보를 응답에서 덜어내 정찰을 어렵게 한다. (2) **스캐너 탐지**:
+      그래도 들어오는 능동 스캔을 WAF 913 과 요청 빈도 제한으로 잡는다. 단, 정보 숨김은
+      취약점을 없애는 게 아니라 정찰을 성가시게 하는 한 겹임을 기억한다(패치·접근제어를 보완).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) 정보 숨김(핑거프린팅 축소) 방어 항목 정리 — ServerTokens 등
+      echo "핑거프린팅: ServerTokens Prod, ServerSignature Off, X-Powered-By 제거, 오류페이지 일반화"
+      # 2) 스캐너 탐지·차단 방어 항목 정리 — WAF 913 + 빈도 제한
+      echo "스캐너 탐지: ModSec 913(UA), rate-limit, 반복 출발지 차단"
+      ```
+
+      ## ✅ 합격 기준
+      `ServerTokens` 출력 시 통과. **근거:** 정보 숨김 항목(ServerTokens 등)과 스캐너 탐지
+      항목(913/빈도 제한)이 모두 포함되면 방어 설계가 두 축을 갖춘 것이다.
+    hint: 'ServerTokens + 스캐너 탐지'
+    category: report
+    points: 10
+    answer: |
+      # 1) 정보 숨김(핑거프린팅 축소) 방어 항목 정리 — ServerTokens 등
+      echo "핑거프린팅: ServerTokens Prod, ServerSignature Off, X-Powered-By 제거, 오류페이지 일반화"
+      # 2) 스캐너 탐지·차단 방어 항목 정리 — WAF 913 + 빈도 제한
+      echo "스캐너 탐지: ModSec 913(UA), rate-limit, 반복 출발지 차단"
+    answer_detail: "방어는 두 축이다 — 정보 숨김(ServerTokens Prod·ServerSignature Off·X-Powered-By 제거·오류 일반화)으로 핑거프린팅을 어렵게 하고, 스캐너 탐지(WAF 913 UA 룰 + 요청 빈도 제한 + 반복 출발지 차단)로 능동 스캔을 잡는다. 정보 숨김은 근본 방어(패치·접근제어)를 대체하지 않고 보완하는 한 겹이다. 두 축이 모두 정리되면 방어 설계 성공으로 판정한다."
+    expected_output: |
+      핑거프린팅: ServerTokens Prod, ServerSignature Off, X-Powered-By 제거, 오류페이지 일반화
+      스캐너 탐지: ModSec 913(UA), rate-limit, 반복 출발지 차단
+    verify:
+      type: output_contains
+      expect: 'ServerTokens'
+      field: stdout
+      semantic:
+        intent: "스캐너/핑거프린팅 방어"
+        success_criteria: ["정보 숨김", "스캐너 탐지"]
+        acceptable_methods: ["**[설명] 방어 (권장)**"]
+    target_vm: web
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표
+      미션 1–7 을 하나의 점검 보고서로 종합한다 — 검증된 발견과 방어 권고를 문서로 입증한다.
+
+      ## 📖 개념 (왜 이걸 하나)
+      보고서는 "스캐너를 돌렸다"가 아니라 "오탐을 거른 검증된 발견과 방어 권고"를 담아야
+      신뢰를 얻는다. 자동 스캐너의 두 그림자 — 오탐(사람의 검증 필요)과 시끄러움(능동 스캔은
+      탐지됨) — 을 결론에 분명히 적는다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) heredoc(<<'EOF' ... EOF)으로 스캐너 점검 보고서를 그대로 출력 — 스캐너 결과·탐지·핑거프린팅·방어를 종합
+      cat > ~/web-vuln_w02_note1.md <<'EOF'
+      # 웹취약점 W02 스캐너 보고서
+      ## 1. nikto(취약점)/whatweb(스택)/ffuf(경로) 자동 점검
+      ## 2. 탐지: nikto UA → WAF 913. 매우 시끄러움
+      ## 3. 핑거프린팅: Server 버전/X-Powered-By 노출
+      ## 4. 방어: 정보 숨김(ServerTokens) + 스캐너 탐지(913/rate)
+      ## 결론: 자동 스캐너는 빠르나 탐지된다. 방어는 정보 숨김+탐지
+      EOF
+      cat ~/web-vuln_w02_note1.md
+      ```
+
+      ## ✅ 합격 기준
+      `스캐너` 출력 시 통과. **근거:** 보고서에 스캐너 결과·탐지·핑거프린팅·방어가 모두 포함되면
+      검증된 발견과 방어 권고를 담은 점검 보고서로 인정된다.
+    hint: '스캐너+탐지+방어'
+    category: report
+    points: 10
+    answer: |
+      cat > ~/web-vuln_w02_note2.md <<'EOF'
+      # 웹취약점 W02 스캐너 보고서
+      ## 1. nikto(취약점)/whatweb(스택)/ffuf(경로) 자동 점검
+      ## 2. 탐지: nikto UA → WAF 913. 매우 시끄러움
+      ## 3. 핑거프린팅: Server 버전/X-Powered-By 노출
+      ## 4. 방어: 정보 숨김(ServerTokens) + 스캐너 탐지(913/rate)
+      ## 결론: 자동 스캐너는 빠르나 탐지된다. 방어는 정보 숨김+탐지
+      EOF
+      cat ~/web-vuln_w02_note2.md
+    answer_detail: "스캐너 점검 보고서는 nikto/whatweb/ffuf 결과 → 스캐너 탐지(913) → 핑거프린팅 노출 → 방어 권고를 종합한다. 핵심 결론은 자동 스캐너의 두 그림자다 — 오탐이 많아 사람의 검증이 필요하고, 능동 스캔은 시끄러워 탐지된다. 검증되지 않은 스캐너 출력을 그대로 싣지 않는 것이 신뢰의 핵심이다. 보고서에 스캐너 결과·탐지·방어가 모두 포함되면 종합 성공으로 판정한다."
+    expected_output: |
+      # 웹취약점 W02 스캐너 보고서
+      ## 1. nikto(취약점)/whatweb(스택)/ffuf(경로) 자동 점검
+      ## 2. 탐지: nikto UA → WAF 913. 매우 시끄러움
+      ## 3. 핑거프린팅: Server 버전/X-Powered-By 노출
+      ## 4. 방어: 정보 숨김(ServerTokens) + 스캐너 탐지(913/rate)
+      ## 결론: 자동 스캐너는 빠르나 탐지된다. 방어는 정보 숨김+탐지
+    verify:
+      type: output_contains
+      expect: '스캐너'
+      field: stdout
+      semantic:
+        intent: "스캐너 종합 보고"
+        success_criteria: ["스캐너/탐지/방어"]
+        acceptable_methods: ["**[관리적] 보고서 (권장)**"]
+    target_vm: web

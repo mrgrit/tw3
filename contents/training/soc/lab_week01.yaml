@@ -1,0 +1,575 @@
+lab_id: standalone-soc-week01
+title: "다중벡터 공격 vs SOC 관제·L1 트리아지"
+version: standalone-soc
+course: soc
+week: 1
+description: |
+  SOC L1 분석가의 하루를 압축한 실습이다. 외부 공격자가 한 번에 세 갈래(포트 스캔 + SSH 무차별
+  대입 + 웹 SQLi)로 들어오는 다중벡터 공격을 직접 재현하고(Red), 그 공격이 소스별로 흩어져 남긴
+  텔레메트리를 분석해(Blue) L1 트리아지를 수행한다. 트리아지란 경보 하나하나를 깊게 파지 않고
+  4요소(출발지 srcip / 시그니처 rule.description / 시각 timestamp / 심각도 rule.level)만 빠르게
+  읽어 분류 → 우선순위(P1/P2/P3) → 상관까지 가는 1차 판단이다. 마지막엔 흩어진 세 경보를 같은
+  출발지 IP 로 엮어 "한 공격자의 단계적 캠페인(정찰 → 침투)"으로 종합한다(Purple).
+
+  분석 소스(어떤 공격이 어디에 흔적을 남기나):
+    - Suricata eve.json (네트워크) ← 포트 스캔
+    - 호스트 /var/log/auth.log (인증) ← SSH 무차별 대입
+    - web modsec_audit.log (웹) ← 웹 SQLi
+    - Wazuh alerts.json ← 위 소스가 SIEM 한곳으로 모인 통합 경보 스트림
+  관측·분석 중심이라 인프라 변경은 없다. 공격(재현)은 내 공격 VM `ssh att@192.168.0.202`(비번 1)에서
+  발신하고(세 벡터 모두 출처 192.168.0.202로 통일됨), 분석은 `ssh ccc@{{TARGET_IP}}`(el34 호스트, 비번 1)에서
+  `ssh ccc@<장비IP>`(siem 32.100/ips 31.2/web 32.80)로 한다. 인증 로그는 호스트의 /var/log/auth.log(ccc는 adm
+  그룹이라 sudo 없이 읽음). 도구 풀이 — jq: JSON 로그에서 원하는 필드만 뽑는 명령줄 도구.
+difficulty: medium
+duration_minutes: 180
+prerequisites:
+  - "el34 호스트 SSH(ssh ccc@{{TARGET_IP}}) + docker exec"
+  - "lecture §3(트리아지 4요소) §4(다중벡터) §5(우선순위) 숙지"
+objectives:
+  - "SIEM(Wazuh) 가동 확인 — analysisd 데몬 + alerts.json 경보 적재 (관제의 출발점)"
+  - "다중벡터 공격(포트 스캔 / SSH 무차별 대입 / 웹 SQLi) 재현 + 각 벡터가 남기는 소스 매핑"
+  - "L1 트리아지 4요소(출발지 srcip / 시그니처 rule.description / 시각 timestamp / 심각도 level) 식별 + 분류"
+  - "공격 단계(정찰<침투)와 빈도(단발<다발)로 우선순위(P1/P2/P3) 판정"
+  - "흩어진 세 경보를 같은 출발지 IP 로 엮어 한 공격자의 캠페인(정찰→침투)으로 상관(correlation)"
+  - "4요소 + 분류 + 우선순위 + 상관을 한 장의 L1 트리아지 보고서로 종합"
+pass_threshold: 0.7
+steps:
+
+  - order: 1
+    instruction: |
+      ## 🎯 목표 — SOC 대시보드 점검 (경보가 모이고 있나)
+
+      관제의 모든 분석은 "SIEM이 경보를 실제로 수집 중인가"의 확인에서 출발한다. 이 첫 점검이
+      실패하면(데몬 정지·스트림 멈춤) 뒤따르는 트리아지가 전부 무의미하다. 분석가가 매일 아침
+      가장 먼저 하는 일이 바로 이 헬스체크다.
+
+      ## 개념 한 줄
+      SIEM(Wazuh)은 흩어진 소스(Suricata=네트워크 / ModSec=웹 / 호스트 인증 로그)의 이벤트를
+      한 스트림(alerts.json)으로 모은다. 그 두뇌가 analysisd 데몬이다 — 이게 살아 있어야 경보가
+      생성된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-siem` — `docker exec -it el34-siem bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) Wazuh manager 데몬 상태에서 경보 생성 핵심 데몬 analysisd 가동 확인
+      /var/ossec/bin/wazuh-control status | grep analysisd
+      # 2) alerts.json 에서 출발지(src_ip) 있는 최근 경보 1건을 jq로 파싱 — 4요소(출발지/시그니처/시각/심각도) 미리보기
+      tail -1000 /var/ossec/logs/alerts/alerts.json | grep '"src_ip"' | tail -1 | jq '{src:.data.src_ip, sig:.rule.description, when:.timestamp, level:.rule.level}'
+      ```
+
+      ## ✅ 합격 기준
+      `analysisd` 출력 시 통과. **근거:** analysisd is running 이 나오면 경보 생성 데몬이 가동 중이고,
+      alerts.json 의 최근 1건이 jq 로 파싱돼 4요소가 보인다 — 안 보이면 manager·agent 연결을 점검한다.
+
+      ## 🔧 도구 풀이
+      - `wazuh-control status` — Wazuh manager 의 데몬 가동 상태를 보여주는 명령. analysisd 가
+        경보 생성의 핵심 데몬이다.
+      - `jq` — JSON 로그에서 원하는 필드만 골라 뽑는 명령줄 도구. `{src:.data.src_ip ...}` 는
+        경보에서 4요소 필드만 추려 보여준다.
+    hint: 'wazuh-control analysisd + alerts.json tail jq'
+    category: survey
+    points: 10
+    answer: |
+      # 1) Wazuh manager 데몬 상태에서 경보 생성 핵심 데몬 analysisd 가동 확인
+      ssh ccc@10.20.32.100 sudo /var/ossec/bin/wazuh-control status | grep analysisd
+      # 2) alerts.json 에서 출발지(src_ip) 있는 최근 경보 1건을 jq로 파싱 — 4요소(출발지/시그니처/시각/심각도) 미리보기
+      ssh ccc@10.20.32.100 'tail -1000 /var/ossec/logs/alerts/alerts.json | grep "\"src_ip\"" | tail -1 | jq "{src:.data.src_ip, sig:.rule.description, when:.timestamp, level:.rule.level}"'
+    answer_detail: "SOC 관제의 토대 = SIEM(Wazuh)의 analysisd 데몬이 소스(Suricata/ModSec/호스트 인증 로그)의 이벤트를 alerts.json 한 스트림으로 수집하는 것. 채점은 출력에 'analysisd'(running)가 포함되는지로 가용성을 확인한다. 분석가는 이 스트림에서 4요소(출발지 src_ip/시그니처 rule.description/시각 timestamp/심각도 rule.level)를 읽는다 — 이 4요소가 본 실습 전체의 분석 골격이다."
+    expected_output: |
+      wazuh-analysisd is running...
+      {
+        "src": "192.168.0.202",
+        "sig": "Suricata: Alert - EL34 Bot UA - sqlmap",
+        "when": "2026-06-26T14:45:40.538+0000",
+        "level": 3
+      }
+    verify:
+      type: output_contains
+      expect: 'analysisd'
+      field: stdout
+      semantic:
+        intent: "SIEM 경보 수집 가용성 점검 (관제 출발점)"
+        success_criteria: ["analysisd running", "alerts.json 적재", "4요소 인지"]
+        acceptable_methods:
+          - "**[OSS] wazuh-control + alerts.json (권장)**"
+    target_vm: siem
+
+  - order: 2
+    instruction: |
+      ## 🎯 목표 — 다중벡터 공격 재현 (스캔 + SSH 무차별 대입 + 웹)
+
+      분석(Blue)의 대상이 되는 경보를 학생이 직접 만들어 "공격 → 경보"의 인과를 체득한다.
+      한 공격자가 세 갈래로 들어오면 SOC 화면이 세 개의 별개 경보로 채워진다 — 이 흩어짐을
+      눈으로 확인하는 것이 이후 트리아지·상관의 출발점이다.
+
+      ## 개념 한 줄
+      다중벡터 = 한 공격자가 여러 경로로 동시에 시도. 각 벡터는 서로 다른 소스에 흔적을 남긴다:
+      ①포트 스캔→Suricata eve(네트워크), ②SSH 무차별 대입→호스트 auth.log(인증),
+      ③웹 SQLi→ModSec audit(웹).
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실행 위치:** 세 벡터 모두 내 공격 VM `ssh att@192.168.0.202`(비번 1)에서 발신한다 —
+      스캔·웹은 공인 진입 192.168.0.161로, SSH 무차별 대입은 el34 호스트(192.168.0.80) SSH로.
+
+      ```bash
+      # ── (202에서) ① 포트 스캔 — 공인 진입으로 SYN 스캔 (Suricata eve에 흔적) ──
+      sudo nmap -sS -p 20-200 192.168.0.161 -T4 --max-retries 1 >/dev/null 2>&1; echo scanned
+
+      # ── (202에서) ② SSH 무차별 대입 — el34 호스트(192.168.0.80) SSH에 없는 계정 8회 실패(auth.log에 src 192.168.0.202로 다발) ──
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad1@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad2@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad3@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad4@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad5@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad6@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad7@192.168.0.80 exit
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 socw1bad8@192.168.0.80 exit
+      echo "brute x8 done"
+
+      # ── 외부 공격자 VM 192.168.0.202 에서: ③ 웹 SQLi (sqlmap UA, ModSec audit에 942) ──
+      sqlmap -u 'http://dvwa.el34.lab/?id=socw1' --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear|403 \(Forbidden\)' | head -3
+
+      echo "3-vector done"
+      ```
+
+      ## ✅ 합격 기준
+      `vector done` 출력 시 통과. **근거:** 3-vector done 이 나오면 세 벡터가 모두 실행돼 각 소스
+      (eve / auth.log / modsec_audit)에 새 이벤트가 쌓인 것 — 이를 실습 3~5 에서 찾아 분류한다.
+
+      ## 🔧 도구 풀이
+      - `nmap -sS` — 열린 포트를 탐색하는 정찰 도구. `-sS` 는 완전한 연결을 맺지 않는 SYN 스캔이다.
+      - `ssh ... socw1bad$i@192.168.0.80` — 202에서 el34 호스트 SSH에 없는 계정으로 8회 로그인 실패를
+        만들어, 호스트 auth.log 에 `Invalid user ... from 192.168.0.202` 무차별 대입 흔적을 남긴다.
+      - `sqlmap` — SQL 자동 공격 도구. 기본 User-Agent(`sqlmap/1.x`)와 `UNION SELECT`·`OR` 페이로드를
+        그대로 실어 수백 요청을 보낸다 — 진짜 도구라 ModSec 의 SQLi 룰(942)·스캐너 룰(913)에 대량으로 잡힌다.
+
+      ## ⚠️ 윤리
+      공격은 반드시 el34 실습 환경 안에서만 발생시킨다. 외부 시스템 대상 시도는 절대 금지다.
+    hint: 'nmap + ssh 실패 8회(202→192.168.0.80) + 웹 SQLi'
+    category: recon
+    points: 10
+    answer: |
+      # 1) ① 포트 스캔 — 외부 공격자 VM 192.168.0.202가 SYN 스캔(Suricata eve에 흔적)
+      ssh att@192.168.0.202 'sudo nmap -sS -p 20-200 192.168.0.161 -T4 --max-retries 1 >/dev/null 2>&1; echo scanned'
+      # 2) ② SSH 무차별 대입 — 내 공격 VM(202)에서 el34 호스트(192.168.0.80) SSH에 없는 계정 8회 실패(auth.log에 src 192.168.0.202로 다발)
+      ssh att@192.168.0.202 'for u in socw1bad1 socw1bad2 socw1bad3 socw1bad4 socw1bad5 socw1bad6 socw1bad7 socw1bad8; do ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=3 ${u}@192.168.0.80 exit; done'
+      echo "brute x8 done"
+      # 3) ③ 웹 SQLi — sqlmap UA로 UNION SELECT 주입(ModSec audit에 942)
+      ssh att@192.168.0.202 "sqlmap -u 'http://dvwa.el34.lab/?id=socw1' --batch --level=2 --risk=2 --flush-session --disable-coloring 2>&1 | grep -iE 'WAF/IPS|do not appear|403 \(Forbidden\)' | head -3"
+      # 4) 3벡터 완료 마커
+      echo "3-vector done"
+    answer_detail: "한 공격자가 세 벡터로 공격하면 각각 다른 소스에 다른 경보로 흩어진다 — 스캔(Suricata eve)/인증 무차별 대입(호스트 auth.log)/웹(ModSec audit). 채점은 'vector done' 출력으로 3벡터 재현을 확인한다. 이 흩어짐이 본 실습의 핵심 난점이며, 실습 7 에서 같은 출발지로 다시 엮는다. (인증 벡터는 202에서 el34 호스트 192.168.0.80 SSH로 브루트 → auth.log에 src 192.168.0.202로 남아, 스캔·웹과 같은 출발지로 상관된다.)"
+    expected_output: |
+      scanned
+      brute x8 done
+      403 (Forbidden) - 445 times
+      3-vector done
+    verify:
+      type: output_contains
+      expect: 'vector done'
+      field: stdout
+      semantic:
+        intent: "다중벡터 공격 재현 — 세 소스에 경보 생성"
+        success_criteria: ["스캔/인증/웹 3벡터", "각 텔레메트리 소스 인지"]
+        acceptable_methods:
+          - "**[OSS] nmap + ssh 실패 + 웹 sqlmap (권장)**"
+    target_vm: web
+
+  - order: 3
+    instruction: |
+      ## 🎯 목표 — 트리아지: 스캔 경보 (정찰 분류, P3)
+
+      가장 흔하고 가장 덜 위험한 경보인 포트 스캔을 분류하며 트리아지 4요소의 기본기를 익힌다.
+      정찰 경보를 옳게 P3(낮음)로 내리는 것이 L1 의 첫 판단이다.
+
+      ## 개념 한 줄
+      포트 스캔은 공격의 "정찰" 단계(MITRE T1046) — 공격자가 열린 문을 찾는 행위다. Suricata 가
+      네트워크 패킷을 보고 eve.json 에 alert 로 남긴다. 아직 침투가 아니므로 단발이면 우선순위 낮음.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-ips` — `docker exec -it el34-ips bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) Suricata eve에서 scan 시그니처 alert만 골라 시그니처/출발지/심각도 추출(최근 3건)
+      tail -3000 /var/log/suricata/eve.json | jq -c 'select(.event_type=="alert" and (.alert.signature|test("scan";"i")))|{sig:.alert.signature,src:.src_ip,sev:.alert.severity}' | tail -3
+      # 2) 해석 — 정찰(Recon, MITRE T1046). 단발 스캔 = 우선순위 낮음(P3)
+      # → 분류: 정찰(Recon, MITRE T1046). 단발 스캔 = 우선순위 낮음(P3)
+      ```
+
+      ## ✅ 합격 기준
+      `scan` 출력 시 통과. **근거:** scan 류 시그니처가 출발지(src)·심각도(sev)와 함께 나오면 4요소
+      중 셋을 식별한 것 → "정찰(T1046), 단발이라 P3" 로 분류. 안 보이면 실습 2 의 nmap 을 다시 실행한다.
+
+      ## 🔧 도구 풀이
+      - eve.json — Suricata 가 분석한 모든 이벤트를 한 줄당 1 JSON 으로 남기는 로그. `event_type`
+        으로 종류를 구분하며, 공격 탐지는 `event_type=="alert"` 다.
+      - `jq ... test("scan";"i")` — 시그니처 이름에 "scan" 이 (대소문자 무시 "i") 들어간 alert 만
+        골라낸다. `.alert.severity` 가 Suricata 의 심각도(숫자가 작을수록 위험)다.
+    hint: 'eve.json 의 scan 시그니처 + src_ip + severity'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) Suricata eve에서 scan 시그니처 alert만 골라 시그니처/출발지/심각도 추출(최근 3건)
+      ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | jq -c "select(.event_type==\"alert\" and (.alert.signature|test(\"scan\";\"i\")))|{sig:.alert.signature,src:.src_ip,sev:.alert.severity}" | tail -3'
+      # 2) 해석 — 정찰(Recon, MITRE T1046). 단발 스캔 = 우선순위 낮음(P3)
+      # → 분류: 정찰(Recon, MITRE T1046). 단발 스캔 = 우선순위 낮음(P3)
+    answer_detail: "스캔 경보는 공격의 정찰 단계(T1046)다. eve.json 의 alert 에서 출발지(src_ip)·시그니처(예: ET SCAN nmap SYN scan)·심각도(severity)의 3요소를 식별한다. 채점은 출력에 'scan' 시그니처가 잡히는지로 확인. 정찰은 '곧 공격이 온다'는 신호이지만 단독·단발이면 P3(낮음)으로 내린다 — 다만 같은 출발지가 반복되거나 다른 벡터와 엮이면(실습 7) 위험도가 급등하므로 맥락으로 기록해 둔다."
+    expected_output: |
+      {"sig":"EL34 Possible nmap SYN scan","src":"192.168.0.202","sev":3}
+      {"sig":"EL34 Possible nmap SYN scan","src":"192.168.0.202","sev":3}
+      {"sig":"EL34 Possible nmap SYN scan","src":"192.168.0.202","sev":3}
+      → 분류: 정찰(Recon, MITRE T1046). 단발 스캔 = 우선순위 낮음(P3)
+    verify:
+      type: output_contains
+      expect: 'scan'
+      field: stdout
+      semantic:
+        intent: "스캔 경보 트리아지 — 출발지/시그니처/심각도 식별 + 정찰 분류"
+        success_criteria: ["scan 시그니처", "src_ip 식별", "정찰(P3) 분류"]
+        acceptable_methods:
+          - "**[OSS] eve.json scan 경보 분석 (권장)**"
+    target_vm: ips
+
+  - order: 4
+    instruction: |
+      ## 🎯 목표 — 트리아지: 인증 실패 경보 (무차별 대입 판정, P2)
+
+      "정상 오타 한두 번"과 "무차별 대입 다발"을 구분하는 것이 인증 분석의 핵심이다. 이 구분을
+      빈도(짧은 시간 다발)와 계정 다양성으로 판정하는 법을 익힌다.
+
+      ## 개념 한 줄
+      SSH 무차별 대입(MITRE T1110) = 여러 계정/비번을 자동으로 반복 시도하는 공격. 호스트
+      인증 로그(/var/log/auth.log)에 `Invalid user`(없는 계정 시도) / `Failed password`(비번 실패)
+      로 남는다. 다발 + 여러 계정이면 사전(wordlist) 기반 자동화 공격의 강한 신호다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) auth.log에서 인증 실패(없는 계정/비번 실패) 최근 10줄
+      grep -aE "Invalid user|Failed password" /var/log/auth.log | tail -10
+      # 2) 무차별 대입 실패 건수 집계(-c) — 빈도가 판정 단서
+      grep -acE "Invalid user socw1|Failed password" /var/log/auth.log
+      # 3) 판정 — 짧은 시간 다발 = SSH 무차별 대입(T1110), 진행형 → P2
+      # → 판정: 짧은 시간 다발 = SSH 무차별 대입(T1110). 진행형 공격 → P2(중간, 스캔보다 우선)
+      ```
+
+      ## ✅ 합격 기준
+      `Invalid user` 출력 시 통과. **근거:** Invalid user 가 다발(8건+)로 여러 계정(socw1bad*)에 걸쳐
+      나오면 "무차별 대입, 진행형이라 P2" 로 판정 — 단발 1~2건이면 정상 오타일 수 있어 우선순위를 낮춘다.
+
+      ## 🔧 도구 풀이
+      - /var/log/auth.log — 리눅스 호스트의 로그인 시도 기록 파일. ccc 계정은 adm 그룹이라 sudo
+        없이 읽는다.
+      - `grep -aE` — `-a`: 바이너리로 오인될 수 있는 줄도 텍스트로 검색, `-E`: 확장 정규식(`|`=또는).
+      - `grep -acE` — 여기에 `-c` 를 더해 매치된 줄 "수"만 센다(= 빈도 측정). 빈도가 무차별 대입
+        판정의 핵심 단서다.
+    hint: 'auth.log 의 Invalid user/Failed password 빈도 + 계정'
+    category: analysis
+    points: 16
+    answer: |
+      # 1) auth.log에서 인증 실패(없는 계정/비번 실패) 최근 10줄
+      grep -aE "Invalid user|Failed password" /var/log/auth.log | tail -10
+      # 2) 무차별 대입 실패 건수 집계(-c) — 빈도가 판정 단서
+      grep -acE "Invalid user socw1|Failed password" /var/log/auth.log
+      # 3) 판정 — 짧은 시간 다발 = SSH 무차별 대입(T1110), 진행형 → P2
+      # → 판정: 짧은 시간 다발 = SSH 무차별 대입(T1110). 진행형 공격 → P2(중간, 스캔보다 우선)
+    answer_detail: "인증 실패가 짧은 시간에 다발(8건+)로 여러 계정(socw1bad*)에 걸쳐 나타나면 무차별 대입(T1110)이다. 채점은 출력에 'Invalid user'(없는 계정 시도)가 잡히는지로 확인한다. 단발 실패(사용자 오타, 정상)와 구분하는 결정적 단서는 두 가지 — 빈도(grep -c 로 측정한 건수)와 계정 다양성. 무차별 대입은 '곧 침투를 시도한다'는 진행형 신호라 단발 정찰(P3)보다 우선(P2)이다. W02 에서 이 인증 로그를 성공(Accepted) 추적까지 한층 깊게 분석한다."
+    expected_output: |
+      Jun 26 23:07:17 el34 sshd[2166924]: Invalid user socw1bad7 from 192.168.0.202 port 57056
+      Jun 26 23:07:17 el34 sshd[2166946]: Invalid user socw1bad8 from 192.168.0.202 port 57064
+      Jun 26 23:45:50 el34 sshd[2303433]: Invalid user socw1bad1 from 192.168.0.202 port 36620
+      Jun 26 23:45:50 el34 sshd[2303436]: Invalid user socw1bad2 from 192.168.0.202 port 36624
+      Jun 26 23:45:50 el34 sshd[2303439]: Invalid user socw1bad3 from 192.168.0.202 port 36640
+      Jun 26 23:45:50 el34 sshd[2303461]: Invalid user socw1bad4 from 192.168.0.202 port 36646
+      Jun 26 23:45:50 el34 sshd[2303466]: Invalid user socw1bad5 from 192.168.0.202 port 36656
+      Jun 26 23:45:50 el34 sshd[2303469]: Invalid user socw1bad6 from 192.168.0.202 port 36670
+      Jun 26 23:45:50 elf4
+    verify:
+      type: output_contains
+      expect: 'Invalid user'
+      field: stdout
+      semantic:
+        intent: "인증 실패 트리아지 — 빈도/계정으로 무차별 대입 판정 + 우선순위"
+        success_criteria: ["Invalid user 다발", "빈도+계정 분석", "무차별 대입(P2) 판정"]
+        acceptable_methods:
+          - "**[OSS] auth.log Invalid user/Failed 빈도 (권장)**"
+          - "**[설명] 단발 vs 다발 구분**"
+    target_vm: siem
+
+  - order: 5
+    instruction: |
+      ## 🎯 목표 — 트리아지: 웹 공격 경보 (시그니처/대상 식별)
+
+      웹은 가장 흔한 침투 경로다. ModSec(WAF)이 차단한 웹 공격의 시그니처와 출발지를 읽어
+      "웹 익스플로잇 시도"로 분류하는 법을 익힌다.
+
+      ## 개념 한 줄
+      웹 공격(SQLi 등, MITRE T1190)은 web 의 ModSecurity(WAF)가 검사해 modsec_audit.log 에
+      남긴다. CRS 룰 ID 로 공격 종류를 식별한다 — 942=SQL Injection, 913=스캐너 탐지. 차단되면
+      HTTP 403 이 응답된다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** `el34-web` — `docker exec -it el34-web bash` 로 접속해 실행한다.
+
+      ```bash
+      # 1) modsec_audit 최근 80줄에서 CRS 룰ID(942 SQLi 등)/도구지문(sqlmap) 추출
+      sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "94[0-9]1[0-9]{2}|sqlmap" | sort -u
+      # 2) 최근 1건의 차단 상태(403)와 실제 출발지(remote_address) 확인
+      sudo tail -1 /var/log/apache2/modsec_audit.log | jq '{status:.response.status, remote:.transaction.remote_address}'
+      # 3) 해석 — 웹 익스플로잇(SQLi/스캐너), 출발지 remote_address 식별
+      # → 분류: 웹 익스플로잇(SQLi/스캐너). 출발지 remote_address 식별
+      ```
+
+      ## ✅ 합격 기준
+      `sqlmap` 출력 시 통과. **근거:** 942(SQLi) 또는 도구 지문 sqlmap 이 매치되고 차단 결과(403)·실제
+      출발지(remote_address=192.168.0.202)가 식별되면 통과 — el34 는 출처 IP 를 보존한다.
+
+      ## 🔧 도구 풀이
+      - modsec_audit.log — ModSecurity 가 검사한 웹 트랜잭션의 감사 로그(JSON 형식). 차단된
+        요청의 출발지·상태·매치 룰을 담는다.
+      - CRS(OWASP Core Rule Set) — ModSec 의 표준 웹 공격 룰셋. 942 대역이 SQLi, 941 이 XSS,
+        913 이 스캐너 탐지다.
+      - `remote_address` — 요청을 보낸 실제 출발지 IP. 상관(실습 7)에서 다른 소스의 출발지와
+        대조하는 핵심 키다.
+    hint: 'modsec audit 의 942/sqlmap + remote_address'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) modsec_audit 최근 80줄에서 CRS 룰ID(942 SQLi 등)/도구지문(sqlmap) 추출
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "94[0-9]1[0-9]{2}|sqlmap" | sort -u'
+      # 2) 최근 1건의 차단 상태(403)와 실제 출발지(remote_address) 확인
+      ssh ccc@10.20.32.80 'sudo tail -1 /var/log/apache2/modsec_audit.log | jq "{status:.response.status, remote:.transaction.remote_address}"'
+      # 3) 해석 — 웹 익스플로잇(SQLi/스캐너), 출발지 remote_address 식별
+      # → 분류: 웹 익스플로잇(SQLi/스캐너). 출발지 remote_address 식별
+    answer_detail: "웹 공격은 ModSec audit 에 CRS 룰 ID 로 남는다 — 942=SQLi, 913=스캐너. 채점은 출력에 도구 지문 'sqlmap' 이 잡히는지로 확인한다. remote_address 가 실제 출발지(192.168.0.202)로 보존되는 점이 핵심 — el34 는 fw 가 SNAT 하지 않아 출처 IP 가 web 까지 그대로 전달된다(상관의 전제). 웹은 정찰이 아닌 침투 시도라 스캔(P3)보다 우선(P2)으로 분류한다."
+    expected_output: |
+      941100
+      941110
+      941120
+      941160
+      942100
+      942160
+      942190
+      949110
+      sqlmap
+      {
+        "status": 403,
+        "remote": "192.168.0.202"
+      … (이하 생략)
+    verify:
+      type: output_contains
+      expect: 'sqlmap'
+      field: stdout
+      semantic:
+        intent: "웹 공격 경보 트리아지 — 시그니처/대상 식별"
+        success_criteria: ["942/sqlmap 시그니처", "remote_address", "웹 익스플로잇 분류"]
+        acceptable_methods:
+          - "**[OSS] modsec audit grep (권장)**"
+    target_vm: web
+
+  - order: 6
+    instruction: |
+      ## 🎯 목표 — 우선순위 정렬 (무엇부터 보나)
+
+      실습 3~5 에서 분류한 세 경보를 P1/P2/P3 로 줄 세우는 L1 의 핵심 의사결정을 연습한다.
+      한정된 분석 시간을 어디에 쓸지 정하는 작업이다.
+
+      ## 개념 한 줄
+      우선순위는 두 신호로 매긴다 — ①공격 단계(정찰 < 침투): 아직 안 들어온 정찰보다 이미
+      공격 중인 침투가 위험. ②빈도(단발 < 다발): 짧은 시간 다발은 자동화된 진행형 공격의
+      강한 신호. (P1=침투 성공/치명, P2=진행형 침투 시도, P3=정찰/단발.)
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) 스캔(정찰, 단발) → P3 낮음
+      echo "스캔(정찰, 단발)        → P3 (낮음)"
+      # 2) 웹 SQLi(침투 시도) → P2 중간
+      echo "웹 SQLi(침투 시도)       → P2 (중간)"
+      # 3) SSH 무차별 대입(다발) → P2 중간(진행형)
+      echo "SSH 무차별 대입(8건 다발) → P2 (중간, 진행형 — 곧 침투 시도)"
+      # 4) 결론 — 진행형/침투(웹·인증) 먼저, 정찰(스캔)은 맥락으로 기록
+      # → 진행형/침투(웹·인증)을 먼저 본다. 정찰은 맥락으로 기록
+      ```
+
+      ## ✅ 합격 기준
+      `P2` 출력 시 통과. **근거:** 웹 SQLi·SSH 무차별 대입을 P2(중간), 단발 스캔을 P3(낮음)로 줄
+      세우면 통과 → "진행형/침투를 먼저, 정찰은 맥락으로 기록".
+
+      ## 🔧 개념 풀이
+      - P1/P2/P3 — 경보의 처리 우선순위 등급(높음/중간/낮음). 절대 점수가 아니라 상대적
+        줄 세우기다. 같은 P3 라도 중요 자산(예: 결제 서버)을 향하면 끌어올린다.
+    hint: '정찰 P3 < 침투/진행형 P2'
+    category: analysis
+    points: 10
+    answer: |
+      # 1) 스캔(정찰, 단발) → P3 낮음
+      echo "스캔(정찰, 단발)        → P3 (낮음)"
+      # 2) 웹 SQLi(침투 시도) → P2 중간
+      echo "웹 SQLi(침투 시도)       → P2 (중간)"
+      # 3) SSH 무차별 대입(다발) → P2 중간(진행형)
+      echo "SSH 무차별 대입(8건 다발) → P2 (중간, 진행형 — 곧 침투 시도)"
+      # 4) 결론 — 진행형/침투(웹·인증) 먼저, 정찰(스캔)은 맥락으로 기록
+      # → 진행형/침투(웹·인증)을 먼저 본다. 정찰은 맥락으로 기록
+    answer_detail: "모든 경보가 같은 무게가 아니다. 정찰(스캔, P3)보다 진행형 침투 공격(무차별 대입·웹 SQLi, P2)을 먼저 본다. 빈도(다발)는 강한 우선순위 신호다 — 스캔 1회와 무차별 대입 8회는 위험도가 다르다. 채점은 출력에 'P2'(진행형/침투 분류)가 포함되는지로 확인한다. L1 은 이 줄 세우기로 한정된 분석 시간을 위험한 곳에 먼저 배분한다."
+    expected_output: |
+      스캔(정찰, 단발)        → P3 (낮음)
+      웹 SQLi(침투 시도)       → P2 (중간)
+      SSH 무차별 대입(8건 다발) → P2 (중간, 진행형 — 곧 침투 시도)
+      → 진행형/침투(웹·인증)을 먼저 본다. 정찰은 맥락으로 기록
+    verify:
+      type: output_contains
+      expect: 'P2'
+      field: stdout
+      semantic:
+        intent: "경보 우선순위(P1/P2/P3) 정렬"
+        success_criteria: ["정찰 P3", "침투/진행형 P2", "빈도 기반 우선순위"]
+        acceptable_methods:
+          - "**[설명] 단계/빈도 기반 우선순위 (권장)**"
+    target_vm: siem
+
+  - order: 7
+    instruction: |
+      ## 🎯 목표 — 상관(Purple): 같은 출발지로 한 캠페인
+
+      L1 의 진짜 실력 — 흩어진 세 경보를 한 사건으로 엮는 상관(correlation)을 직접 해본다.
+      실습 3~5 에서 따로따로 분류한 경보가 사실 한 공격자임을 출발지 IP 로 증명한다.
+
+      ## 개념 한 줄
+      상관 = 흩어진 경보를 공통 키(주로 출발지 IP)로 엮어 한 사건으로 종합하는 분석. 서로 다른
+      소스(Suricata eve, ModSec audit)의 출발지가 같은 192.168.0.202 로 수렴하면 "한 공격자의
+      단계적 캠페인(정찰 → 침투)"이다.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+
+      **실습 컨테이너:** Suricata 집계는 `el34-ips`, ModSec 확인은 `el34-web`.
+      각 컨테이너에 `docker exec -it el34-<name> bash` 로 접속해 실행한다.
+
+      ```bash
+      # ── el34-ips 에서: Suricata alert 출발지를 집계(uniq -c)해 많은 순으로 상위 3개 ──
+      tail -3000 /var/log/suricata/eve.json | jq -rc 'select(.event_type=="alert")|.src_ip' | sort | uniq -c | sort -rn | head -3
+
+      # ── el34-web 에서: ModSec 웹 공격 출발지에 같은 192.168.0.202가 있는지 확인 ──
+      sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "10\.20\.30\.202" | head -1
+
+      # 상관 — 스캔+웹이 같은 출발지 192.168.0.202 = 한 공격자의 단계적 캠페인(정찰→침투)
+      # → 스캔+웹이 같은 출발지 192.168.0.202 = 한 공격자의 단계적 캠페인(정찰→침투)
+      ```
+
+      ## ✅ 합격 기준
+      `192.168.0.202` 출력 시 통과. **근거:** 두 소스(Suricata eve, ModSec audit) 모두에서 같은 출발지
+      192.168.0.202 가 나오면 스캔과 웹 공격이 한 공격자임이 확인 — 출처 IP 보존(SNAT 없음)이 전제다.
+
+      ## 🔧 도구 풀이
+      - `jq -rc ... .src_ip | sort | uniq -c | sort -rn` — 모든 alert 의 출발지를 뽑아(`-r` 따옴표
+        없이) 정렬·집계(`uniq -c`)한 뒤 많은 순(`sort -rn`)으로 보여준다 = 출발지별 경보 빈도표.
+      - 상관의 전제는 출처 IP 보존이다 — el34 의 fw 는 SNAT 를 하지 않아 공격자 IP 가 모든
+        소스에 그대로 남는다. SNAT 가 있으면 출발지가 다 같아져 상관이 무력화된다.
+    hint: 'eve src_ip + modsec remote 가 같은 192.168.0.202 → 한 캠페인'
+    category: analysis
+    points: 14
+    answer: |
+      # 1) Suricata alert 출발지를 집계(uniq -c)해 많은 순으로 상위 3개
+      ssh ccc@10.20.31.2 'sudo tail -3000 /var/log/suricata/eve.json | jq -rc "select(.event_type==\"alert\")|.src_ip" | sort | uniq -c | sort -rn | head -3'
+      # 2) ModSec 웹 공격 출발지에 같은 192.168.0.202가 있는지 확인
+      ssh ccc@10.20.32.80 'sudo tail -80 /var/log/apache2/modsec_audit.log | grep -oE "10\.20\.30\.202" | head -1'
+      # 3) 상관 — 스캔+웹이 같은 출발지 192.168.0.202 = 한 공격자의 단계적 캠페인(정찰→침투)
+      # → 스캔+웹이 같은 출발지 192.168.0.202 = 한 공격자의 단계적 캠페인(정찰→침투)
+    answer_detail: "L1 과 숙련 분석가를 가르는 능력이 상관이다. 서로 다른 소스(Suricata eve=네트워크, ModSec=웹)의 출발지를 집계해 같은 IP 192.168.0.202 로 수렴함을 확인하면 '한 공격자가 정찰 후 침투 중'이라는 서사가 잡힌다. 채점은 출력에 '192.168.0.202'(공통 출발지)가 나오는지로 확인한다. 상관 전과 후의 결론이 완전히 다르다 — 상관 없이는 별개 경보 3건, 상관하면 즉시 출발지 차단을 검토할 위급한 단일 캠페인이다. el34 의 출처 IP 보존(SNAT 없음)이 이 모든 상관의 전제다."
+    expected_output: |
+      246 192.168.0.202
+      192.168.0.202
+      → 스캔+웹이 같은 출발지 192.168.0.202 = 한 공격자의 단계적 캠페인(정찰→침투)
+    verify:
+      type: output_contains
+      expect: '192.168.0.202'
+      field: stdout
+      semantic:
+        intent: "같은 출발지로 다중벡터를 한 캠페인으로 상관"
+        success_criteria: ["출발지별 집계", "192.168.0.202 공통", "단계적 캠페인 종합"]
+        acceptable_methods:
+          - "**[OSS] src_ip 집계 + 출처 상관 (권장)**"
+    target_vm: ips
+
+  - order: 8
+    instruction: |
+      ## 🎯 목표 — L1 트리아지 보고서
+
+      분석은 보고로 완성된다. 실습 1~7 을 표준 양식으로 정리해, L2 가 받아 즉시 이어갈 수 있는
+      산출물을 만든다. SOC 의 모든 경보 처리는 추적성·인수인계·사후분석을 위해 기록으로 남아야 한다.
+
+      ## 개념 한 줄
+      L1 보고서 = 4요소(출발지/시그니처/시각/심각도) 식별 → 분류(정찰/인증/웹) → 우선순위
+      (P1/P2/P3) → 상관(같은 출발지 → 한 캠페인) 의 4단계를 한 장으로 종합한 것.
+
+      ## 💻 실행 명령 (한 줄씩 따라 실행)
+      ```bash
+      # 1) heredoc(<<'EOF' ... EOF)으로 L1 트리아지 보고서 출력 — 4요소→분류→우선순위→상관→결론
+      cat > ~/w01_note1.md <<'EOF'
+      # SOC W01 L1 트리아지 보고서
+      ## 1. 경보 4요소
+      | 경보 | 출발지 | 시그니처 | 심각도 |
+      |------|--------|----------|--------|
+      | 스캔 | 192.168.0.202 | nmap SYN scan | 낮 |
+      | 인증 | (다발) | Invalid user x8 | 중 |
+      | 웹 | 192.168.0.202 | sqlmap/942 SQLi | 중 |
+      ## 2. 분류: 스캔=정찰 / 인증=무차별대입 / 웹=익스플로잇
+      ## 3. 우선순위: 웹·인증(P2) > 스캔(P3)
+      ## 4. 상관: 스캔+웹 동일 출발지 192.168.0.202 → 정찰→침투 한 캠페인
+      ## 결론: L1은 4요소로 빠르게 분류·우선순위·상관해 L2로 올린다
+      EOF
+      cat ~/w01_note1.md
+      ```
+
+      ## ✅ 합격 기준
+      `트리아지` 출력 시 통과. **근거:** 보고서에 4요소 표 + 분류(정찰/인증/웹) + 우선순위(P1/P2/P3) +
+      상관(같은 출발지 → 한 캠페인)이 모두 담기면 통과 — 실습 1~7 의 실제 출력값을 근거로 인용한다.
+
+      ## 🔧 작성 팁
+      위 양식을 채울 때 실습 1~7 의 실제 출력값(출발지 192.168.0.202, 시그니처 942/sqlmap,
+      Invalid user 다발 등)을 근거로 인용한다. 추측이 아니라 관측된 증거로 결론을 뒷받침해야
+      L2 가 신뢰하고 이어받을 수 있다.
+    hint: '4요소 + 분류 + 우선순위 + 상관'
+    category: report
+    points: 12
+    answer: |
+      cat > ~/w01_note2.md <<'EOF'
+      # SOC W01 L1 트리아지 보고서
+      ## 1. 경보 4요소
+      | 경보 | 출발지 | 시그니처 | 심각도 |
+      |------|--------|----------|--------|
+      | 스캔 | 192.168.0.202 | nmap SYN scan | 낮 |
+      | 인증 | (다발) | Invalid user x8 | 중 |
+      | 웹 | 192.168.0.202 | sqlmap/942 SQLi | 중 |
+      ## 2. 분류: 스캔=정찰 / 인증=무차별대입 / 웹=익스플로잇
+      ## 3. 우선순위: 웹·인증(P2) > 스캔(P3)
+      ## 4. 상관: 스캔+웹 동일 출발지 192.168.0.202 → 정찰→침투 한 캠페인
+      ## 결론: L1은 4요소로 빠르게 분류·우선순위·상관해 L2로 올린다
+      EOF
+      cat ~/w01_note2.md
+    answer_detail: "L1 트리아지의 4단계(4요소 식별 → 분류 → 우선순위 → 상관)를 한 장으로 종합하는 것이 본 실습의 마무리다. 채점은 보고서에 '트리아지' 키워드와 4요소/분류/우선순위/상관 구조가 담기는지로 확인한다. L1 은 경보를 깊게 파지 않고 빠르게 줄 세워 핵심을 L2 로 올린다 — 보고서가 부실하면 L2/L3 가 처음부터 다시 분석해야 해 SOC 전체 효율이 무너진다. 이 한 장이 SOC 협업의 출발점이다."
+    expected_output: |
+      # SOC W01 L1 트리아지 보고서
+      ## 1. 경보 4요소
+      | 경보 | 출발지 | 시그니처 | 심각도 |
+      |------|--------|----------|--------|
+      | 스캔 | 192.168.0.202 | nmap SYN scan | 낮 |
+      | 인증 | (다발) | Invalid user x8 | 중 |
+      | 웹 | 192.168.0.202 | sqlmap/942 SQLi | 중 |
+      ## 2. 분류: 스캔=정찰 / 인증=무차별대입 / 웹=익스플로잇
+      ## 3. 우선순위: 웹·인증(P2) > 스캔(P3)
+      ## 4. 상관: 스캔+웹 동일 출발지 192.168.0.202 → 정찰→침투 한 캠페인
+      ## 결론: L1은 4요소로 빠르게 분류·우선순위·상관해 L2로 올린다
+    verify:
+      type: output_contains
+      expect: '트리아지'
+      field: stdout
+      semantic:
+        intent: "L1 트리아지 종합 보고"
+        success_criteria: ["4요소 표", "분류/우선순위", "출발지 상관"]
+        acceptable_methods:
+          - "**[관리적] 트리아지 보고서 (권장)**"
+    target_vm: siem
